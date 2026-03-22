@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
 from test_kernel_backend.core.types import CUDAArch
 from test_kernel_backend.device.device import DeviceHandle, DeviceInfo
+
+_HAS_GPU = False
+try:
+    _HAS_GPU = torch.cuda.is_available()
+except Exception:
+    pass
+
+requires_gpu = pytest.mark.skipif(
+    not _HAS_GPU, reason="CUDA device required",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +127,7 @@ class TestDeviceInfo:
 # ---------------------------------------------------------------------------
 
 
+@requires_gpu
 class TestDeviceHandleInit:
     """DeviceHandle.__init__ validates device_id and queries properties."""
 
@@ -137,6 +148,7 @@ class TestDeviceHandleInit:
             DeviceHandle(device_id=999)
 
 
+@requires_gpu
 class TestDeviceHandleInfo:
     """DeviceHandle.info returns correct static properties."""
 
@@ -173,6 +185,7 @@ class TestDeviceHandleInfo:
         assert dh.info is dh.info
 
 
+@requires_gpu
 class TestDeviceHandleSynchronize:
     """DeviceHandle.synchronize blocks until work completes."""
 
@@ -190,6 +203,7 @@ class TestDeviceHandleSynchronize:
         dh.synchronize()
 
 
+@requires_gpu
 class TestDeviceHandleMemory:
     """DeviceHandle memory queries return sensible values."""
 
