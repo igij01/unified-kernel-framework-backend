@@ -1,0 +1,30 @@
+# Slot: cuda124-tf
+# CUDA 12.4 + TensorFlow 2.15.0
+#
+# tensorflow[and-cuda] bundles its own CUDA 12.2 runtime and cuDNN 8.9.
+# This is forward-compatible with a CUDA 12.4 host driver.
+# No separate cuDNN installation is required.
+
+name: playground
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # ── Scientific stack ─────────────────────────────────────────────────────
+  - jupyterlab=4.2.*
+  - ipywidgets=8.*
+  - numpy=1.26.*
+  - matplotlib=3.9.*
+  - pandas=2.2.*
+  - scipy=1.13.*
+
+  # ── GPU framework ────────────────────────────────────────────────────────
+  # tensorflow[and-cuda] bundles cuDNN and CUDA runtime — no separate install.
+  - pip:
+    - tensorflow[and-cuda]==2.15.0
+    - keras==2.15.0

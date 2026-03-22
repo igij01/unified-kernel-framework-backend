@@ -1,0 +1,3 @@
+[submodule "cuda_docker_env"]
+	path = cuda_docker_env
+	url = git@github.com:igij01/cuda_docker_env.git
