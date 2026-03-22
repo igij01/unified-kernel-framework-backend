@@ -16,6 +16,9 @@ dev = [
     "pytest-asyncio>=0.24",
 ]
 
+[tool.setuptools.packages.find]
+include = ["test_kernel_backend*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
