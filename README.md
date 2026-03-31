@@ -42,6 +42,13 @@ Each kernel is individually versioned. Only kernels that have changed since the 
 
 Kernel correctness is verified against **PyTorch reference implementations**. The reference implementation's signature also serves as the **problem specification** — it defines the inputs, outputs, shapes, and semantics that the kernel (or composition of kernels) must satisfy. This means the backend depends on PyTorch.
 
+### Autotuning Architecture
+
+Autotuning is split into two layers (see [ADR-0009](docs/adr/0009-profiler-autotuner-split.md)):
+
+- **Profiler** — benchmarks a single kernel at a single search point (warmup cycles, observer metric collection, profiling cycles, result averaging). Observers plug into the Profiler.
+- **Autotuner** — drives the search strategy over the `(problem_size × config)` space, delegating per-point benchmarking to the Profiler. Strategies plug into the Autotuner. The pipeline invokes the Autotuner, which handles the full search loop including verification, storage, and plugin event dispatch.
+
 ### Plugin System
 
 Every stage of the pipeline exposes plugin hooks for monitoring, visualization, and custom logic:

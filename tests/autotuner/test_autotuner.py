@@ -1,11 +1,25 @@
-"""Tests for test_kernel_backend.autotuner.autotuner — single-point benchmarker."""
+"""Tests for test_kernel_backend.autotuner.autotuner — strategy loop orchestrator.
+
+The Autotuner drives a Strategy over the search space, delegates per-point
+benchmarking to the Profiler, handles verification via the Verifier, stores
+results incrementally, and emits plugin events.  These tests verify the
+orchestration logic without CUDA hardware.
+"""
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
-from test_kernel_backend.autotuner.autotuner import Autotuner, IncompatibleObserverError
-from test_kernel_backend.autotuner.observer import MemoryObserver, NCUObserver, TimingObserver
+from test_kernel_backend.autotuner.autotuner import (
+    Autotuner,
+    AutotuneError,
+    AutotuneRunResult,
+)
+from test_kernel_backend.autotuner.profiler import Profiler
+from test_kernel_backend.autotuner.strategy import _unevaluated_points
 from test_kernel_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
@@ -13,15 +27,78 @@ from test_kernel_backend.core.types import (
     KernelConfig,
     KernelHash,
     SearchPoint,
+    SearchSpace,
 )
+from test_kernel_backend.plugin.manager import PluginManager
+from test_kernel_backend.plugin.plugin import (
+    EVENT_AUTOTUNE_COMPLETE,
+    EVENT_AUTOTUNE_PROGRESS,
+    EVENT_AUTOTUNE_START,
+    EVENT_VERIFY_COMPLETE,
+    EVENT_VERIFY_FAIL,
+    EVENT_VERIFY_START,
+    PipelineEvent,
+)
+from test_kernel_backend.verifier.verifier import Verifier
 
 from .conftest import (
     FakeDeviceHandle,
     FakeProblem,
+    FakeResultStore,
     FakeRunner,
+    make_search_space,
     make_spec,
-    noop_grid,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fakes local to autotuner orchestrator tests
+# ---------------------------------------------------------------------------
+
+
+class FakeStrategy:
+    """Exhaustive strategy that returns all unevaluated points then stops.
+
+    Relies on the autotuner's ``if not points: break`` guard to
+    terminate.  Stateless across kernels so it works for multi-kernel
+    pipeline runs too.
+    """
+
+    def suggest(
+        self, space: SearchSpace, results: list[AutotuneResult],
+    ) -> list[SearchPoint]:
+        return _unevaluated_points(space, results)
+
+    def is_converged(self, results: list[AutotuneResult]) -> bool:
+        return False  # loop exits when suggest() returns []
+
+
+class TrackingPlugin:
+    """Plugin that records all events for test assertions."""
+
+    def __init__(
+        self, name: str = "tracker", critical: bool = False,
+    ) -> None:
+        self._name = name
+        self._critical = critical
+        self.events: list[PipelineEvent] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def critical(self) -> bool:
+        return self._critical
+
+    async def on_event(self, event: PipelineEvent) -> None:
+        self.events.append(event)
+
+    async def startup(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -29,611 +106,749 @@ from .conftest import (
 # ---------------------------------------------------------------------------
 
 
-def _compiled(
-    params: dict | None = None,
-    version_hash: KernelHash | None = None,
-) -> CompiledKernel:
-    """Build a CompiledKernel with sensible defaults."""
-    spec = make_spec()
-    if version_hash is not None:
-        from test_kernel_backend.core.types import KernelSpec
-
-        spec = KernelSpec(
-            name=spec.name,
-            source=spec.source,
-            backend=spec.backend,
-            target_archs=spec.target_archs,
-            grid_generator=spec.grid_generator,
-            compile_flags=spec.compile_flags,
-            version_hash=version_hash,
-        )
-    config = KernelConfig(params=params or {"BS": 64})
-    return CompiledKernel(spec=spec, config=config)
+def _compile_all(
+    spec: Any = None,
+    configs: list[KernelConfig] | None = None,
+) -> list[CompiledKernel]:
+    """Build a list of CompiledKernels with sensible defaults."""
+    spec = spec or make_spec()
+    configs = configs or [
+        KernelConfig(params={"BS": 64}),
+        KernelConfig(params={"BS": 128}),
+    ]
+    return [CompiledKernel(spec=spec, config=c) for c in configs]
 
 
-class _StubObserver:
-    """Minimal configurable observer for testing protocol properties."""
+async def _run_autotuner(
+    *,
+    runner: FakeRunner | None = None,
+    store: FakeResultStore | None = None,
+    device: FakeDeviceHandle | None = None,
+    problem: FakeProblem | None = None,
+    strategy: Any | None = None,
+    compiled_kernels: list[CompiledKernel] | None = None,
+    spec: Any | None = None,
+    space: SearchSpace | None = None,
+    plugins: PluginManager | None = None,
+    existing_results: list[AutotuneResult] | None = None,
+    skip_verify: bool = False,
+    skip_autotune: bool = False,
+    warmup_cycles: int = 0,
+    profiling_cycles: int = 1,
+) -> AutotuneRunResult:
+    """Convenience wrapper to create and run an Autotuner.
 
-    def __init__(
-        self,
-        *,
-        supported_backends: tuple[str, ...] | None = None,
-        run_once: bool = False,
-        metric_name: str = "stub",
-    ) -> None:
-        self._supported_backends = supported_backends
-        self._run_once = run_once
-        self._metric_name = metric_name
-        self.before_count = 0
-        self.after_count = 0
+    Constructs a Profiler, Verifier, and Autotuner from the given
+    fakes (or sensible defaults) and executes the full strategy loop.
+    """
+    _runner = runner or FakeRunner()
+    _store = store or FakeResultStore()
+    _device = device or FakeDeviceHandle()
+    _problem = problem or FakeProblem()
+    _strategy = strategy or FakeStrategy()
+    _plugins = plugins or PluginManager()
+    _spec = spec or make_spec()
 
-    @property
-    def supported_backends(self) -> tuple[str, ...] | None:
-        return self._supported_backends
+    _compiled = compiled_kernels if compiled_kernels is not None else _compile_all(_spec)
+    _space = space or SearchSpace(
+        size_specs=dict(_problem.sizes),
+        configs=[ck.config for ck in _compiled],
+    )
 
-    @property
-    def run_once(self) -> bool:
-        return self._run_once
+    profiler = Profiler(
+        runner=_runner,
+        device=_device,
+        backend="fake",
+        warmup_cycles=warmup_cycles,
+        profiling_cycles=profiling_cycles,
+    )
+    verifier = Verifier(runner=_runner, device=_device)
+    autotuner = Autotuner(
+        profiler=profiler,
+        verifier=verifier,
+        store=_store,
+        plugin_manager=_plugins,
+    )
 
-    def setup(self, device) -> None:
-        pass
-
-    def before_run(self, device, point) -> None:
-        self.before_count += 1
-
-    def after_run(self, device, point) -> dict[str, float]:
-        self.after_count += 1
-        return {self._metric_name: float(self.after_count)}
-
-    def teardown(self, device) -> None:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Properties
-# ---------------------------------------------------------------------------
-
-
-class TestAutotunerProperties:
-    """warmup_cycles, profiling_cycles, and backend are configurable."""
-
-    def test_default_warmup_cycles(self) -> None:
-        at = Autotuner(runner=FakeRunner(), device=FakeDeviceHandle(), backend="cuda")
-        assert at.warmup_cycles == 1
-
-    def test_default_profiling_cycles(self) -> None:
-        at = Autotuner(runner=FakeRunner(), device=FakeDeviceHandle(), backend="cuda")
-        assert at.profiling_cycles == 5
-
-    def test_custom_warmup_cycles(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=3,
-        )
-        assert at.warmup_cycles == 3
-
-    def test_custom_profiling_cycles(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", profiling_cycles=10,
-        )
-        assert at.profiling_cycles == 10
-
-    def test_zero_warmup_is_allowed(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0,
-        )
-        assert at.warmup_cycles == 0
-
-    def test_negative_warmup_raises(self) -> None:
-        with pytest.raises(ValueError, match="warmup_cycles"):
-            Autotuner(
-                runner=FakeRunner(), device=FakeDeviceHandle(),
-                backend="cuda", warmup_cycles=-1,
-            )
-
-    def test_zero_profiling_raises(self) -> None:
-        with pytest.raises(ValueError, match="profiling_cycles"):
-            Autotuner(
-                runner=FakeRunner(), device=FakeDeviceHandle(),
-                backend="cuda", profiling_cycles=0,
-            )
-
-    def test_backend_property(self) -> None:
-        at = Autotuner(runner=FakeRunner(), device=FakeDeviceHandle(), backend="triton")
-        assert at.backend == "triton"
+    return await autotuner.run(
+        spec=_spec,
+        space=_space,
+        compiled_kernels=_compiled,
+        problem=_problem,
+        strategy=_strategy,
+        existing_results=existing_results,
+        skip_verify=skip_verify,
+        skip_autotune=skip_autotune,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Backend compatibility
+# Return type
 # ---------------------------------------------------------------------------
 
 
-class TestBackendCompatibility:
-    """setup() validates observer-backend compatibility."""
+class TestAutotuneRunResult:
+    """AutotuneRunResult dataclass fields and defaults."""
 
-    def test_compatible_observer_passes(self) -> None:
-        obs = _StubObserver(supported_backends=("cuda", "triton"))
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-        )
-        at.setup()  # should not raise
+    def test_defaults(self) -> None:
+        r = AutotuneRunResult()
+        assert r.tuned == []
+        assert r.verified == []
+        assert r.errors == []
 
-    def test_universal_observer_passes(self) -> None:
-        obs = _StubObserver(supported_backends=None)
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+    def test_autotune_error_fields(self) -> None:
+        err = AutotuneError(
+            sizes={"M": 128},
+            config=KernelConfig(params={"BS": 64}),
+            message="boom",
+            exception=RuntimeError("boom"),
         )
-        at.setup()  # should not raise
-
-    def test_incompatible_observer_raises(self) -> None:
-        obs = _StubObserver(supported_backends=("triton",))
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-        )
-        with pytest.raises(IncompatibleObserverError, match="triton"):
-            at.setup()
-
-    def test_error_names_observer_class(self) -> None:
-        obs = _StubObserver(supported_backends=("triton",))
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-        )
-        with pytest.raises(IncompatibleObserverError, match="_StubObserver"):
-            at.setup()
-
-    def test_builtin_observers_compatible_with_cuda(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda",
-            observers=[TimingObserver(), NCUObserver(), MemoryObserver()],
-        )
-        at.setup()  # should not raise
+        assert err.sizes == {"M": 128}
+        assert err.config == KernelConfig(params={"BS": 64})
+        assert err.message == "boom"
+        assert isinstance(err.exception, RuntimeError)
 
 
 # ---------------------------------------------------------------------------
-# Setup / teardown
+# Basic strategy loop
 # ---------------------------------------------------------------------------
 
 
-class TestSetupTeardown:
-    """setup() and teardown() delegate to all observers."""
+class TestStrategyLoop:
+    """Autotuner drives the strategy and produces results for each point."""
 
-    def test_setup_calls_observers(self) -> None:
-        obs = MemoryObserver()
-        device = FakeDeviceHandle(memory_allocated=500)
-        at = Autotuner(
-            runner=FakeRunner(), device=device,
-            backend="cuda", observers=[obs],
-        )
-        at.setup()
-        assert obs._before_bytes == 0
+    async def test_returns_autotune_run_result(self) -> None:
+        """run() returns an AutotuneRunResult."""
+        result = await _run_autotuner()
+        assert isinstance(result, AutotuneRunResult)
 
-    def test_teardown_calls_observers(self) -> None:
-        obs = MemoryObserver()
-        device = FakeDeviceHandle(memory_allocated=500)
-        at = Autotuner(
-            runner=FakeRunner(), device=device,
-            backend="cuda", observers=[obs],
+    async def test_exhaustive_all_points_profiled(self) -> None:
+        """With exhaustive strategy, every (size, config) point is profiled."""
+        problem = FakeProblem(sizes={"M": [128, 256]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
         )
-        at.setup()
-        obs._before_bytes = 999
-        at.teardown()
-        assert obs._before_bytes == 0
+        result = await _run_autotuner(
+            problem=problem, compiled_kernels=compiled,
+        )
+        # 2 sizes x 1 config = 2 tuned results
+        assert len(result.tuned) == 2
+
+    async def test_multi_config_multi_size(self) -> None:
+        """Multiple configs and sizes produce the full cartesian product."""
+        problem = FakeProblem(sizes={"M": [128, 256]})
+        compiled = _compile_all(
+            configs=[
+                KernelConfig(params={"BS": 64}),
+                KernelConfig(params={"BS": 128}),
+            ],
+        )
+        result = await _run_autotuner(
+            problem=problem, compiled_kernels=compiled,
+        )
+        # 2 sizes x 2 configs = 4 tuned results
+        assert len(result.tuned) == 4
+
+    async def test_strategy_convergence_stops_loop(self) -> None:
+        """A strategy that converges immediately produces no results."""
+
+        class ImmediateConverge:
+            def suggest(self, space, results):
+                return []
+
+            def is_converged(self, results):
+                return True
+
+        result = await _run_autotuner(strategy=ImmediateConverge())
+        assert result.tuned == []
+
+    async def test_empty_compiled_kernels_no_results(self) -> None:
+        """No compiled kernels means no points can be profiled."""
+        result = await _run_autotuner(compiled_kernels=[])
+        assert result.tuned == []
+
+    async def test_no_progress_breaks_loop(self) -> None:
+        """If a batch produces no new results, the loop breaks."""
+        # Strategy that always suggests the same point but it fails
+        # verification, so no tuned results accumulate.
+        problem = FakeProblem(
+            sizes={"M": [128]},
+            # Reference returns a mismatch so verification fails
+            filter_fn=lambda s: False,  # filter out all sizes
+        )
+        result = await _run_autotuner(problem=problem)
+        assert result.tuned == []
 
 
 # ---------------------------------------------------------------------------
-# tune — basic behaviour
+# Verification
 # ---------------------------------------------------------------------------
 
 
-class TestTuneBasic:
-    """Core benchmarking behaviour of tune()."""
+class TestVerification:
+    """Autotuner verifies each search point before profiling."""
 
-    def test_returns_autotune_result(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+    async def test_verification_runs_before_profiling(self) -> None:
+        """Each profiled point has a corresponding verification result."""
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
         )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert isinstance(result, AutotuneResult)
-
-    def test_result_has_correct_point(self) -> None:
-        config = KernelConfig(params={"BS": 256})
-        compiled = CompiledKernel(spec=make_spec(), config=config)
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+        result = await _run_autotuner(
+            problem=problem, compiled_kernels=compiled,
         )
-        result = at.tune(compiled, FakeProblem(), {"M": 128})
-        assert result.point == SearchPoint(sizes={"M": 128}, config=config)
+        assert len(result.verified) == 1
+        assert result.verified[0].passed
+        assert len(result.tuned) == 1
 
-    def test_result_has_correct_arch(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(arch=CUDAArch.SM_80),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+    async def test_failed_verification_skips_profiling(self) -> None:
+        """If verification fails, that point is not profiled."""
+        problem = FakeProblem(
+            sizes={"M": [128]},
+            # Return a mismatch: init returns [0.0], reference returns [999.0]
+            filter_fn=None,
         )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.arch == CUDAArch.SM_80
-
-    def test_result_has_correct_kernel_hash(self) -> None:
-        kh = KernelHash("abc123")
-        compiled = _compiled(version_hash=kh)
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
-        )
-        result = at.tune(compiled, FakeProblem(), {"M": 128})
-        assert result.kernel_hash == kh
-
-    def test_result_kernel_hash_none_when_unset(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.kernel_hash is None
-
-    def test_timing_comes_from_runner(self) -> None:
-        runner = FakeRunner(time_fn=lambda c: 4.2)
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.time_ms == pytest.approx(4.2)
-
-
-# ---------------------------------------------------------------------------
-# tune — warmup and profiling cycles
-# ---------------------------------------------------------------------------
-
-
-class TestTuneCycles:
-    """Runner is called warmup + profiling times; warmup doesn't affect timing."""
-
-    def test_total_runner_calls(self) -> None:
-        """Runner called warmup_cycles + profiling_cycles times."""
         runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=2, profiling_cycles=3,
-        )
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert runner.call_count == 5  # 2 warmup + 3 profiling
+        # Make reference produce a different output than the kernel
+        class MismatchProblem:
+            sizes = {"M": [128]}
+            atol = 1e-3
+            rtol = 1e-3
 
-    def test_zero_warmup_only_profiling_calls(self) -> None:
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=4,
-        )
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert runner.call_count == 4
-
-    def test_warmup_does_not_affect_timing(self) -> None:
-        """Warmup runs are discarded — timing comes only from profiling."""
-        call_idx = 0
-
-        def varying_time(compiled):
-            nonlocal call_idx
-            call_idx += 1
-            if call_idx <= 2:
-                return 999.0  # warmup (should be discarded)
-            return 1.0  # profiling
-
-        runner = FakeRunner(time_fn=varying_time)
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=2, profiling_cycles=3,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.time_ms == pytest.approx(1.0)
-
-    def test_profiling_cycles_averaged(self) -> None:
-        """Multiple profiling iterations are averaged."""
-        call_idx = 0
-
-        def varying_time(compiled):
-            nonlocal call_idx
-            call_idx += 1
-            return call_idx * 2.0
-
-        runner = FakeRunner(time_fn=varying_time)
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=3,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        # (2.0 + 4.0 + 6.0) / 3 = 4.0
-        assert result.time_ms == pytest.approx(4.0)
-
-    def test_single_profiling_cycle_no_averaging(self) -> None:
-        runner = FakeRunner(time_fn=lambda c: 7.5)
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.time_ms == pytest.approx(7.5)
-
-
-# ---------------------------------------------------------------------------
-# tune — observer integration (regular observers)
-# ---------------------------------------------------------------------------
-
-
-class TestTuneObservers:
-    """Regular observer before_run/after_run are called during profiling cycles."""
-
-    def test_observer_metrics_in_result(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(),
-            device=FakeDeviceHandle(memory_allocated=1024),
-            backend="cuda",
-            observers=[MemoryObserver()],
-            warmup_cycles=0, profiling_cycles=1,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-        assert "peak_memory_bytes" in result.metrics
-
-    def test_multiple_observers_merge_metrics(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(),
-            device=FakeDeviceHandle(memory_allocated=512),
-            backend="cuda",
-            observers=[TimingObserver(), MemoryObserver()],
-            warmup_cycles=0, profiling_cycles=1,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-        assert "time_ms" in result.metrics
-        assert "peak_memory_bytes" in result.metrics
-
-    def test_observer_metrics_averaged_across_cycles(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(),
-            device=FakeDeviceHandle(memory_allocated=0),
-            backend="cuda",
-            observers=[MemoryObserver()],
-            warmup_cycles=0, profiling_cycles=3,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-        assert result.metrics["peak_memory_bytes"] == pytest.approx(0.0)
-
-    def test_regular_observers_not_called_during_warmup(self) -> None:
-        obs = _StubObserver(run_once=False, metric_name="regular")
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-            warmup_cycles=3, profiling_cycles=2,
-        )
-        at.setup()
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-        assert obs.before_count == 2
-        assert obs.after_count == 2
-
-    def test_no_observers_returns_empty_metrics(self) -> None:
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
-        )
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        assert result.metrics == {}
-
-
-# ---------------------------------------------------------------------------
-# tune — run_once observers
-# ---------------------------------------------------------------------------
-
-
-class TestTuneRunOnce:
-    """run_once observers execute in a single dedicated run before profiling."""
-
-    def test_run_once_observer_called_exactly_once(self) -> None:
-        obs = _StubObserver(run_once=True, metric_name="ncu_metric")
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-            warmup_cycles=0, profiling_cycles=3,
-        )
-        at.setup()
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        assert obs.before_count == 1
-        assert obs.after_count == 1
-
-    def test_run_once_adds_dedicated_runner_call(self) -> None:
-        """run_once observers cause one extra runner.run() call."""
-        obs = _StubObserver(run_once=True, metric_name="ncu_metric")
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-            warmup_cycles=1, profiling_cycles=2,
-        )
-        at.setup()
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        # 1 warmup + 1 run_once + 2 profiling = 4
-        assert runner.call_count == 4
-
-    def test_run_once_metrics_in_result(self) -> None:
-        obs = _StubObserver(run_once=True, metric_name="ncu_metric")
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-            warmup_cycles=0, profiling_cycles=1,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-        assert "ncu_metric" in result.metrics
-
-    def test_run_once_metrics_not_averaged(self) -> None:
-        """run_once metrics come from a single run — no averaging applied."""
-        obs = _StubObserver(run_once=True, metric_name="ncu_metric")
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
-            warmup_cycles=0, profiling_cycles=5,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        # _StubObserver returns float(after_count); called once → 1.0
-        assert result.metrics["ncu_metric"] == pytest.approx(1.0)
-
-    def test_mixed_regular_and_run_once(self) -> None:
-        """Both observer types contribute metrics to the same result."""
-        regular = _StubObserver(run_once=False, metric_name="regular")
-        once = _StubObserver(run_once=True, metric_name="once")
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[regular, once],
-            warmup_cycles=0, profiling_cycles=3,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        assert "regular" in result.metrics
-        assert "once" in result.metrics
-        # regular was called 3 times, once was called 1 time
-        assert regular.after_count == 3
-        assert once.after_count == 1
-        # 1 run_once + 3 profiling = 4 runner calls
-        assert runner.call_count == 4
-
-    def test_ncu_observer_is_run_once_in_autotuner(self) -> None:
-        """NCUObserver (built-in) runs in the dedicated single execution."""
-        ncu = NCUObserver()
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[ncu],
-            warmup_cycles=0, profiling_cycles=3,
-        )
-        at.setup()
-        result = at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        # NCU metrics present
-        assert "registers" in result.metrics
-        # 1 run_once + 3 profiling = 4 runner calls
-        assert runner.call_count == 4
-
-    def test_no_run_once_observers_skips_dedicated_run(self) -> None:
-        """Without run_once observers, no extra runner call."""
-        regular = _StubObserver(run_once=False, metric_name="regular")
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[regular],
-            warmup_cycles=1, profiling_cycles=2,
-        )
-        at.setup()
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.teardown()
-
-        # 1 warmup + 2 profiling = 3 (no dedicated run)
-        assert runner.call_count == 3
-
-
-# ---------------------------------------------------------------------------
-# tune — inputs and grid
-# ---------------------------------------------------------------------------
-
-
-class TestTuneInputsAndGrid:
-    """tune() passes correct inputs and grid to the runner."""
-
-    def test_initializes_problem_with_sizes(self) -> None:
-        calls = []
-
-        class TrackingProblem(FakeProblem):
             def initialize(self, sizes):
-                calls.append(dict(sizes))
-                return super().initialize(sizes)
+                return [[0.0]]
 
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+            def reference(self, inputs):
+                return [[999.0]]
+
+            def filter_sizes(self, sizes):
+                return True
+
+        result = await _run_autotuner(
+            problem=MismatchProblem(),
+            compiled_kernels=_compile_all(
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
         )
-        at.tune(_compiled(), TrackingProblem(), {"M": 128, "N": 256})
-        assert calls == [{"M": 128, "N": 256}]
+        assert any(not vr.passed for vr in result.verified)
+        assert result.tuned == []
 
-    def test_uses_spec_grid_generator(self) -> None:
-        grid_calls = []
+    async def test_skip_verify_bypasses_verification(self) -> None:
+        """skip_verify=True skips verification entirely."""
+        result = await _run_autotuner(skip_verify=True)
+        assert result.verified == []
+        assert len(result.tuned) > 0
 
-        def tracking_grid(sizes, config):
-            grid_calls.append((dict(sizes), config))
-            return noop_grid(sizes, config)
+    async def test_verification_cached_per_config_sizes(self) -> None:
+        """Same (config, sizes) pair is only verified once even if
+        the strategy suggests it multiple times."""
 
-        from test_kernel_backend.core.types import KernelSpec
+        class RepeatStrategy:
+            """Suggests the same points twice, then stops."""
 
-        spec = KernelSpec(
-            name="test", source="", backend="cuda",
-            target_archs=[CUDAArch.SM_90], grid_generator=tracking_grid,
+            def __init__(self):
+                self._calls = 0
+
+            def suggest(self, space, results):
+                self._calls += 1
+                if self._calls > 2:
+                    return []
+                return _unevaluated_points(space, results)
+
+            def is_converged(self, results):
+                return self._calls > 2
+
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
         )
-        config = KernelConfig(params={"BS": 64})
-        compiled = CompiledKernel(spec=spec, config=config)
-
-        at = Autotuner(
-            runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+        result = await _run_autotuner(
+            problem=problem,
+            compiled_kernels=compiled,
+            strategy=RepeatStrategy(),
         )
-        at.tune(compiled, FakeProblem(), {"M": 128})
-        assert len(grid_calls) == 1
-        assert grid_calls[0] == ({"M": 128}, config)
+        # Only 1 unique (config, size) pair → 1 verification
+        assert len(result.verified) == 1
+
+    async def test_partial_verification_failure(self) -> None:
+        """One config fails, another passes — only the passed one is profiled."""
+        call_count = 0
+
+        class AlternatingRefProblem:
+            """First call to reference matches, second mismatches."""
+
+            sizes = {"M": [128]}
+            atol = 1e-3
+            rtol = 1e-3
+
+            def initialize(self, sizes):
+                return [[1.0, 2.0, 3.0]]
+
+            def reference(self, inputs):
+                nonlocal call_count
+                call_count += 1
+                if call_count % 2 == 0:
+                    return [[999.0]]
+                return list(inputs)
+
+            def filter_sizes(self, sizes):
+                return True
+
+        compiled = _compile_all(
+            configs=[
+                KernelConfig(params={"A": 1}),
+                KernelConfig(params={"A": 2}),
+            ],
+        )
+        result = await _run_autotuner(
+            problem=AlternatingRefProblem(),
+            compiled_kernels=compiled,
+        )
+        passed = [vr for vr in result.verified if vr.passed]
+        failed = [vr for vr in result.verified if not vr.passed]
+        assert len(passed) >= 1
+        assert len(failed) >= 1
+        assert len(result.tuned) == len(passed)
 
 
 # ---------------------------------------------------------------------------
-# tune — multiple invocations
+# Result storage
 # ---------------------------------------------------------------------------
 
 
-class TestTuneMultipleCalls:
-    """tune() can be called multiple times within a setup/teardown session."""
+class TestResultStorage:
+    """Autotuner stores results incrementally via the ResultStore."""
 
-    def test_multiple_tunes_independent_results(self) -> None:
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=0, profiling_cycles=1,
+    async def test_results_stored(self) -> None:
+        """Profiled results are stored in the ResultStore."""
+        store = FakeResultStore()
+        await _run_autotuner(store=store)
+        assert len(store.results) > 0
+
+    async def test_each_result_stored_incrementally(self) -> None:
+        """Each result is stored in its own individual batch."""
+        store = FakeResultStore()
+        problem = FakeProblem(sizes={"M": [128, 256]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
         )
-        r1 = at.tune(_compiled(params={"BS": 64}), FakeProblem(), {"M": 128})
-        r2 = at.tune(_compiled(params={"BS": 128}), FakeProblem(), {"M": 256})
-
-        assert r1.point.config.params == {"BS": 64}
-        assert r1.point.sizes == {"M": 128}
-        assert r2.point.config.params == {"BS": 128}
-        assert r2.point.sizes == {"M": 256}
-        assert runner.call_count == 2
-
-    def test_runner_count_accumulates_across_tunes(self) -> None:
-        runner = FakeRunner()
-        at = Autotuner(
-            runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", warmup_cycles=1, profiling_cycles=2,
+        await _run_autotuner(
+            store=store, problem=problem, compiled_kernels=compiled,
         )
-        at.tune(_compiled(), FakeProblem(), {"M": 128})
-        at.tune(_compiled(), FakeProblem(), {"M": 256})
-        # 2 calls × (1 warmup + 2 profiling) = 6
-        assert runner.call_count == 6
+        # Each result stored in its own batch (one at a time)
+        assert len(store.store_calls) == len(store.results)
+        assert all(len(batch) == 1 for batch in store.store_calls)
+
+    async def test_existing_results_fed_to_strategy(self) -> None:
+        """Previously cached results are passed to the strategy so it
+        can account for prior evaluations and skip already-evaluated points."""
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        spec = make_spec()
+        compiled = [CompiledKernel(spec=spec, config=c.config) for c in compiled]
+
+        # Pre-existing result for the only point in the space
+        existing = [
+            AutotuneResult(
+                kernel_hash=KernelHash("pre"),
+                arch=CUDAArch.SM_90,
+                point=SearchPoint(
+                    sizes={"M": 128},
+                    config=KernelConfig(params={"BS": 64}),
+                ),
+            ),
+        ]
+        result = await _run_autotuner(
+            problem=problem,
+            compiled_kernels=compiled,
+            existing_results=existing,
+        )
+        # Strategy sees the existing result → no unevaluated points → no work
+        assert result.tuned == []
+
+
+# ---------------------------------------------------------------------------
+# Plugin events
+# ---------------------------------------------------------------------------
+
+
+class TestPluginEvents:
+    """Autotuner emits correct events at each stage."""
+
+    async def _run_with_tracker(self, **kwargs) -> tuple[
+        AutotuneRunResult, TrackingPlugin,
+    ]:
+        plugins = PluginManager()
+        tracker = TrackingPlugin()
+        await plugins.register(tracker)
+        result = await _run_autotuner(plugins=plugins, **kwargs)
+        await plugins.await_plugins()
+        return result, tracker
+
+    async def test_autotune_start_emitted(self) -> None:
+        _, tracker = await self._run_with_tracker()
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_AUTOTUNE_START in types
+
+    async def test_autotune_progress_emitted(self) -> None:
+        _, tracker = await self._run_with_tracker()
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_AUTOTUNE_PROGRESS in types
+
+    async def test_autotune_complete_emitted(self) -> None:
+        _, tracker = await self._run_with_tracker()
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_AUTOTUNE_COMPLETE in types
+
+    async def test_verify_events_emitted(self) -> None:
+        """Verify events are emitted for each verification."""
+        _, tracker = await self._run_with_tracker()
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_VERIFY_START in types
+        assert EVENT_VERIFY_COMPLETE in types
+
+    async def test_verify_fail_event_emitted(self) -> None:
+        class MismatchProblem:
+            sizes = {"M": [128]}
+            atol = 1e-3
+            rtol = 1e-3
+
+            def initialize(self, sizes):
+                return [[0.0]]
+
+            def reference(self, inputs):
+                return [[999.0]]
+
+            def filter_sizes(self, sizes):
+                return True
+
+        _, tracker = await self._run_with_tracker(
+            problem=MismatchProblem(),
+            compiled_kernels=_compile_all(
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
+        )
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_VERIFY_FAIL in types
+
+    async def test_no_autotune_events_when_skip_autotune(self) -> None:
+        """When skip_autotune=True, AUTOTUNE_START/PROGRESS/COMPLETE
+        are not emitted, but VERIFY events still are."""
+        _, tracker = await self._run_with_tracker(skip_autotune=True)
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_AUTOTUNE_START not in types
+        assert EVENT_AUTOTUNE_PROGRESS not in types
+        assert EVENT_AUTOTUNE_COMPLETE not in types
+        # Verify events should still be present
+        assert EVENT_VERIFY_START in types
+
+    async def test_event_ordering(self) -> None:
+        """Events follow: start → verify → progress → complete."""
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        _, tracker = await self._run_with_tracker(
+            problem=problem, compiled_kernels=compiled,
+        )
+        types = [e.event_type for e in tracker.events]
+
+        idx_start = types.index(EVENT_AUTOTUNE_START)
+        idx_verify = types.index(EVENT_VERIFY_START)
+        idx_progress = types.index(EVENT_AUTOTUNE_PROGRESS)
+        idx_complete = types.index(EVENT_AUTOTUNE_COMPLETE)
+
+        assert idx_start < idx_verify
+        assert idx_verify < idx_progress
+        assert idx_progress < idx_complete
+
+
+# ---------------------------------------------------------------------------
+# Skip flags
+# ---------------------------------------------------------------------------
+
+
+class TestSkipFlags:
+    """skip_verify and skip_autotune control which stages run."""
+
+    async def test_skip_verify_and_autotune(self) -> None:
+        """Both flags skip everything — no verification, no profiling."""
+        result = await _run_autotuner(
+            skip_verify=True, skip_autotune=True,
+        )
+        assert result.verified == []
+        assert result.tuned == []
+
+    async def test_verify_only(self) -> None:
+        """skip_autotune=True runs verification but not profiling."""
+        result = await _run_autotuner(skip_autotune=True)
+        assert len(result.verified) > 0
+        assert result.tuned == []
+
+    async def test_autotune_only(self) -> None:
+        """skip_verify=True runs profiling without verification."""
+        result = await _run_autotuner(skip_verify=True)
+        assert result.verified == []
+        assert len(result.tuned) > 0
+
+
+# ---------------------------------------------------------------------------
+# Size filtering
+# ---------------------------------------------------------------------------
+
+
+class TestSizeFiltering:
+    """Autotuner respects problem.filter_sizes to skip invalid combinations."""
+
+    async def test_filtered_sizes_not_verified(self) -> None:
+        """Sizes rejected by filter_sizes are not verified."""
+        problem = FakeProblem(
+            sizes={"M": [128, 256, 512]},
+            filter_fn=lambda s: s["M"] != 256,
+        )
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        result = await _run_autotuner(
+            problem=problem, compiled_kernels=compiled,
+        )
+        verified_sizes = [vr.sizes for vr in result.verified]
+        for vs in verified_sizes:
+            assert vs["M"] != 256
+
+    async def test_filtered_sizes_not_profiled(self) -> None:
+        """Sizes rejected by filter_sizes are not profiled."""
+        problem = FakeProblem(
+            sizes={"M": [128, 256]},
+            filter_fn=lambda s: s["M"] == 128,
+        )
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        result = await _run_autotuner(
+            problem=problem, compiled_kernels=compiled,
+        )
+        for ar in result.tuned:
+            assert ar.point.sizes["M"] == 128
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+class TestErrorHandling:
+    """Autotuner records profiling errors without crashing."""
+
+    async def test_profiling_error_recorded(self) -> None:
+        """Runner failure during profiling is captured as an AutotuneError."""
+        call_count = 0
+
+        class FailOnceRunner:
+            """Fails on the second runner call (first is verification)."""
+
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                nonlocal call_count
+                call_count += 1
+                # First call is verification, second is profiling warmup/run
+                if call_count == 2:
+                    raise RuntimeError("GPU error")
+                return FakeRunner().run(
+                    compiled, inputs, device, grid, extra_args,
+                )
+
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        result = await _run_autotuner(
+            runner=FailOnceRunner(),
+            problem=problem,
+            compiled_kernels=compiled,
+        )
+        assert len(result.errors) >= 1
+        assert "GPU error" in result.errors[0].message
+
+    async def test_profiling_error_does_not_crash_loop(self) -> None:
+        """After an error, the loop still terminates cleanly."""
+        call_count = 0
+
+        class FailAlwaysRunner:
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                nonlocal call_count
+                call_count += 1
+                if call_count > 1:  # first call = verification
+                    raise RuntimeError("boom")
+                return FakeRunner().run(
+                    compiled, inputs, device, grid, extra_args,
+                )
+
+        problem = FakeProblem(sizes={"M": [128]})
+        compiled = _compile_all(
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        # Should not raise
+        result = await _run_autotuner(
+            runner=FailAlwaysRunner(),
+            problem=problem,
+            compiled_kernels=compiled,
+        )
+        assert len(result.errors) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Profiler lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestProfilerLifecycle:
+    """Autotuner manages Profiler setup/teardown correctly."""
+
+    async def test_profiler_teardown_on_success(self) -> None:
+        """Profiler.teardown() is called after successful run."""
+        teardown_called = []
+
+        class TrackingProfiler(Profiler):
+            def teardown(self):
+                teardown_called.append(True)
+                super().teardown()
+
+        runner = FakeRunner()
+        device = FakeDeviceHandle()
+        profiler = TrackingProfiler(
+            runner=runner, device=device, backend="fake",
+            warmup_cycles=0, profiling_cycles=1,
+        )
+        verifier = Verifier(runner=runner, device=device)
+        store = FakeResultStore()
+        plugins = PluginManager()
+
+        autotuner = Autotuner(profiler, verifier, store, plugins)
+        await autotuner.run(
+            spec=make_spec(),
+            space=SearchSpace(
+                size_specs={"M": [128]},
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
+            compiled_kernels=_compile_all(
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
+            problem=FakeProblem(sizes={"M": [128]}),
+            strategy=FakeStrategy(),
+        )
+        assert teardown_called == [True]
+
+    async def test_profiler_teardown_on_error(self) -> None:
+        """Profiler.teardown() is called even if the loop raises."""
+        teardown_called = []
+
+        class TrackingProfiler(Profiler):
+            def teardown(self):
+                teardown_called.append(True)
+                super().teardown()
+
+        class ExplodingStrategy:
+            def suggest(self, space, results):
+                raise RuntimeError("strategy exploded")
+
+            def is_converged(self, results):
+                return False
+
+        runner = FakeRunner()
+        device = FakeDeviceHandle()
+        profiler = TrackingProfiler(
+            runner=runner, device=device, backend="fake",
+            warmup_cycles=0, profiling_cycles=1,
+        )
+        verifier = Verifier(runner=runner, device=device)
+        store = FakeResultStore()
+        plugins = PluginManager()
+
+        autotuner = Autotuner(profiler, verifier, store, plugins)
+        with pytest.raises(RuntimeError, match="strategy exploded"):
+            await autotuner.run(
+                spec=make_spec(),
+                space=SearchSpace(
+                    size_specs={"M": [128]},
+                    configs=[KernelConfig(params={"BS": 64})],
+                ),
+                compiled_kernels=_compile_all(
+                    configs=[KernelConfig(params={"BS": 64})],
+                ),
+                problem=FakeProblem(sizes={"M": [128]}),
+                strategy=ExplodingStrategy(),
+            )
+        assert teardown_called == [True]
+
+    async def test_profiler_not_set_up_when_skip_autotune(self) -> None:
+        """When skip_autotune=True, setup()/teardown() are not called."""
+        setup_called = []
+
+        class TrackingProfiler(Profiler):
+            def setup(self):
+                setup_called.append(True)
+                super().setup()
+
+            def teardown(self):
+                setup_called.append("teardown")
+                super().teardown()
+
+        runner = FakeRunner()
+        device = FakeDeviceHandle()
+        profiler = TrackingProfiler(
+            runner=runner, device=device, backend="fake",
+            warmup_cycles=0, profiling_cycles=1,
+        )
+        verifier = Verifier(runner=runner, device=device)
+        store = FakeResultStore()
+        plugins = PluginManager()
+
+        autotuner = Autotuner(profiler, verifier, store, plugins)
+        await autotuner.run(
+            spec=make_spec(),
+            space=SearchSpace(
+                size_specs={"M": [128]},
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
+            compiled_kernels=_compile_all(
+                configs=[KernelConfig(params={"BS": 64})],
+            ),
+            problem=FakeProblem(sizes={"M": [128]}),
+            strategy=FakeStrategy(),
+            skip_autotune=True,
+        )
+        # Neither setup nor teardown should be called
+        assert setup_called == []
+
+
+# ---------------------------------------------------------------------------
+# Result correctness
+# ---------------------------------------------------------------------------
+
+
+class TestResultCorrectness:
+    """Autotuner results contain correct metadata."""
+
+    async def test_tuned_results_have_correct_arch(self) -> None:
+        result = await _run_autotuner()
+        for ar in result.tuned:
+            assert ar.arch == CUDAArch.SM_90
+
+    async def test_tuned_results_have_kernel_hash(self) -> None:
+        """When spec has a version hash, it propagates to results."""
+        spec = make_spec()
+        from test_kernel_backend.versioning.hasher import KernelHasher
+
+        kh = KernelHasher().hash(spec)
+        from dataclasses import replace
+
+        spec = replace(spec, version_hash=kh)
+
+        compiled = _compile_all(spec=spec)
+        result = await _run_autotuner(
+            spec=spec, compiled_kernels=compiled,
+        )
+        for ar in result.tuned:
+            assert ar.kernel_hash is not None

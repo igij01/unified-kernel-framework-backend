@@ -2,30 +2,25 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from test_kernel_backend.autotuner.autotuner import Autotuner
+from test_kernel_backend.autotuner.profiler import Profiler
 from test_kernel_backend.core.compiler import CompilationError
 from test_kernel_backend.core.types import (
     AutotuneResult,
+    CompiledKernel,
     KernelSpec,
     SearchSpace,
 )
 from test_kernel_backend.plugin.plugin import (
-    EVENT_AUTOTUNE_COMPLETE,
-    EVENT_AUTOTUNE_PROGRESS,
-    EVENT_AUTOTUNE_START,
     EVENT_COMPILE_COMPLETE,
     EVENT_COMPILE_ERROR,
     EVENT_COMPILE_START,
     EVENT_KERNEL_DISCOVERED,
     EVENT_PIPELINE_COMPLETE,
-    EVENT_VERIFY_COMPLETE,
-    EVENT_VERIFY_FAIL,
-    EVENT_VERIFY_START,
     PipelineEvent,
 )
 from test_kernel_backend.verifier.verifier import Verifier, VerificationResult
@@ -90,20 +85,20 @@ class PipelineResult:
 class Pipeline:
     """Top-level orchestrator for the kernel verify-and-autotune workflow.
 
-    Coordinates versioning, compilation, verification, autotuning,
-    storage, and plugin dispatch.  Each stage emits events to the
-    PluginManager for async observation.
+    Coordinates versioning, compilation, and autotuning.  Each stage
+    emits events to the PluginManager for async observation.
 
     Orchestration flow for each kernel::
 
         1. Hash kernel, check store for existing results
         2. Skip unchanged kernels (unless force=True)
         3. Compile all configurations from the compiler
-        4. Strategy loop — for each suggested search point:
-           a. Verify the compiled kernel at that size point
-           b. Autotune the kernel at that size point (if verification passed)
-           c. Store the result
-        5. Emit events at each stage for plugins
+        4. Delegate to Autotuner.run() for the strategy loop:
+           a. Strategy suggests search points
+           b. Verify each point (unless skip_verify)
+           c. Profile each point via the Profiler (unless skip_autotune)
+           d. Store results incrementally, emit plugin events
+        5. Emit pipeline-complete event
     """
 
     def __init__(
@@ -148,7 +143,7 @@ class Pipeline:
             kernels: Kernels to process.
             problem: Problem specification (reference impl + sizes).
             strategy: Autotuning search strategy.
-            observers: Optional metrics observers for autotuning.
+            observers: Optional metrics observers for profiling.
             force: If True, reprocess all kernels regardless of cache.
             skip_verify: If True, skip verification stage.
             skip_autotune: If True, skip autotuning stage.
@@ -202,7 +197,7 @@ class Pipeline:
 
         # -- 2. Compile all configurations --------------------------------
         configs = self._compiler.generate_configs(spec)
-        compiled_map: dict[str, _CompiledEntry] = {}
+        compiled_kernels: list[CompiledKernel] = []
 
         for config in configs:
             await self._emit(
@@ -211,8 +206,7 @@ class Pipeline:
             )
             try:
                 compiled = self._compiler.compile(spec, config)
-                key = _config_key(config)
-                compiled_map[key] = _CompiledEntry(compiled=compiled)
+                compiled_kernels.append(compiled)
                 await self._emit(
                     EVENT_COMPILE_COMPLETE,
                     {"spec": spec, "config": config, "compiled": compiled},
@@ -226,126 +220,52 @@ class Pipeline:
                     {"spec": spec, "config": config, "error": exc},
                 )
 
-        if not compiled_map:
+        if not compiled_kernels:
             return  # all compilations failed
 
         # -- 3. Build search space ----------------------------------------
         space = SearchSpace(
             size_specs=dict(problem.sizes),
-            configs=[e.compiled.config for e in compiled_map.values()],
+            configs=[ck.config for ck in compiled_kernels],
         )
 
-        # -- 4. Set up verifier and autotuner -----------------------------
-        verifier = Verifier(runner=self._runner, device=self._device)
-        autotuner = Autotuner(
+        # -- 4. Autotuner: strategy loop, verification, profiling ---------
+        profiler = Profiler(
             runner=self._runner,
             device=self._device,
             backend=self._compiler.backend_name,
             observers=observers,
         )
-        autotuner.setup()
+        verifier = Verifier(runner=self._runner, device=self._device)
+        autotuner = Autotuner(
+            profiler=profiler,
+            verifier=verifier,
+            store=self._store,
+            plugin_manager=self._plugins,
+        )
 
-        if not skip_autotune:
-            await self._emit(
-                EVENT_AUTOTUNE_START,
-                {"spec": spec, "space": space},
-            )
-
-        # -- 5. Strategy loop ---------------------------------------------
-        tune_results: list[AutotuneResult] = []
         existing = self._store.query(
             kernel_hash=kernel_hash,
             arch=self._device.info.arch,
         )
 
-        try:
-            while not strategy.is_converged(tune_results + existing):
-                points = strategy.suggest(space, tune_results + existing)
-                if not points:
-                    break
+        autotune_result = await autotuner.run(
+            spec=spec,
+            space=space,
+            compiled_kernels=compiled_kernels,
+            problem=problem,
+            strategy=strategy,
+            existing_results=existing,
+            skip_verify=skip_verify,
+            skip_autotune=skip_autotune,
+        )
 
-                progress_before = len(tune_results)
-
-                for point in points:
-                    # Filter invalid size combinations
-                    if hasattr(problem, "filter_sizes"):
-                        if not problem.filter_sizes(point.sizes):
-                            continue
-
-                    ck = _config_key(point.config)
-                    entry = compiled_map.get(ck)
-                    if entry is None:
-                        continue  # config failed compilation
-
-                    compiled = entry.compiled
-
-                    # -- 5a. Verify before autotune -----------------------
-                    if not skip_verify:
-                        sizes_key = _sizes_key(point.sizes)
-                        cache_key = f"{ck}:{sizes_key}"
-
-                        if cache_key not in entry.verified:
-                            await self._emit(
-                                EVENT_VERIFY_START,
-                                {"spec": spec, "sizes": point.sizes,
-                                 "config": point.config},
-                            )
-                            vr = verifier.verify(
-                                compiled, problem, point.sizes,
-                            )
-                            result.verified.append(vr)
-                            entry.verified[cache_key] = vr.passed
-
-                            if vr.passed:
-                                await self._emit(
-                                    EVENT_VERIFY_COMPLETE,
-                                    {"spec": spec, "result": vr},
-                                )
-                            else:
-                                await self._emit(
-                                    EVENT_VERIFY_FAIL,
-                                    {"spec": spec, "result": vr},
-                                )
-
-                        if not entry.verified.get(cache_key, False):
-                            continue  # skip autotune for failed point
-
-                    # -- 5b. Autotune -------------------------------------
-                    if not skip_autotune:
-                        try:
-                            ar = autotuner.tune(
-                                compiled, problem, point.sizes,
-                            )
-                            tune_results.append(ar)
-                            result.autotuned.append(ar)
-                            self._store.store([ar])
-
-                            await self._emit(
-                                EVENT_AUTOTUNE_PROGRESS,
-                                {"spec": spec, "result": ar},
-                            )
-                        except Exception as exc:
-                            logger.exception(
-                                "Autotune failed for %r at %s",
-                                spec.name, point.sizes,
-                            )
-                            result.errors.append(
-                                PipelineError(
-                                    spec, "autotune", str(exc), exc,
-                                ),
-                            )
-
-                # Break if no progress was made (e.g. all verifications
-                # failed or all points were filtered/skipped).
-                if len(tune_results) == progress_before:
-                    break
-        finally:
-            autotuner.teardown()
-
-        if not skip_autotune:
-            await self._emit(
-                EVENT_AUTOTUNE_COMPLETE,
-                {"spec": spec, "results": tune_results},
+        # Merge autotuner results into pipeline result
+        result.verified.extend(autotune_result.verified)
+        result.autotuned.extend(autotune_result.tuned)
+        for err in autotune_result.errors:
+            result.errors.append(
+                PipelineError(spec, "autotune", err.message, err.exception),
             )
 
     # ------------------------------------------------------------------
@@ -359,25 +279,3 @@ class Pipeline:
         await self._plugins.emit(
             PipelineEvent(event_type=event_type, data=data),
         )
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _CompiledEntry:
-    """Tracks a compiled kernel and its per-sizes verification cache."""
-
-    compiled: object = None  # CompiledKernel
-    verified: dict[str, bool] = field(default_factory=dict)
-
-
-def _config_key(config: object) -> str:
-    """Deterministic string key for a KernelConfig."""
-    return json.dumps(config.params, sort_keys=True, default=str)  # type: ignore[attr-defined]
-
-
-def _sizes_key(sizes: dict[str, int]) -> str:
-    """Deterministic string key for a sizes dict."""
-    return json.dumps(sizes, sort_keys=True)

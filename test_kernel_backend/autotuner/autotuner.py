@@ -1,281 +1,351 @@
-"""Autotuner — benchmarks a single compiled kernel with warmup and profiling cycles.
+"""Autotuner — orchestrates the search loop over the (size x config) space.
 
-The autotuner handles per-point benchmarking: warmup runs, timed profiling
-runs, observer metric collection, and result averaging.  The outer search
-loop (strategy, compilation, caching, persistence) is managed by Pipeline.
+The autotuner drives a Strategy to explore the search space, delegates
+single-point benchmarking to the Profiler, handles per-point verification,
+stores results incrementally, and emits plugin events throughout.
+
+See ADR-0009 for the rationale behind the Profiler/Autotuner split.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from test_kernel_backend.autotuner.profiler import Profiler
 from test_kernel_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
-    SearchPoint,
+    KernelConfig,
+    KernelSpec,
+    SearchSpace,
 )
-from test_kernel_backend.autotuner.observer import Observer
+from test_kernel_backend.plugin.plugin import (
+    EVENT_AUTOTUNE_COMPLETE,
+    EVENT_AUTOTUNE_PROGRESS,
+    EVENT_AUTOTUNE_START,
+    EVENT_VERIFY_COMPLETE,
+    EVENT_VERIFY_FAIL,
+    EVENT_VERIFY_START,
+    PipelineEvent,
+)
+from test_kernel_backend.verifier.verifier import VerificationResult
 
 if TYPE_CHECKING:
-    from test_kernel_backend.core.runner import Runner
-    from test_kernel_backend.device.device import DeviceHandle
+    from test_kernel_backend.autotuner.strategy import Strategy
+    from test_kernel_backend.plugin.manager import PluginManager
     from test_kernel_backend.problem.problem import Problem
+    from test_kernel_backend.storage.store import ResultStore
+    from test_kernel_backend.verifier.verifier import Verifier
 
 logger = logging.getLogger(__name__)
 
-# Defaults
-_DEFAULT_WARMUP_CYCLES = 1
-_DEFAULT_PROFILING_CYCLES = 5
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
 
 
-class IncompatibleObserverError(Exception):
-    """Raised when an observer is not compatible with the autotuner's backend."""
+@dataclass
+class AutotuneError:
+    """An error encountered during profiling at a specific search point.
+
+    Attributes:
+        sizes: The problem sizes where the error occurred.
+        config: The kernel configuration that was being profiled.
+        message: Human-readable error description.
+        exception: The original exception, if any.
+    """
+
+    sizes: dict[str, int] = field(default_factory=dict)
+    config: KernelConfig | None = None
+    message: str = ""
+    exception: Exception | None = None
+
+
+@dataclass
+class AutotuneRunResult:
+    """Aggregate result from a complete autotuning run for a single kernel.
+
+    Attributes:
+        tuned: Profiling results for each successfully benchmarked point.
+        verified: Verification results for each point that was verified.
+        errors: Errors encountered during profiling.
+    """
+
+    tuned: list[AutotuneResult] = field(default_factory=list)
+    verified: list[VerificationResult] = field(default_factory=list)
+    errors: list[AutotuneError] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _config_key(config: object) -> str:
+    """Deterministic string key for a KernelConfig."""
+    return json.dumps(config.params, sort_keys=True, default=str)  # type: ignore[attr-defined]
+
+
+def _sizes_key(sizes: dict[str, int]) -> str:
+    """Deterministic string key for a sizes dict."""
+    return json.dumps(sizes, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Autotuner
+# ---------------------------------------------------------------------------
 
 
 class Autotuner:
-    """Benchmarks a single compiled kernel at a given size point.
+    """Orchestrates the autotuning search loop over a kernel's search space.
 
-    For each :meth:`tune` call the autotuner:
+    Drives a :class:`Strategy` to explore the ``(problem_size x config)``
+    space, delegates per-point benchmarking to the :class:`Profiler`,
+    handles per-point verification via the :class:`Verifier`, stores
+    results incrementally, and emits plugin events throughout.
 
-    1. Initialises problem inputs for the requested sizes.
-    2. Runs the kernel for :attr:`warmup_cycles` iterations (results
-       discarded — lets caches and schedulers settle).
-    3. Runs ``run_once`` observers in a single dedicated kernel execution.
-    4. Runs the kernel for :attr:`profiling_cycles` iterations, collecting
-       wall-clock timing from the runner and metrics from regular observers.
-    5. Averages the timings and regular-observer metrics across profiling
-       iterations, then merges in the ``run_once`` observer metrics.
-    6. Returns a single :class:`AutotuneResult`.
+    Typical usage by the Pipeline::
 
-    Observer lifecycle::
+        profiler = Profiler(runner, device, backend, observers)
+        autotuner = Autotuner(profiler, verifier, store, plugin_manager)
+        result = await autotuner.run(
+            spec, space, compiled_kernels, problem, strategy,
+        )
 
-        Pipeline calls  autotuner.setup()   — once before the session
-        Pipeline calls  autotuner.tune(...)  — once per search point
-        Pipeline calls  autotuner.teardown() — once after the session
+    The autotuner loop:
 
-    At :meth:`setup` time the autotuner validates that every registered
-    observer is compatible with the configured ``backend``.
+    1. Emit ``AUTOTUNE_START`` event.
+    2. Loop until ``strategy.is_converged()`` or no progress:
+
+       a. ``strategy.suggest(space, results)`` yields a batch of points.
+       b. Filter invalid size combinations via ``problem.filter_sizes``.
+       c. For each valid point:
+
+          - Verify (unless ``skip_verify``), with caching.
+          - Profile via the Profiler (unless ``skip_autotune``).
+          - Store the result and emit ``AUTOTUNE_PROGRESS``.
+
+    3. Emit ``AUTOTUNE_COMPLETE`` event.
     """
 
     def __init__(
         self,
-        runner: Runner,
-        device: DeviceHandle,
-        backend: str,
-        observers: list[Observer] | None = None,
-        warmup_cycles: int = _DEFAULT_WARMUP_CYCLES,
-        profiling_cycles: int = _DEFAULT_PROFILING_CYCLES,
+        profiler: Profiler,
+        verifier: Verifier,
+        store: ResultStore,
+        plugin_manager: PluginManager,
     ) -> None:
         """Initialise the autotuner.
 
         Args:
-            runner: Backend runner for executing compiled kernels.
-            device: GPU device handle.
-            backend: Backend name (e.g. ``"cuda"``, ``"triton"``).
-                Used to validate observer compatibility at
-                :meth:`setup` time.
-            observers: Optional list of observers for collecting custom
-                metrics during kernel invocations.
-            warmup_cycles: Number of untimed kernel runs before profiling.
-            profiling_cycles: Number of timed kernel runs whose results
-                are averaged into the final ``AutotuneResult``.
-
-        Raises:
-            ValueError: If ``warmup_cycles < 0`` or ``profiling_cycles < 1``.
+            profiler: Single-point benchmarker for warmup + profiling.
+            verifier: Correctness checker against reference implementation.
+            store: Persistent result store for incremental storage.
+            plugin_manager: Async event dispatcher for plugin notifications.
         """
-        if warmup_cycles < 0:
-            raise ValueError(f"warmup_cycles must be >= 0, got {warmup_cycles}")
-        if profiling_cycles < 1:
-            raise ValueError(f"profiling_cycles must be >= 1, got {profiling_cycles}")
+        self._profiler = profiler
+        self._verifier = verifier
+        self._store = store
+        self._plugins = plugin_manager
 
-        self._runner = runner
-        self._device = device
-        self._backend = backend
-        self._observers = list(observers) if observers else []
-        self._warmup_cycles = warmup_cycles
-        self._profiling_cycles = profiling_cycles
-
-        # Partitioned at setup() time
-        self._regular_observers: list[Observer] = []
-        self._run_once_observers: list[Observer] = []
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
-    @property
-    def warmup_cycles(self) -> int:
-        """Number of untimed warmup iterations before profiling."""
-        return self._warmup_cycles
-
-    @property
-    def profiling_cycles(self) -> int:
-        """Number of timed profiling iterations that are averaged."""
-        return self._profiling_cycles
-
-    @property
-    def backend(self) -> str:
-        """Backend name this autotuner is configured for."""
-        return self._backend
-
-    # ------------------------------------------------------------------
-    # Observer lifecycle (called by Pipeline once per session)
-    # ------------------------------------------------------------------
-
-    def setup(self) -> None:
-        """Validate observer compatibility and initialise all observers.
-
-        Raises:
-            IncompatibleObserverError: If any observer's
-                ``supported_backends`` does not include this autotuner's
-                backend.
-        """
-        for obs in self._observers:
-            supported = obs.supported_backends
-            if supported is not None and self._backend not in supported:
-                raise IncompatibleObserverError(
-                    f"{type(obs).__name__} supports backends "
-                    f"{supported!r}, but autotuner is configured "
-                    f"for {self._backend!r}"
-                )
-
-        self._regular_observers = [o for o in self._observers if not o.run_once]
-        self._run_once_observers = [o for o in self._observers if o.run_once]
-
-        for obs in self._observers:
-            obs.setup(self._device)
-
-    def teardown(self) -> None:
-        """Finalise all observers.  Call once after all :meth:`tune` calls."""
-        for obs in self._observers:
-            obs.teardown(self._device)
-
-    # ------------------------------------------------------------------
-    # Core benchmarking
-    # ------------------------------------------------------------------
-
-    def _collect_observer_metrics(
+    async def run(
         self,
-        observers: list[Observer],
-        point: SearchPoint,
-        base_metrics: dict[str, float] | None = None,
-    ) -> dict[str, float]:
-        """Run after_run on *observers* and merge their metrics.
-
-        Args:
-            observers: Observers whose ``after_run`` to call.
-            point: Current search point.
-            base_metrics: Pre-existing metrics (e.g. from runner) to
-                merge into.  Keys from observers overwrite collisions
-                with a warning.
-
-        Returns:
-            Merged metrics dict.
-        """
-        metrics = dict(base_metrics) if base_metrics else {}
-        seen_keys: dict[str, str] = {}
-        for obs in observers:
-            obs_metrics = obs.after_run(self._device, point)
-            for key, value in obs_metrics.items():
-                if key in metrics or key in seen_keys:
-                    prev_source = seen_keys.get(key, "runner")
-                    logger.warning(
-                        "Metric '%s' from %s overwrites value from %s",
-                        key,
-                        type(obs).__name__,
-                        prev_source,
-                    )
-                metrics[key] = value
-                seen_keys[key] = type(obs).__name__
-        return metrics
-
-    def tune(
-        self,
-        compiled: CompiledKernel,
+        spec: KernelSpec,
+        space: SearchSpace,
+        compiled_kernels: list[CompiledKernel],
         problem: Problem,
-        sizes: dict[str, int],
-    ) -> AutotuneResult:
-        """Benchmark a compiled kernel at a specific size point.
-
-        Execution order:
-
-        1. Warmup iterations (untimed, no observer calls).
-        2. A single dedicated run for ``run_once`` observers (e.g. NCU).
-        3. Profiling iterations for regular observers — timing and
-           metrics averaged.
-        4. ``run_once`` metrics merged into the averaged result.
+        strategy: Strategy,
+        *,
+        existing_results: list[AutotuneResult] | None = None,
+        skip_verify: bool = False,
+        skip_autotune: bool = False,
+    ) -> AutotuneRunResult:
+        """Execute the full autotune loop for a single kernel.
 
         Args:
-            compiled: Pre-compiled kernel artifact.
-            problem: Problem supplying input tensors via
-                :meth:`~Problem.initialize`.
-            sizes: Size parameters for this evaluation point.
+            spec: Kernel specification (with version hash set).
+            space: The ``(sizes x configs)`` search space.
+            compiled_kernels: Pre-compiled kernel artifacts, one per
+                configuration that compiled successfully.
+            problem: Problem providing reference implementation, input
+                generation, and optional size filtering.
+            strategy: Search strategy that suggests batches of points
+                and checks for convergence.
+            existing_results: Previously cached results for this kernel
+                (from the result store).  Fed into the strategy so it
+                can account for prior evaluations.
+            skip_verify: If True, skip verification — all points go
+                straight to profiling.
+            skip_autotune: If True, skip profiling — only run
+                verification (useful for verify-only mode).
 
         Returns:
-            ``AutotuneResult`` with averaged ``time_ms`` and merged
-            observer ``metrics``.
+            :class:`AutotuneRunResult` containing profiling results,
+            verification results, and any errors encountered.
         """
-        point = SearchPoint(sizes=sizes, config=compiled.config)
-        inputs = problem.initialize(sizes)
-        grid = compiled.spec.grid_generator(sizes, compiled.config)
+        result = AutotuneRunResult()
+        existing = list(existing_results) if existing_results else []
 
-        # -- Warmup (untimed, no observer calls) -----------------------
-        for _ in range(self._warmup_cycles):
-            self._runner.run(compiled, inputs, self._device, grid)
+        # Build compiled-kernel lookup keyed by deterministic config key
+        compiled_map: dict[str, CompiledKernel] = {}
+        for ck in compiled_kernels:
+            compiled_map[_config_key(ck.config)] = ck
 
-        # -- Run-once observers (single dedicated execution) -----------
-        run_once_metrics: dict[str, float] = {}
-        if self._run_once_observers:
-            for obs in self._run_once_observers:
-                obs.before_run(self._device, point)
-
-            self._runner.run(compiled, inputs, self._device, grid)
-
-            run_once_metrics = self._collect_observer_metrics(
-                self._run_once_observers, point,
+        # Set up profiler (observer validation + initialisation)
+        if not skip_autotune:
+            self._profiler.setup()
+            await self._emit(
+                EVENT_AUTOTUNE_START,
+                {"spec": spec, "space": space},
             )
 
-        # -- Profiling (regular observers) -----------------------------
-        timings: list[float] = []
-        all_metrics: list[dict[str, float]] = []
+        # Per-(config, sizes) verification cache
+        verified_cache: dict[str, bool] = {}
 
-        for _ in range(self._profiling_cycles):
-            for obs in self._regular_observers:
-                obs.before_run(self._device, point)
+        try:
+            await self._run_strategy_loop(
+                result, existing, compiled_map,
+                spec, space, problem, strategy,
+                verified_cache,
+                skip_verify=skip_verify,
+                skip_autotune=skip_autotune,
+            )
+        finally:
+            if not skip_autotune:
+                self._profiler.teardown()
 
-            run_result = self._runner.run(compiled, inputs, self._device, grid)
-
-            metrics = self._collect_observer_metrics(
-                self._regular_observers, point, run_result.metrics,
+        if not skip_autotune:
+            await self._emit(
+                EVENT_AUTOTUNE_COMPLETE,
+                {"spec": spec, "results": result.tuned},
             )
 
-            timings.append(run_result.time_ms)
-            all_metrics.append(metrics)
+        return result
 
-        # -- Average profiling results ---------------------------------
-        avg_time = sum(timings) / len(timings)
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
-        avg_metrics: dict[str, float] = {}
-        if all_metrics:
-            for key in all_metrics[0]:
-                values = [m[key] for m in all_metrics if key in m]
-                avg_metrics[key] = sum(values) / len(values) if values else 0.0
+    async def _run_strategy_loop(
+        self,
+        result: AutotuneRunResult,
+        existing: list[AutotuneResult],
+        compiled_map: dict[str, CompiledKernel],
+        spec: KernelSpec,
+        space: SearchSpace,
+        problem: Problem,
+        strategy: Strategy,
+        verified_cache: dict[str, bool],
+        *,
+        skip_verify: bool,
+        skip_autotune: bool,
+    ) -> None:
+        """Drive the strategy and process each suggested batch of points.
 
-        # Merge run-once metrics (not averaged — single execution)
-        for key, value in run_once_metrics.items():
-            if key in avg_metrics:
-                logger.warning(
-                    "run_once metric '%s' overwrites profiling metric", key,
-                )
-            avg_metrics[key] = value
+        This is the core loop extracted from ``run()`` so that the
+        ``finally`` block in ``run()`` can guarantee profiler teardown.
 
-        return AutotuneResult(
-            kernel_hash=compiled.spec.version_hash,
-            arch=self._device.info.arch,
-            point=point,
-            time_ms=avg_time,
-            metrics=avg_metrics,
-            timestamp=datetime.now(),
+        Args:
+            result: Mutable result accumulator (tuned, verified, errors).
+            existing: Previously cached autotune results for this kernel.
+            compiled_map: Config-key to CompiledKernel lookup.
+            spec: Kernel specification.
+            space: Search space definition.
+            problem: Problem for inputs, reference, and size filtering.
+            strategy: Search strategy driving point selection.
+            verified_cache: Mutable cache tracking verification outcomes.
+            skip_verify: Whether to skip verification.
+            skip_autotune: Whether to skip profiling.
+        """
+        while not strategy.is_converged(result.tuned + existing):
+            points = strategy.suggest(space, result.tuned + existing)
+            if not points:
+                break
+
+            progress_before = len(result.tuned)
+
+            for point in points:
+                # Filter invalid size combinations
+                if hasattr(problem, "filter_sizes"):
+                    if not problem.filter_sizes(point.sizes):
+                        continue
+
+                ck = _config_key(point.config)
+                compiled = compiled_map.get(ck)
+                if compiled is None:
+                    continue  # config failed compilation
+
+                # -- Verify before profiling -------------------------
+                if not skip_verify:
+                    sk = _sizes_key(point.sizes)
+                    cache_key = f"{ck}:{sk}"
+
+                    if cache_key not in verified_cache:
+                        await self._emit(
+                            EVENT_VERIFY_START,
+                            {"spec": spec, "sizes": point.sizes,
+                             "config": point.config},
+                        )
+                        vr = self._verifier.verify(
+                            compiled, problem, point.sizes,
+                        )
+                        result.verified.append(vr)
+                        verified_cache[cache_key] = vr.passed
+
+                        if vr.passed:
+                            await self._emit(
+                                EVENT_VERIFY_COMPLETE,
+                                {"spec": spec, "result": vr},
+                            )
+                        else:
+                            await self._emit(
+                                EVENT_VERIFY_FAIL,
+                                {"spec": spec, "result": vr},
+                            )
+
+                    if not verified_cache.get(cache_key, False):
+                        continue  # skip profiling for failed point
+
+                # -- Profile -----------------------------------------
+                if not skip_autotune:
+                    try:
+                        ar = self._profiler.profile(
+                            compiled, problem, point.sizes,
+                        )
+                        result.tuned.append(ar)
+                        self._store.store([ar])
+
+                        await self._emit(
+                            EVENT_AUTOTUNE_PROGRESS,
+                            {"spec": spec, "result": ar},
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Profiling failed for %r at %s",
+                            spec.name, point.sizes,
+                        )
+                        result.errors.append(
+                            AutotuneError(
+                                sizes=dict(point.sizes),
+                                config=point.config,
+                                message=str(exc),
+                                exception=exc,
+                            ),
+                        )
+
+            # Break if no progress was made (e.g. all verifications
+            # failed or all points were filtered/skipped).
+            if len(result.tuned) == progress_before:
+                break
+
+    async def _emit(
+        self, event_type: str, data: dict,
+    ) -> None:
+        """Emit a pipeline event to the plugin manager."""
+        await self._plugins.emit(
+            PipelineEvent(event_type=event_type, data=data),
         )

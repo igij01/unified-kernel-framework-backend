@@ -14,6 +14,8 @@ This directory contains Architecture Decision Records (ADRs) for test-kernel-bac
 | [0006](0006-source-as-ir-native-compilation.md) | Source as IR, Native Backend Compilation | Accepted | 2026-03-17 |
 | [0007](0007-autotuning-strategies.md) | Autotuning Strategy Classes | Accepted | 2026-03-17 |
 | [0008](0008-observer-custom-metrics.md) | Observer for Custom Autotuning Metrics | Accepted | 2026-03-17 |
+| [0009](0009-profiler-autotuner-split.md) | Split Autotuner into Profiler + Autotuner | Accepted | 2026-03-30 |
+| [0010](0010-kernel-problem-registry.md) | Kernel and Problem Registry | Accepted | 2026-03-30 |
 
 ## Creating a New ADR
 

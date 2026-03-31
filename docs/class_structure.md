@@ -29,7 +29,8 @@ test_kernel_backend/
 │   └── verifier.py          # Verifier class
 │
 ├── autotuner/               # Autotuning orchestration
-│   ├── autotuner.py         # Autotuner benchmarker (warmup + profiling cycles)
+│   ├── profiler.py          # Profiler — single-point benchmarker (warmup + profiling cycles)
+│   ├── autotuner.py         # Autotuner — strategy loop orchestrator
 │   ├── strategy.py          # Strategy protocol + built-in strategies
 │   └── observer/            # Observer protocol + built-in observers
 │       ├── observer.py      # Observer protocol
@@ -51,11 +52,14 @@ test_kernel_backend/
 │   ├── plugin.py            # Plugin protocol, lifecycle events
 │   └── manager.py           # PluginManager (async dispatch)
 │
+├── registry/                # Kernel & problem catalog (frontend)
+│   └── registry.py          # Registry singleton — kernel store, problem store, linkage
+│
 ├── pipeline/                # Top-level orchestration
 │   └── pipeline.py          # Pipeline class
 │
 └── backends/                # Backend implementations (isolated deps)
-    ├── cuda/
+    ├── cuda/      
     │   ├── compiler.py      # CUDACompiler (CuPy/NVRTC)
     │   └── runner.py        # CUDARunner
     ├── triton/
@@ -76,39 +80,50 @@ test_kernel_backend/
 Only downward dependencies are allowed. No module may import from a module above it.
 
 ```
-                        ┌─────────────┐
-                        │   pipeline  │  Orchestrates the full workflow
-                        └──────┬──────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-              ▼                ▼                ▼
-       ┌────────────┐  ┌────────────┐  ┌────────────┐
-       │  verifier  │  │  autotuner │  │   plugin   │
-       └──────┬─────┘  └──┬───┬──┬──┘  └──────┬─────┘
-              │            │   │  │             │
-              │            │   │  └─────┐      │
-              ▼            ▼   ▼        ▼      ▼
-       ┌────────────┐  ┌───────┐  ┌──────┐  ┌──────────┐
-       │   problem  │  │strateg│  │observ│  │  storage │
-       └────────────┘  └───────┘  └──┬───┘  └──────────┘
-                                     │
-                                     ▼
-                               ┌──────────┐
-                               │  device  │
-                               └──────────┘
+  ┌──────────────┐
+  │   registry   │  Frontend: kernel & problem catalog (singleton)
+  └──────┬───────┘
+         │ provides KernelSpec + Problem to
+         ▼
+  ┌─────────────┐
+  │   pipeline  │  Orchestrates the full workflow
+  └──────┬──────┘
+         │
+         ┌────────────────┼────────────────┐
+         │                │                │
+         ▼                ▼                ▼
+  ┌────────────┐  ┌────────────┐  ┌────────────┐
+  │  verifier  │  │  autotuner │  │   plugin   │
+  └──────┬─────┘  └──┬───┬──┬──┘  └──────┬─────┘
+         │            │   │  │             │
+         │            │   │  └─────┐      │
+         ▼            ▼   ▼        ▼      ▼
+  ┌────────────┐  ┌───────┐  ┌────────┐  ┌──────────┐
+  │   problem  │  │strateg│  │profiler│  │  storage │
+  └────────────┘  └───────┘  └──┬─────┘  └──────────┘
+                                │
+                             ┌──┴──┐
+                             ▼     ▼
+                       ┌──────┐ ┌──────────┐
+                       │observ│ │  device  │
+                       └──────┘ └──────────┘
 
-       ┌─────────────────────────────────────────────────┐
-       │                    core                         │
-       │  types.py  compiler.py  runner.py  registry.py  │
-       └─────────────────────────────────────────────────┘
-                               ▲
-                               │ (implements protocols)
-       ┌─────────────────────────────────────────────────┐
-       │                  backends/*                     │
-       │  cuda/  triton/  cute_dsl/  tile_ir/            │
-       └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │                    core                         │
+  │  types.py  compiler.py  runner.py  registry.py  │
+  └─────────────────────────────────────────────────┘
+                          ▲
+                          │ (implements protocols)
+  ┌─────────────────────────────────────────────────┐
+  │                  backends/*                     │
+  │  cuda/  triton/  cute_dsl/  tile_ir/            │
+  └─────────────────────────────────────────────────┘
 ```
+
+The registry sits **above** the pipeline — it is a frontend catalog, not part of
+the pipeline's internal machinery. The pipeline remains reentrant and unaware of
+the registry. Other orchestration layers (a future service/main class) pull
+`KernelSpec` and `Problem` from the registry and feed them into pipeline runs.
 
 ---
 
@@ -343,44 +358,58 @@ class Verifier:
 
 ## Autotuner Module — `autotuner/`
 
-Depends on: `core`, `problem`, `device`
+Depends on: `core`, `problem`, `device`, `verifier`, `storage`, `plugin`
 
-The autotuner is a **single-point benchmarker** — it runs one compiled
-kernel at one size point with warmup and profiling cycles, collects
-observer metrics, and returns an averaged result.  The outer search loop
-(strategy, compilation, caching, persistence) lives in Pipeline.
+The autotuner module contains two classes with distinct responsibilities
+(see [ADR-0009](adr/0009-profiler-autotuner-split.md)):
 
-### Autotuner Benchmarking Flow
+- **Profiler** — single-point benchmarker (warmup, observers, profiling
+  cycles, metric averaging). Observers plug into the Profiler.
+- **Autotuner** — strategy loop orchestrator (drives the Strategy over the
+  search space, delegates per-point work to the Profiler, emits plugin events).
+  Strategy plugs into the Autotuner.
+
+### Responsibility Boundaries
 
 ```
-Pipeline (outer loop)                          Autotuner (per-point)
-─────────────────────                          ────────────────────
-  strategy.suggest()                           ┌───────────────────────┐
+Autotuner (strategy loop)                      Profiler (per-point)
+─────────────────────────                      ────────────────────
+  Query existing results from store            ┌───────────────────────┐
        │                                       │  1. Warmup cycles     │
-       ▼                                       │     (untimed)         │
-  compile(spec, config)                        │                       │
-       │                                       │  2. run_once observer │
-       ▼                                       │     dedicated run     │
-  autotuner.tune(compiled, problem, sizes)────▶│                       │
-       │                                       │  3. Profiling cycles  │
-       ▼                                       │     (timed + regular  │
-  store.store([result])                        │      observers)       │
+  strategy.suggest(space, results)             │     (untimed)         │
        │                                       │                       │
-       ▼                                       │  4. Average & merge   │
-  plugin_manager.emit(...)                     └───────┬───────────────┘
-                                                       │
-                                                       ▼
-                                                 AutotuneResult
+       ▼  for each point:                      │  2. run_once observer │
+  verify(compiled, problem, sizes)             │     dedicated run     │
+       │                                       │                       │
+       ▼                                       │  3. Profiling cycles  │
+  profiler.profile(compiled, problem, sizes)──▶│     (timed + regular  │
+       │                                       │      observers)       │
+       ▼                                       │                       │
+  store.store([result])                        │  4. Average & merge   │
+  plugin_manager.emit(AUTOTUNE_PROGRESS)       └───────┬───────────────┘
+       │                                               │
+  until strategy.is_converged()                        ▼
+       │                                         AutotuneResult
+  plugin_manager.emit(AUTOTUNE_COMPLETE)
 ```
 
-### `autotuner/autotuner.py`
+### `autotuner/profiler.py` — Single-Point Benchmarker
 
 ```python
 class IncompatibleObserverError(Exception):
-    """Raised when an observer is not compatible with the autotuner's backend."""
+    """Raised when an observer is not compatible with the profiler's backend."""
 
-class Autotuner:
-    """Benchmarks a single compiled kernel at a given size point."""
+class Profiler:
+    """Benchmarks a single compiled kernel at a given size point.
+
+    For each profile() call the profiler:
+    1. Initialises problem inputs for the requested sizes.
+    2. Runs warmup cycles (results discarded).
+    3. Runs run_once observers in a single dedicated kernel execution.
+    4. Runs profiling cycles, collecting timing and regular observer metrics.
+    5. Averages the timings and metrics, merges in run_once metrics.
+    6. Returns a single AutotuneResult.
+    """
 
     def __init__(
         self,
@@ -409,7 +438,7 @@ class Autotuner:
         """Finalise all observers."""
         ...
 
-    def tune(
+    def profile(
         self,
         compiled: CompiledKernel,
         problem: Problem,
@@ -422,6 +451,52 @@ class Autotuner:
           2. Single dedicated run for run_once observers (e.g. NCU)
           3. Profiling cycles with regular observers — timing averaged
           4. run_once metrics merged into result (not averaged)
+        """
+        ...
+```
+
+### `autotuner/autotuner.py` — Strategy Loop Orchestrator
+
+```python
+class Autotuner:
+    """Orchestrates the autotuning search loop over a kernel's search space.
+
+    Drives the Strategy to explore the (problem_size × config) space,
+    delegates single-point benchmarking to the Profiler, handles
+    per-point verification, stores results incrementally, and emits
+    plugin events throughout.
+    """
+
+    def __init__(
+        self,
+        profiler: Profiler,
+        verifier: Verifier,
+        store: ResultStore,
+        plugin_manager: PluginManager,
+    ): ...
+
+    async def run(
+        self,
+        spec: KernelSpec,
+        space: SearchSpace,
+        compiled_map: dict[str, CompiledEntry],
+        problem: Problem,
+        strategy: Strategy,
+        *,
+        existing_results: list[AutotuneResult],
+        skip_verify: bool = False,
+    ) -> AutotuneRunResult:
+        """Execute the full autotune loop for a single kernel.
+
+        1. Emit AUTOTUNE_START event
+        2. Loop until strategy.is_converged() or no progress:
+           a. strategy.suggest(space, results) → batch of SearchPoints
+           b. For each point:
+              - Verify (if enabled, with caching)
+              - profiler.profile() → AutotuneResult
+              - store.store([result])
+              - Emit AUTOTUNE_PROGRESS event
+        3. Emit AUTOTUNE_COMPLETE event
         """
         ...
 ```
@@ -681,20 +756,25 @@ Depends on: all modules above
 │   │ Hash &   │────▶│ Compile  │───┐                               │
 │   │ Version  │     │ all cfgs │   │                               │
 │   └──────────┘     └──────────┘   ▼                               │
-│                            ┌─────────────┐                        │
-│                            │ Strategy     │◀────────────┐         │
-│                            │  .suggest()  │             │         │
-│                            └──────┬──────┘             │         │
-│                                   │ per point           │         │
-│                            ┌──────▼──────┐             │         │
-│                            │  Verify     │             │         │
-│                            │ (cached)    │             │         │
-│                            └──────┬──────┘             │         │
-│                              pass │ fail → skip         │         │
-│                            ┌──────▼──────┐             │         │
-│                            │  Autotune   │─── store ───┘         │
-│                            │ (per point) │                        │
-│                            └─────────────┘                        │
+│                          ┌─────────────────┐                      │
+│                          │   Autotuner     │                      │
+│                          │   .run(...)     │                      │
+│                          │                 │                      │
+│                          │  ┌───────────┐  │                      │
+│                          │  │ Strategy   │◀─────────────┐        │
+│                          │  │ .suggest() │  │            │        │
+│                          │  └─────┬─────┘  │            │        │
+│                          │        │         │            │        │
+│                          │  ┌─────▼─────┐  │            │        │
+│                          │  │  Verify   │  │            │        │
+│                          │  │ (cached)  │  │            │        │
+│                          │  └─────┬─────┘  │            │        │
+│                          │   pass │        │            │        │
+│                          │  ┌─────▼─────┐  │            │        │
+│                          │  │ Profiler   │  │            │        │
+│                          │  │ .profile() │──── store ───┘        │
+│                          │  └───────────┘  │                      │
+│                          └─────────────────┘                      │
 │        │                                                          │
 │        ▼                                                          │
 │   ┌──────────────────────────────────────────────────────────────┐│
@@ -749,13 +829,295 @@ For each kernel in ``kernels``:
 1. **Version hash** — ``KernelHasher.hash(spec)`` stamps the spec
 2. **Change detection** — ``has_changed()`` checks store; skip if cached
 3. **Compile** — ``compiler.generate_configs()`` + ``compiler.compile()`` for each config
-4. **Strategy loop** — until ``strategy.is_converged()`` or no progress:
-   - ``strategy.suggest(space, results)`` → batch of ``SearchPoint``
-   - For each point:
-     - **Verify** at that ``(config, sizes)`` — cached per unique pair
-     - If passed → **Autotune** at that ``(config, sizes)``
-     - ``store.store([result])`` incrementally
-5. **Teardown** — ``autotuner.teardown()`` in a ``finally`` block
+4. **Autotune** — construct ``Profiler`` + ``Autotuner``, call ``autotuner.run()``:
+   - The Autotuner internally drives the strategy loop, per-point
+     verification, profiling via the Profiler, incremental storage,
+     and autotune plugin events (``AUTOTUNE_START``, ``AUTOTUNE_PROGRESS``,
+     ``AUTOTUNE_COMPLETE``).
+   - Profiler teardown is handled in a ``finally`` block.
+
+---
+
+## Registry Module — `registry/`
+
+Depends on: `core` (KernelSpec, CUDAArch, GridGenerator)
+
+The registry is a **frontend catalog** — a singleton that keeps a record of all
+kernels and problems in one place, along with the many-to-many linkage between
+them. It is **not** part of the pipeline; users (or a future service layer)
+extract `KernelSpec` and `Problem` instances from the registry and feed them
+into pipeline invocations.
+
+The singleton is initialised when the `registry` package is imported. User
+modules register kernels and problems at import time via decorators or
+imperative calls.
+
+### `registry/registry.py`
+
+```python
+class Registry:
+    """Singleton catalog of kernels, problems, and their linkage.
+
+    All public methods are static — they operate on module-level state
+    initialised when the registry package is first imported.
+
+    Registration order does not matter: a kernel can be registered before
+    or after the problem it links to. Validation is deferred to pipeline
+    entry.
+    """
+
+    # ── Problem registration ──────────────────────────────────────
+
+    @staticmethod
+    def register_problem(name: str, problem: Problem) -> None:
+        """Register a Problem instance under a unique name.
+
+        Raises ValueError if ``name`` is already registered.
+        """
+        ...
+
+    @staticmethod
+    def problem(name: str) -> Callable[[type[T]], type[T]]:
+        """Decorator form — registers the decorated class as a Problem.
+
+        The class is instantiated (no-arg constructor) and stored::
+
+            @Registry.problem("matmul")
+            class MatMulProblem:
+                ...
+        """
+        ...
+
+    # ── Kernel registration ───────────────────────────────────────
+
+    @staticmethod
+    def register_kernel(
+        name: str,
+        source: Any,
+        backend: str,
+        target_archs: list[CUDAArch],
+        grid_generator: GridGenerator,
+        *,
+        compile_flags: dict[str, Any] | None = None,
+        problem: str | None = None,
+    ) -> None:
+        """Register a kernel imperatively.
+
+        If ``problem`` is given, also links the kernel to that problem.
+        Raises ValueError if ``name`` is already registered.
+        """
+        ...
+
+    @staticmethod
+    def kernel(
+        name: str,
+        backend: str,
+        target_archs: list[CUDAArch],
+        grid_generator: GridGenerator,
+        *,
+        compile_flags: dict[str, Any] | None = None,
+        problem: str | None = None,
+    ) -> Callable[[Callable], Callable]:
+        """Decorator form — the decorated callable becomes the kernel source::
+
+            @Registry.kernel("matmul_splitk", backend="triton",
+                             target_archs=[CUDAArch.SM_80],
+                             grid_generator=my_grid_fn)
+            def matmul_splitk_kernel(...):
+                ...
+        """
+        ...
+
+    # ── Linkage ───────────────────────────────────────────────────
+
+    @staticmethod
+    def link(kernel_name: str, problem_name: str) -> None:
+        """Create a many-to-many link between a kernel and a problem.
+
+        Does not validate that both sides exist — deferred to pipeline.
+        Duplicate links are silently ignored.
+        """
+        ...
+
+    @staticmethod
+    def unlink(kernel_name: str, problem_name: str) -> None:
+        """Remove a kernel–problem link. No-op if the link does not exist."""
+        ...
+
+    # ── Query API ─────────────────────────────────────────────────
+
+    @staticmethod
+    def get_kernel(name: str) -> KernelSpec:
+        """Build and return a KernelSpec from stored registration data.
+
+        Raises KeyError if ``name`` is not registered.
+        """
+        ...
+
+    @staticmethod
+    def get_problem(name: str) -> Problem:
+        """Return the stored Problem instance.
+
+        Raises KeyError if ``name`` is not registered.
+        """
+        ...
+
+    @staticmethod
+    def kernels_for_problem(problem_name: str) -> list[str]:
+        """Return names of all kernels linked to ``problem_name``."""
+        ...
+
+    @staticmethod
+    def problems_for_kernel(kernel_name: str) -> list[str]:
+        """Return names of all problems linked to ``kernel_name``."""
+        ...
+
+    @staticmethod
+    def list_kernels() -> list[str]:
+        """Return all registered kernel names."""
+        ...
+
+    @staticmethod
+    def list_problems() -> list[str]:
+        """Return all registered problem names."""
+        ...
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
+    @staticmethod
+    def unregister_kernel(name: str) -> None:
+        """Remove a kernel and all its linkage entries.
+
+        Raises KeyError if ``name`` is not registered.
+        """
+        ...
+
+    @staticmethod
+    def unregister_problem(name: str) -> None:
+        """Remove a problem and all its linkage entries.
+
+        Raises KeyError if ``name`` is not registered.
+        """
+        ...
+
+    @staticmethod
+    def clear() -> None:
+        """Remove all registered kernels, problems, and links.
+
+        Intended for test teardown.
+        """
+        ...
+
+    # ── Validation ────────────────────────────────────────────────
+
+    @staticmethod
+    def validate() -> list[str]:
+        """Check that all kernel–problem links resolve to registered entries.
+
+        Returns a list of human-readable error strings. An empty list means
+        the registry is consistent. Does not raise — callers decide how to
+        handle errors.
+
+        Checks performed:
+          - Every kernel link references a registered problem name.
+          - Every problem link references a registered kernel name.
+          - Kernels with no links are reported as warnings (valid but
+            may indicate a missing link).
+        """
+        ...
+
+    # ── Display ───────────────────────────────────────────────────
+
+    @staticmethod
+    def dump_tree(group_by: str = "problem") -> str:
+        """Return a tree-formatted string of the registry contents.
+
+        ``group_by`` controls the top-level grouping:
+
+        - ``"problem"`` (default) — group by problem, then backend,
+          then kernel name::
+
+              matmul
+              ├── triton
+              │   ├── matmul_splitk
+              │   └── matmul_persistent
+              └── cuda
+                  └── matmul_naive
+              (unlinked)
+              └── experimental_kernel
+
+        - ``"backend"`` — group by backend, then problem, then kernel::
+
+              triton
+              ├── matmul
+              │   ├── matmul_splitk
+              │   └── matmul_persistent
+              └── conv2d
+                  └── conv2d_implicit_gemm
+              cuda
+              └── matmul
+                  └── matmul_naive
+
+        - ``"kernel"`` — flat alphabetical list of kernels with their
+          linked problems and backend::
+
+              conv2d_implicit_gemm  [triton]  → conv2d
+              experimental_kernel   [triton]  → (none)
+              matmul_naive          [cuda]    → matmul
+              matmul_persistent     [triton]  → matmul
+              matmul_splitk         [triton]  → matmul
+
+        Unlinked kernels (no problem association) appear under an
+        ``(unlinked)`` group in problem/backend views.
+        """
+        ...
+```
+
+### Usage examples
+
+```python
+# ── In user's kernel module (imported at package init) ────────
+
+from test_kernel_backend.registry import Registry
+from test_kernel_backend.core.types import CUDAArch
+
+# Problem via decorator
+@Registry.problem("matmul")
+class MatMulProblem:
+    sizes = {"M": [128, 256, 512], "N": [128, 256, 512], "K": [128, 256]}
+    atol = 1e-3
+    rtol = 1e-3
+    def initialize(self, sizes): ...
+    def reference(self, inputs): ...
+
+# Triton kernel via decorator
+@Registry.kernel("matmul_splitk", backend="triton",
+                 target_archs=[CUDAArch.SM_80],
+                 grid_generator=my_grid_fn,
+                 problem="matmul")
+def matmul_splitk_kernel(...):
+    ...
+
+# CUDA kernel via imperative call
+Registry.register_kernel(
+    name="matmul_naive",
+    source=cuda_source_string,
+    backend="cuda",
+    target_archs=[CUDAArch.SM_80],
+    grid_generator=naive_grid_fn,
+)
+Registry.link("matmul_naive", "matmul")
+
+# ── In orchestration layer ────────────────────────────────────
+
+# Get all kernels that solve "matmul"
+kernel_names = Registry.kernels_for_problem("matmul")
+specs = [Registry.get_kernel(n) for n in kernel_names]
+problem = Registry.get_problem("matmul")
+
+# Feed into pipeline (registry is not involved from here)
+result = await pipeline.run(specs, problem, strategy, observers)
+```
 
 ---
 
@@ -871,11 +1233,16 @@ compile_flags = {
 ## Full Data Flow Diagram
 
 ```
-User provides:
-  KernelSpec(source, backend="triton")
-  Problem(MatMul)
-  Strategy(BayesianOptimization)
-  Observer(NCUObserver)
+User registers (at import time):
+  @Registry.problem("matmul")        → stored in Registry
+  @Registry.kernel("matmul_splitk")  → stored in Registry
+  Registry.link("matmul_splitk", "matmul")
+
+Orchestration layer queries:
+  specs   = [Registry.get_kernel(n) for n in Registry.kernels_for_problem("matmul")]
+  problem = Registry.get_problem("matmul")
+  strategy = BayesianOptimization(...)
+  observers = [NCUObserver()]
 
                     ┌───────────────────────────┐
                     │     KernelSpec + Problem    │
@@ -897,40 +1264,38 @@ User provides:
                     └─────────────┬─────────────┘
                                   │
                                   ▼
-                    ┌───────────────────────────┐
-                    │         Verifier            │
-                    │                             │
-                    │  compile(spec, config[0])   │
-                    │  inputs = problem.init()    │
-                    │  expected = problem.ref()   │
-                    │  actual = runner.run()      │
-                    │  compare(expected, actual)  │
-                    └─────────────┬─────────────┘
-                           pass   │    fail → report
-                                  ▼
-                    ┌───────────────────────────┐
-                    │  Pipeline autotune loop    │
-                    │                             │
-                    │  SearchSpace = sizes×configs │
-                    │  loop:                      │
-                    │    points = strategy.suggest │
-                    │    for point in points:     │
-                    │      compiled = compile()   │
-                    │                             │
-                    │      ┌─────────────────────┐│
-                    │      │     Autotuner        ││
-                    │      │                     ││
-                    │      │ 1. warmup cycles    ││
-                    │      │ 2. run_once obs run ││
-                    │      │ 3. profiling cycles ││
-                    │      │ 4. average & merge  ││
-                    │      └────────┬────────────┘│
-                    │               │             │
-                    │      store.store([result])  │
-                    │      emit(on_autotune_...)  │
-                    │    feed results → strategy  │
-                    │  until converged            │
-                    └─────────────┬─────────────┘
+                    ┌──────────────────────────────────┐
+                    │          Autotuner.run()          │
+                    │                                   │
+                    │  SearchSpace = sizes×configs       │
+                    │  loop:                             │
+                    │    points = strategy.suggest()     │
+                    │    for point in points:            │
+                    │                                   │
+                    │      ┌──────────────────────────┐ │
+                    │      │      Verifier             │ │
+                    │      │  inputs = problem.init()  │ │
+                    │      │  expected = problem.ref() │ │
+                    │      │  actual = runner.run()    │ │
+                    │      │  compare(expected, actual)│ │
+                    │      └────────────┬─────────────┘ │
+                    │            pass   │  fail → skip   │
+                    │                   ▼                │
+                    │      ┌──────────────────────────┐ │
+                    │      │       Profiler            │ │
+                    │      │                          │ │
+                    │      │  1. warmup cycles        │ │
+                    │      │  2. run_once obs run     │ │
+                    │      │  3. profiling cycles     │ │
+                    │      │  4. average & merge      │ │
+                    │      └────────────┬─────────────┘ │
+                    │                   │                │
+                    │      store.store([result])        │
+                    │      emit(AUTOTUNE_PROGRESS)      │
+                    │    feed results → strategy         │
+                    │  until converged                   │
+                    │  emit(AUTOTUNE_COMPLETE)           │
+                    └─────────────┬────────────────────┘
                                   │
                     (async)       │       (async)
                     ┌─────────────┴─────────────┐
@@ -949,9 +1314,12 @@ User provides:
 |--------|------------|--------------|
 | `core/compiler.py`, `core/runner.py` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Source as IR, native compilation per backend |
 | `problem/` | [ADR-0005](adr/0005-problem-specification-format.md) | Python problem classes with SizeSpec |
+| `autotuner/profiler.py` | [ADR-0009](adr/0009-profiler-autotuner-split.md) | Profiler (single-point benchmarker, formerly Autotuner) |
+| `autotuner/autotuner.py` | [ADR-0009](adr/0009-profiler-autotuner-split.md) | Autotuner (strategy loop orchestrator) |
 | `autotuner/strategy.py` | [ADR-0007](adr/0007-autotuning-strategies.md) | Pluggable search strategies |
-| `autotuner/observer.py` | [ADR-0008](adr/0008-observer-custom-metrics.md) | Observer protocol + DeviceHandle |
+| `autotuner/observer/` | [ADR-0008](adr/0008-observer-custom-metrics.md) | Observer protocol + DeviceHandle |
 | `storage/` | [ADR-0003](adr/0003-database-for-autotune-storage.md) | Database for autotune results |
 | `plugin/` | [ADR-0004](adr/0004-async-plugin-execution.md) | Async plugin execution |
 | `versioning/` | [ADR-0001](adr/0001-llvm-inspired-pipeline-architecture.md) | Content-based kernel versioning |
+| `registry/` | [ADR-0010](adr/0010-kernel-problem-registry.md) | Kernel & problem catalog with many-to-many linkage |
 | `backends/` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Isolated backend implementations |
