@@ -1,12 +1,12 @@
-"""Tests for test_kernel_backend.autotuner.profiler — single-point benchmarker."""
+"""Tests for kernel_pipeline_backend.autotuner.profiler — single-point benchmarker."""
 
 from __future__ import annotations
 
 import pytest
 
-from test_kernel_backend.autotuner.profiler import Profiler, IncompatibleObserverError
-from test_kernel_backend.autotuner.observer import MemoryObserver, NCUObserver, TimingObserver
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.autotuner.profiler import Profiler, IncompatibleObserverError
+from kernel_pipeline_backend.autotuner.observer import MemoryObserver, NCUObserver, TimingObserver
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
     CUDAArch,
@@ -36,7 +36,7 @@ def _compiled(
     """Build a CompiledKernel with sensible defaults."""
     spec = make_spec()
     if version_hash is not None:
-        from test_kernel_backend.core.types import KernelSpec
+        from kernel_pipeline_backend.core.types import KernelSpec
 
         spec = KernelSpec(
             name=spec.name,
@@ -586,7 +586,7 @@ class TestProfileInputsAndGrid:
             grid_calls.append((dict(sizes), config))
             return noop_grid(sizes, config)
 
-        from test_kernel_backend.core.types import KernelSpec
+        from kernel_pipeline_backend.core.types import KernelSpec
 
         spec = KernelSpec(
             name="test", source="", backend="cuda",

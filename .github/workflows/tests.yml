@@ -24,6 +24,14 @@ jobs:
       - name: Install CPU-only PyTorch
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Build and install package
+        run: |
+          pip install build
+          python -m build
+          pip install dist/*.whl
+          python -c "import kernel_pipeline_backend; print('Package import OK')"
+          pip uninstall -y kernel-pipeline-backend
+
       - name: Install package with dev dependencies
         run: pip install -e ".[dev]"
 

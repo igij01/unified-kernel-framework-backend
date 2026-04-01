@@ -1,16 +1,16 @@
-"""Tests for test_kernel_backend.autotuner.observer — protocol and built-in observers."""
+"""Tests for kernel_pipeline_backend.autotuner.observer — protocol and built-in observers."""
 
 from __future__ import annotations
 
 import pytest
 
-from test_kernel_backend.autotuner.observer import (
+from kernel_pipeline_backend.autotuner.observer import (
     MemoryObserver,
     NCUObserver,
     Observer,
     TimingObserver,
 )
-from test_kernel_backend.core.types import KernelConfig, SearchPoint
+from kernel_pipeline_backend.core.types import KernelConfig, SearchPoint
 
 from .conftest import FakeDeviceHandle
 

@@ -1,11 +1,11 @@
-"""Tests for test_kernel_backend.verifier.verifier — single-point verification."""
+"""Tests for kernel_pipeline_backend.verifier.verifier — single-point verification."""
 
 from __future__ import annotations
 
 import pytest
 
-from test_kernel_backend.core.types import KernelHash
-from test_kernel_backend.verifier.verifier import (
+from kernel_pipeline_backend.core.types import KernelHash
+from kernel_pipeline_backend.verifier.verifier import (
     Verifier,
     VerificationFailure,
     VerificationResult,
@@ -240,7 +240,7 @@ class TestVerifyPlumbing:
     def test_uses_spec_grid_generator(self) -> None:
         grid_calls = []
 
-        from test_kernel_backend.core.types import GridResult, KernelConfig, KernelSpec, CUDAArch, CompiledKernel
+        from kernel_pipeline_backend.core.types import GridResult, KernelConfig, KernelSpec, CUDAArch, CompiledKernel
 
         def tracking_grid(sizes, config):
             grid_calls.append((dict(sizes), config))

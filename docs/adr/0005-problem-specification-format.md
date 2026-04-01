@@ -60,7 +60,7 @@ The autotuner takes the cartesian product of all size parameters to generate the
 Common patterns are provided as utilities to reduce boilerplate:
 
 ```python
-from test_kernel_backend.problems import rand_tensor, zeros_tensor
+from kernel_pipeline_backend.problems import rand_tensor, zeros_tensor
 
 class MatMul:
     sizes = {"M": range(128, 4097, 128), "N": range(128, 4097, 128), "K": [128, 256, 512]}

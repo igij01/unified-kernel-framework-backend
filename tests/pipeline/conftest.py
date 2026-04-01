@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
     CUDAArch,
@@ -20,9 +20,9 @@ from test_kernel_backend.core.types import (
     SearchPoint,
     SearchSpace,
 )
-from test_kernel_backend.device.device import DeviceInfo
-from test_kernel_backend.plugin.manager import PluginManager
-from test_kernel_backend.plugin.plugin import PipelineEvent
+from kernel_pipeline_backend.device.device import DeviceInfo
+from kernel_pipeline_backend.plugin.manager import PluginManager
+from kernel_pipeline_backend.plugin.plugin import PipelineEvent
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ class FakeCompiler:
     ) -> CompiledKernel:
         import json
 
-        from test_kernel_backend.core.compiler import CompilationError
+        from kernel_pipeline_backend.core.compiler import CompilationError
 
         key = json.dumps(config.params, sort_keys=True)
         if key in self._fail_configs:
@@ -201,7 +201,7 @@ class FakeStrategy:
     def suggest(
         self, space: SearchSpace, results: list[AutotuneResult],
     ) -> list[SearchPoint]:
-        from test_kernel_backend.autotuner.strategy import (
+        from kernel_pipeline_backend.autotuner.strategy import (
             _unevaluated_points,
         )
 

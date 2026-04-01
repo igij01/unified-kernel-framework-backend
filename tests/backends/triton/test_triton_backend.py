@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import pytest
 
-from test_kernel_backend.backends.triton.compiler import TritonCompiler
-from test_kernel_backend.backends.triton.runner import TritonRunner
-from test_kernel_backend.core.compiler import CompilationError
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.backends.triton.compiler import TritonCompiler
+from kernel_pipeline_backend.backends.triton.runner import TritonRunner
+from kernel_pipeline_backend.core.compiler import CompilationError
+from kernel_pipeline_backend.core.types import (
     CUDAArch,
     CompiledKernel,
     GridResult,

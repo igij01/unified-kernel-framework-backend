@@ -1,12 +1,12 @@
-"""Tests for test_kernel_backend.device — DeviceHandle and DeviceInfo."""
+"""Tests for kernel_pipeline_backend.device — DeviceHandle and DeviceInfo."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from test_kernel_backend.core.types import CUDAArch
-from test_kernel_backend.device.device import DeviceHandle, DeviceInfo
+from kernel_pipeline_backend.core.types import CUDAArch
+from kernel_pipeline_backend.device.device import DeviceHandle, DeviceInfo
 
 _HAS_GPU = False
 try:

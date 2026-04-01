@@ -10,10 +10,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from test_kernel_backend.backends.cuda.compiler import CUDACompiler
-from test_kernel_backend.backends.cuda.runner import CUDARunner
-from test_kernel_backend.core.compiler import CompilationError
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.backends.cuda.compiler import CUDACompiler
+from kernel_pipeline_backend.backends.cuda.runner import CUDARunner
+from kernel_pipeline_backend.core.compiler import CompilationError
+from kernel_pipeline_backend.core.types import (
     CUDAArch,
     CompiledKernel,
     GridResult,

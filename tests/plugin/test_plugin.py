@@ -1,4 +1,4 @@
-"""Tests for test_kernel_backend.plugin — Plugin protocol and PipelineEvent."""
+"""Tests for kernel_pipeline_backend.plugin — Plugin protocol and PipelineEvent."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from test_kernel_backend.plugin.plugin import (
+from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
     EVENT_AUTOTUNE_PROGRESS,
     EVENT_AUTOTUNE_START,

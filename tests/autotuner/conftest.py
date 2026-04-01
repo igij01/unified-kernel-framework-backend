@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CUDAArch,
     CompiledKernel,
@@ -18,7 +18,7 @@ from test_kernel_backend.core.types import (
     SearchPoint,
     SearchSpace,
 )
-from test_kernel_backend.device.device import DeviceInfo
+from kernel_pipeline_backend.device.device import DeviceInfo
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ class FakeCompiler:
         import json
         key = json.dumps(config.params, sort_keys=True)
         if key in self._fail_configs:
-            from test_kernel_backend.core.compiler import CompilationError
+            from kernel_pipeline_backend.core.compiler import CompilationError
             raise CompilationError(spec, config, "fake compilation error")
         return CompiledKernel(spec=spec, config=config)
 

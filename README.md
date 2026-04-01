@@ -1,4 +1,4 @@
-# test-kernel-backend
+# kernel-pipeline-backend
 
 Backend infrastructure for a GPU kernel deployment pipeline. Developers write kernels in any supported language/framework, and this system handles **verification**, **autotuning**, and **result storage** — producing optimized, tested kernel binaries ready for frontend packaging into PyTorch or TensorFlow operators.
 
@@ -64,7 +64,7 @@ Kernel binaries are compiled against specific CUDA versions, meaning a CUDA vers
 ## Project Structure
 
 ```
-test-kernel-backend/
+kernel-pipeline-backend/
 ├── cuda_docker_env/       # Docker environment for CUDA builds (submodule)
 ├── docs/
 │   └── adr/               # Architecture Decision Records

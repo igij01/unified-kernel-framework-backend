@@ -1,4 +1,4 @@
-"""Tests for test_kernel_backend.plugin.manager — PluginManager."""
+"""Tests for kernel_pipeline_backend.plugin.manager — PluginManager."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import asyncio
 
 import pytest
 
-from test_kernel_backend.plugin.plugin import PipelineEvent, Plugin
-from test_kernel_backend.plugin.manager import PluginManager
+from kernel_pipeline_backend.plugin.plugin import PipelineEvent, Plugin
+from kernel_pipeline_backend.plugin.manager import PluginManager
 
 
 # ---------------------------------------------------------------------------

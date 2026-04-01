@@ -1,4 +1,4 @@
-"""Tests for test_kernel_backend.versioning.hasher.KernelHasher."""
+"""Tests for kernel_pipeline_backend.versioning.hasher.KernelHasher."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pytest
 
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CUDAArch,
     GridResult,
@@ -16,8 +16,8 @@ from test_kernel_backend.core.types import (
     KernelSpec,
     SearchPoint,
 )
-from test_kernel_backend.storage.database import DatabaseStore
-from test_kernel_backend.versioning.hasher import KernelHasher
+from kernel_pipeline_backend.storage.database import DatabaseStore
+from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
 
 # ---------------------------------------------------------------------------

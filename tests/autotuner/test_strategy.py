@@ -1,10 +1,10 @@
-"""Tests for test_kernel_backend.autotuner.strategy — built-in strategies."""
+"""Tests for kernel_pipeline_backend.autotuner.strategy — built-in strategies."""
 
 from __future__ import annotations
 
 import pytest
 
-from test_kernel_backend.autotuner.strategy import (
+from kernel_pipeline_backend.autotuner.strategy import (
     BasinHopping,
     BayesianOptimization,
     DualAnnealing,
@@ -15,7 +15,7 @@ from test_kernel_backend.autotuner.strategy import (
     _point_key,
     _unevaluated_points,
 )
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     KernelConfig,
     SearchPoint,

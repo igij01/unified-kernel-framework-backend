@@ -1,4 +1,4 @@
-"""Tests for test_kernel_backend.pipeline — Pipeline orchestrator."""
+"""Tests for kernel_pipeline_backend.pipeline — Pipeline orchestrator."""
 
 from __future__ import annotations
 
@@ -6,20 +6,20 @@ import json
 
 import pytest
 
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CUDAArch,
     KernelConfig,
     SearchPoint,
     SearchSpace,
 )
-from test_kernel_backend.pipeline.pipeline import (
+from kernel_pipeline_backend.pipeline.pipeline import (
     Pipeline,
     PipelineError,
     PipelineResult,
 )
-from test_kernel_backend.plugin.manager import PluginManager
-from test_kernel_backend.plugin.plugin import (
+from kernel_pipeline_backend.plugin.manager import PluginManager
+from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
     EVENT_AUTOTUNE_PROGRESS,
     EVENT_AUTOTUNE_START,
@@ -32,7 +32,7 @@ from test_kernel_backend.plugin.plugin import (
     EVENT_VERIFY_FAIL,
     EVENT_VERIFY_START,
 )
-from test_kernel_backend.verifier.verifier import VerificationResult
+from kernel_pipeline_backend.verifier.verifier import VerificationResult
 
 from .conftest import (
     FakeCompiler,
@@ -124,7 +124,7 @@ class TestChangeDetection:
         spec = make_spec()
 
         # Pre-populate store with a result for this kernel
-        from test_kernel_backend.versioning.hasher import KernelHasher
+        from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
         kh = KernelHasher().hash(spec)
         store.results.append(
@@ -143,7 +143,7 @@ class TestChangeDetection:
         store = FakeResultStore()
         spec = make_spec()
 
-        from test_kernel_backend.versioning.hasher import KernelHasher
+        from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
         kh = KernelHasher().hash(spec)
         store.results.append(
@@ -249,7 +249,7 @@ class TestVerification:
                 self._calls += 1
                 if self._calls > 2:
                     return []
-                from test_kernel_backend.autotuner.strategy import (
+                from kernel_pipeline_backend.autotuner.strategy import (
                     _enumerate_all_points,
                 )
                 return _enumerate_all_points(space)
@@ -538,7 +538,7 @@ class TestMultipleKernels:
         spec1 = make_spec(name="cached", source="void cached() {}")
         spec2 = make_spec(name="new", source="void new() {}")
 
-        from test_kernel_backend.versioning.hasher import KernelHasher
+        from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
         kh = KernelHasher().hash(spec1)
         store.results.append(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.core.types import (
     CompiledKernel,
     CUDAArch,
     GridResult,
@@ -12,7 +12,7 @@ from test_kernel_backend.core.types import (
     KernelSpec,
     RunResult,
 )
-from test_kernel_backend.device.device import DeviceInfo
+from kernel_pipeline_backend.device.device import DeviceInfo
 
 
 # ---------------------------------------------------------------------------

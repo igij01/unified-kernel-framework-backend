@@ -1,4 +1,4 @@
-"""Tests for test_kernel_backend.autotuner.autotuner — strategy loop orchestrator.
+"""Tests for kernel_pipeline_backend.autotuner.autotuner — strategy loop orchestrator.
 
 The Autotuner drives a Strategy over the search space, delegates per-point
 benchmarking to the Profiler, handles verification via the Verifier, stores
@@ -13,14 +13,14 @@ from typing import Any
 
 import pytest
 
-from test_kernel_backend.autotuner.autotuner import (
+from kernel_pipeline_backend.autotuner.autotuner import (
     Autotuner,
     AutotuneError,
     AutotuneRunResult,
 )
-from test_kernel_backend.autotuner.profiler import Profiler
-from test_kernel_backend.autotuner.strategy import _unevaluated_points
-from test_kernel_backend.core.types import (
+from kernel_pipeline_backend.autotuner.profiler import Profiler
+from kernel_pipeline_backend.autotuner.strategy import _unevaluated_points
+from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
     CUDAArch,
@@ -29,8 +29,8 @@ from test_kernel_backend.core.types import (
     SearchPoint,
     SearchSpace,
 )
-from test_kernel_backend.plugin.manager import PluginManager
-from test_kernel_backend.plugin.plugin import (
+from kernel_pipeline_backend.plugin.manager import PluginManager
+from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
     EVENT_AUTOTUNE_PROGRESS,
     EVENT_AUTOTUNE_START,
@@ -39,7 +39,7 @@ from test_kernel_backend.plugin.plugin import (
     EVENT_VERIFY_START,
     PipelineEvent,
 )
-from test_kernel_backend.verifier.verifier import Verifier
+from kernel_pipeline_backend.verifier.verifier import Verifier
 
 from .conftest import (
     FakeDeviceHandle,
@@ -839,7 +839,7 @@ class TestResultCorrectness:
     async def test_tuned_results_have_kernel_hash(self) -> None:
         """When spec has a version hash, it propagates to results."""
         spec = make_spec()
-        from test_kernel_backend.versioning.hasher import KernelHasher
+        from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
         kh = KernelHasher().hash(spec)
         from dataclasses import replace

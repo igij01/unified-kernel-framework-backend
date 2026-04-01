@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-This directory contains Architecture Decision Records (ADRs) for test-kernel-backend.
+This directory contains Architecture Decision Records (ADRs) for kernel-pipeline-backend.
 
 ## Index
 
@@ -16,6 +16,7 @@ This directory contains Architecture Decision Records (ADRs) for test-kernel-bac
 | [0008](0008-observer-custom-metrics.md) | Observer for Custom Autotuning Metrics | Accepted | 2026-03-17 |
 | [0009](0009-profiler-autotuner-split.md) | Split Autotuner into Profiler + Autotuner | Accepted | 2026-03-30 |
 | [0010](0010-kernel-problem-registry.md) | Kernel and Problem Registry | Accepted | 2026-03-30 |
+| [0011](0011-tune-service.md) | TuneService — Frontend Orchestration Layer | Accepted | 2026-03-31 |
 
 ## Creating a New ADR
 

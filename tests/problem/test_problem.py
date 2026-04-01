@@ -1,12 +1,12 @@
-"""Tests for test_kernel_backend.problem.problem."""
+"""Tests for kernel_pipeline_backend.problem.problem."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from test_kernel_backend.problem.helpers import ones_tensor, rand_tensor
-from test_kernel_backend.problem.problem import (
+from kernel_pipeline_backend.problem.helpers import ones_tensor, rand_tensor
+from kernel_pipeline_backend.problem.problem import (
     Problem,
     enumerate_sizes,
     filter_size_points,

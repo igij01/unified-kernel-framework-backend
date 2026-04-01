@@ -1,11 +1,11 @@
-"""Tests for test_kernel_backend.problem.helpers."""
+"""Tests for kernel_pipeline_backend.problem.helpers."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from test_kernel_backend.problem.helpers import (
+from kernel_pipeline_backend.problem.helpers import (
     _validate_shape,
     full_tensor,
     ones_tensor,

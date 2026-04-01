@@ -1,6 +1,6 @@
 # Class Structure
 
-First draft of the module and class design for test-kernel-backend.
+First draft of the module and class design for kernel-pipeline-backend.
 
 ## Design Principles
 
@@ -14,7 +14,7 @@ First draft of the module and class design for test-kernel-backend.
 ## Package Layout
 
 ```
-test_kernel_backend/
+kernel_pipeline_backend/
 ├── core/                    # Protocols, data types, zero external deps
 │   ├── types.py             # Shared data types (SearchPoint, AutotuneResult, etc.)
 │   ├── compiler.py          # Compiler protocol
@@ -55,6 +55,9 @@ test_kernel_backend/
 ├── registry/                # Kernel & problem catalog (frontend)
 │   └── registry.py          # Registry singleton — kernel store, problem store, linkage
 │
+├── service/                 # User-facing orchestration
+│   └── service.py           # TuneService — tune by name, reads Registry
+│
 ├── pipeline/                # Top-level orchestration
 │   └── pipeline.py          # Pipeline class
 │
@@ -80,33 +83,37 @@ test_kernel_backend/
 Only downward dependencies are allowed. No module may import from a module above it.
 
 ```
-  ┌──────────────┐
-  │   registry   │  Frontend: kernel & problem catalog (singleton)
-  └──────┬───────┘
-         │ provides KernelSpec + Problem to
-         ▼
-  ┌─────────────┐
-  │   pipeline  │  Orchestrates the full workflow
-  └──────┬──────┘
-         │
-         ┌────────────────┼────────────────┐
-         │                │                │
-         ▼                ▼                ▼
-  ┌────────────┐  ┌────────────┐  ┌────────────┐
-  │  verifier  │  │  autotuner │  │   plugin   │
-  └──────┬─────┘  └──┬───┬──┬──┘  └──────┬─────┘
-         │            │   │  │             │
-         │            │   │  └─────┐      │
-         ▼            ▼   ▼        ▼      ▼
-  ┌────────────┐  ┌───────┐  ┌────────┐  ┌──────────┐
-  │   problem  │  │strateg│  │profiler│  │  storage │
-  └────────────┘  └───────┘  └──┬─────┘  └──────────┘
-                                │
-                             ┌──┴──┐
-                             ▼     ▼
-                       ┌──────┐ ┌──────────┐
-                       │observ│ │  device  │
-                       └──────┘ └──────────┘
+  ┌───────────────┐
+  │  TuneService  │  User-facing entry point: tune("name"), tune_problem(...)
+  └──────┬────────┘
+         │ reads from          constructs per request
+         ▼                            │
+  ┌──────────────┐                    │
+  │   registry   │  Kernel & problem  │
+  └──────────────┘  catalog           │
+                                      ▼
+                               ┌─────────────┐
+                               │   pipeline  │  Orchestrates the full workflow
+                               └──────┬──────┘
+                                      │
+                  ┌───────────────────┼───────────────────┐
+                  │                   │                    │
+                  ▼                   ▼                    ▼
+           ┌────────────┐     ┌────────────┐     ┌────────────┐
+           │  verifier  │     │  autotuner │     │   plugin   │
+           └──────┬─────┘     └──┬───┬──┬──┘     └──────┬─────┘
+                  │               │   │  │              │
+                  │               │   │  └─────┐       │
+                  ▼               ▼   ▼        ▼       ▼
+           ┌────────────┐   ┌───────┐  ┌────────┐  ┌──────────┐
+           │   problem  │   │strateg│  │profiler│  │  storage │
+           └────────────┘   └───────┘  └──┬─────┘  └──────────┘
+                                          │
+                                       ┌──┴──┐
+                                       ▼     ▼
+                                 ┌──────┐ ┌──────────┐
+                                 │observ│ │  device  │
+                                 └──────┘ └──────────┘
 
   ┌─────────────────────────────────────────────────┐
   │                    core                         │
@@ -120,10 +127,9 @@ Only downward dependencies are allowed. No module may import from a module above
   └─────────────────────────────────────────────────┘
 ```
 
-The registry sits **above** the pipeline — it is a frontend catalog, not part of
-the pipeline's internal machinery. The pipeline remains reentrant and unaware of
-the registry. Other orchestration layers (a future service/main class) pull
-`KernelSpec` and `Problem` from the registry and feed them into pipeline runs.
+`TuneService` sits at the top — it reads the `Registry` to resolve names,
+then constructs a fresh `Pipeline` per request from shared resources (device,
+store).  The pipeline remains reentrant and unaware of the registry.
 
 ---
 
@@ -1078,8 +1084,8 @@ class Registry:
 ```python
 # ── In user's kernel module (imported at package init) ────────
 
-from test_kernel_backend.registry import Registry
-from test_kernel_backend.core.types import CUDAArch
+from kernel_pipeline_backend.registry import Registry
+from kernel_pipeline_backend.core.types import CUDAArch
 
 # Problem via decorator
 @Registry.problem("matmul")
@@ -1121,6 +1127,165 @@ result = await pipeline.run(specs, problem, strategy, observers)
 
 ---
 
+## Service Module — `service/`
+
+Depends on: `registry`, `pipeline`, `core` (BackendRegistry), `device`, `storage`, `plugin`, `autotuner` (strategies, observers)
+
+The service module provides the **user-facing entry point** for the entire
+system.  `TuneService` owns shared resources, reads the `Registry` singleton
+to resolve names, constructs a fresh `Pipeline` per request, and returns
+results.
+
+### `service/service.py`
+
+```python
+@dataclass
+class TuneResult:
+    """Result of tuning one or more kernels."""
+    kernel_names: list[str]
+    problem_name: str | None                  # None for unlinked kernels
+    pipeline_result: PipelineResult
+
+class TuneService:
+    """User-facing orchestration layer.
+
+    Owns shared resources (device, store) and default configuration
+    (strategy, observers, plugins).  Each tune request constructs a
+    fresh Pipeline, resolving kernel/problem names through the
+    module-wide Registry singleton.
+    """
+
+    def __init__(
+        self,
+        device: DeviceHandle,
+        store: ResultStore,
+        *,
+        strategy: Strategy | None = None,         # default: Exhaustive()
+        observers: list[Observer] | None = None,   # default: [TimingObserver()]
+        plugins: list[Plugin] | None = None,       # default: []
+    ): ...
+
+    # ── Request API ───────────────────────────────────────────
+
+    async def tune(
+        self,
+        kernel_name: str,
+        *,
+        problem: str | None = None,       # override which problem to use
+        strategy: Strategy | None = None,  # override default strategy
+        observers: list[Observer] | None = None,
+        plugins: list[Plugin] | None = None,
+        force: bool = False,
+        skip_verify: bool = False,
+        skip_autotune: bool = False,
+    ) -> TuneResult:
+        """Tune a single kernel by name.
+
+        Resolution:
+          1. Registry.get_kernel(kernel_name) → KernelSpec
+          2. Resolve problem:
+             - If ``problem`` given: use that problem name.
+             - Elif kernel has linked problems: use the first.
+             - Else: skip_verify=True (autotune without verification).
+          3. Look up Compiler/Runner from BackendRegistry.
+          4. Construct Pipeline, run, shut down plugins, return.
+        """
+        ...
+
+    async def tune_problem(
+        self,
+        problem_name: str,
+        *,
+        strategy: Strategy | None = None,
+        observers: list[Observer] | None = None,
+        plugins: list[Plugin] | None = None,
+        force: bool = False,
+        skip_verify: bool = False,
+        skip_autotune: bool = False,
+    ) -> TuneResult:
+        """Tune all kernels linked to a problem.
+
+        Resolves ``Registry.kernels_for_problem(problem_name)`` and passes
+        the full list to a single ``pipeline.run()`` call.
+        """
+        ...
+
+    async def tune_all(
+        self,
+        *,
+        strategy: Strategy | None = None,
+        observers: list[Observer] | None = None,
+        plugins: list[Plugin] | None = None,
+        force: bool = False,
+        skip_verify: bool = False,
+        skip_autotune: bool = False,
+    ) -> list[TuneResult]:
+        """Tune every kernel in the registry.
+
+        Groups kernels by problem, then issues one pipeline run per
+        problem group.  Unlinked kernels are collected into a final
+        run with skip_verify=True.
+        """
+        ...
+```
+
+### Per-request pipeline construction
+
+```
+tune("matmul_splitk")
+    │
+    ├── Registry.get_kernel("matmul_splitk")         → KernelSpec
+    ├── Registry.problems_for_kernel("matmul_splitk") → ["matmul"]
+    ├── Registry.get_problem("matmul")                → Problem
+    │
+    ├── BackendRegistry.get_compiler("triton")        → TritonCompiler
+    ├── BackendRegistry.get_runner("triton")          → TritonRunner
+    │
+    ├── PluginManager()                               ← register plugins
+    │
+    ├── Pipeline(compiler, runner, store, plugins, device)
+    │       └── await pipeline.run([spec], problem, strategy, observers)
+    │
+    ├── await plugin_manager.shutdown_all()
+    │
+    └── return TuneResult(...)
+```
+
+### Usage example
+
+```python
+from kernel_pipeline_backend.service import TuneService
+from kernel_pipeline_backend.device import DeviceHandle
+from kernel_pipeline_backend.storage import DatabaseStore
+from kernel_pipeline_backend.autotuner import BayesianOptimization, NCUObserver
+
+# Import user kernel/problem modules — triggers @Registry decorators
+import my_project.kernels
+import my_project.problems
+
+# One-time setup
+service = TuneService(
+    device=DeviceHandle(0),
+    store=DatabaseStore("results.db"),
+    strategy=BayesianOptimization(),
+    observers=[NCUObserver()],
+)
+
+# Tune a single kernel (uses service defaults)
+result = await service.tune("matmul_splitk")
+
+# Tune with per-request override
+result = await service.tune("matmul_splitk", strategy=Exhaustive())
+
+# Tune all kernels that solve "matmul"
+result = await service.tune_problem("matmul")
+
+# Tune everything in the registry
+results = await service.tune_all()
+```
+
+---
+
 ## Backends — `backends/`
 
 Each backend implements `Compiler` and `Runner` from `core/`, then registers itself.
@@ -1135,7 +1300,7 @@ A new backend only needs to:
 
 ```python
 # backends/my_new_lang/__init__.py
-from test_kernel_backend.core.registry import registry
+from kernel_pipeline_backend.core.registry import registry
 from .compiler import MyNewLangCompiler
 from .runner import MyNewLangRunner
 
@@ -1238,11 +1403,13 @@ User registers (at import time):
   @Registry.kernel("matmul_splitk")  → stored in Registry
   Registry.link("matmul_splitk", "matmul")
 
-Orchestration layer queries:
-  specs   = [Registry.get_kernel(n) for n in Registry.kernels_for_problem("matmul")]
-  problem = Registry.get_problem("matmul")
-  strategy = BayesianOptimization(...)
-  observers = [NCUObserver()]
+User calls TuneService:
+  service = TuneService(device, store, strategy=BayesianOptimization(),
+                        observers=[NCUObserver()])
+  result = await service.tune("matmul_splitk")
+     └─► resolves name via Registry → KernelSpec + Problem
+         looks up backend → Compiler + Runner
+         constructs Pipeline per request
 
                     ┌───────────────────────────┐
                     │     KernelSpec + Problem    │
@@ -1322,4 +1489,5 @@ Orchestration layer queries:
 | `plugin/` | [ADR-0004](adr/0004-async-plugin-execution.md) | Async plugin execution |
 | `versioning/` | [ADR-0001](adr/0001-llvm-inspired-pipeline-architecture.md) | Content-based kernel versioning |
 | `registry/` | [ADR-0010](adr/0010-kernel-problem-registry.md) | Kernel & problem catalog with many-to-many linkage |
+| `service/` | [ADR-0011](adr/0011-tune-service.md) | TuneService — user-facing orchestration, pipeline-per-request |
 | `backends/` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Isolated backend implementations |
