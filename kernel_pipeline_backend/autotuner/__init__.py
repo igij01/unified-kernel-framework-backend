@@ -32,6 +32,7 @@ from kernel_pipeline_backend.autotuner.observer import (
     NCUObserver,
     MemoryObserver,
 )
+from kernel_pipeline_backend.autotuner.instrument import Instrument
 
 __all__ = [
     "Autotuner",
@@ -49,4 +50,5 @@ __all__ = [
     "TimingObserver",
     "NCUObserver",
     "MemoryObserver",
+    "Instrument",
 ]

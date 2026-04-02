@@ -27,13 +27,16 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from kernel_pipeline_backend.core.registry import registry as backend_registry
+from kernel_pipeline_backend.core.types import CompileOptions, PointResult
 from kernel_pipeline_backend.pipeline.pipeline import Pipeline, PipelineResult
 from kernel_pipeline_backend.plugin.manager import PluginManager
 from kernel_pipeline_backend.registry import Registry
 
 if TYPE_CHECKING:
+    from kernel_pipeline_backend.autotuner.instrument import Instrument
     from kernel_pipeline_backend.autotuner.observer import Observer
     from kernel_pipeline_backend.autotuner.strategy import Strategy
+    from kernel_pipeline_backend.core.types import SearchPoint
     from kernel_pipeline_backend.device.device import DeviceHandle
     from kernel_pipeline_backend.plugin.plugin import Plugin
     from kernel_pipeline_backend.storage.store import ResultStore
@@ -478,3 +481,83 @@ class TuneService:
             results.append(result)
 
         return results
+
+    async def run_point(
+        self,
+        kernel_name: str,
+        point: SearchPoint,
+        *,
+        problem: str | None = None,
+        observers: list[Observer] | None = None,
+        instruments: list[Instrument] | None = None,
+        compile_options: CompileOptions | None = None,
+        verify: bool = True,
+        profile: bool = True,
+    ) -> PointResult:
+        """Execute a single (kernel, point) pair: compile, verify, profile.
+
+        Resolves kernel and problem names from the Registry, wires up a
+        fresh Pipeline, and delegates to :meth:`Pipeline.run_point`.  The
+        pipeline and plugin manager are torn down after each call.
+
+        Resolution:
+
+        1. ``Registry.get_kernel(kernel_name)`` → ``KernelSpec``.
+        2. Resolve problem:
+
+           - If ``problem`` is given: use that problem name.
+           - Elif kernel has linked problems: use the first (sorted).
+           - Else: ``verify`` is forced to ``False`` (no problem → can't
+             verify), and profiling is skipped too.
+
+        Args:
+            kernel_name: Registered kernel name.
+            point: The (sizes, config) pair to evaluate.
+            problem: Override which problem to use.  If ``None``, uses
+                the first linked problem or skips verify/profile.
+            observers: Override the service-level default observers.
+            instruments: Instruments to apply before compilation.
+            compile_options: Extra flags / optimization level overrides.
+            verify: Whether to run verification.
+            profile: Whether to run profiling.
+
+        Returns:
+            :class:`PointResult` with compilation, verification, and
+            profiling outcomes.
+
+        Raises:
+            KeyError: If ``kernel_name`` or ``problem`` is not registered.
+        """
+        spec = Registry.get_kernel(kernel_name)
+
+        # Resolve problem
+        problem_name = problem
+        problem_obj = None
+        if problem_name is None:
+            linked = Registry.problems_for_kernel(kernel_name)
+            if linked:
+                problem_name = linked[0]
+
+        if problem_name is not None:
+            problem_obj = Registry.get_problem(problem_name)
+        else:
+            verify = False
+
+        resolved_observers = self._resolve_observers(observers)
+        resolved_plugins = self._resolve_plugins(None)
+
+        pm = await self._build_plugin_manager(resolved_plugins)
+        try:
+            pipeline = self._build_pipeline(spec.backend, pm)
+            return await pipeline.run_point(
+                spec,
+                point,
+                problem_obj,
+                resolved_observers,
+                instruments=instruments,
+                compile_options=compile_options,
+                verify=verify,
+                profile=profile,
+            )
+        finally:
+            await pm.shutdown_all()

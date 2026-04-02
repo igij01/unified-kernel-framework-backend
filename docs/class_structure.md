@@ -32,6 +32,8 @@ kernel_pipeline_backend/
 │   ├── profiler.py          # Profiler — single-point benchmarker (warmup + profiling cycles)
 │   ├── autotuner.py         # Autotuner — strategy loop orchestrator
 │   ├── strategy.py          # Strategy protocol + built-in strategies
+│   ├── instrument/          # Instrument protocol (compile-time transform + paired observer)
+│   │   └── instrument.py    # Instrument protocol
 │   └── observer/            # Observer protocol + built-in observers
 │       ├── observer.py      # Observer protocol
 │       ├── timing.py        # TimingObserver (wall-clock timing)
@@ -109,11 +111,16 @@ Only downward dependencies are allowed. No module may import from a module above
            │   problem  │   │strateg│  │profiler│  │  storage │
            └────────────┘   └───────┘  └──┬─────┘  └──────────┘
                                           │
-                                       ┌──┴──┐
-                                       ▼     ▼
-                                 ┌──────┐ ┌──────────┐
-                                 │observ│ │  device  │
-                                 └──────┘ └──────────┘
+                                    ┌─────┼─────┐
+                                    ▼     ▼     ▼
+                              ┌───────┐┌──────┐┌──────────┐
+                              │instrum││observ││  device  │
+                              └───┬───┘└──────┘└──────────┘
+                                  │
+                                  ▼
+                              ┌──────┐
+                              │observ│  (instrument-owned)
+                              └──────┘
 
   ┌─────────────────────────────────────────────────┐
   │                    core                         │
@@ -171,7 +178,7 @@ class RunResult:
     """Output from a single kernel invocation."""
     outputs: list[torch.Tensor]
     time_ms: float
-    metrics: dict[str, float]            # observer-contributed metrics
+    metrics: dict[str, Any]              # observer-contributed metrics (widened for artifact refs)
 
 @dataclass
 class AutotuneResult:
@@ -180,8 +187,31 @@ class AutotuneResult:
     arch: str
     point: SearchPoint
     time_ms: float
-    metrics: dict[str, float]            # merged observer metrics
+    metrics: dict[str, Any]              # merged observer metrics (widened for artifact refs)
     timestamp: datetime
+
+@dataclass(frozen=True)
+class CompileOptions:
+    """Simple compilation flag overrides for run_point().
+
+    For flag-only adjustments that don't require source transformation
+    or runtime artifact capture.  For more complex instrumentation
+    (source wrapping, artifact collection), use an Instrument instead.
+
+    Ephemeral — does not affect the kernel's identity (version hash).
+    """
+    extra_flags: dict[str, Any] = field(default_factory=dict)
+    optimization_level: str | None = None
+
+@dataclass
+class PointResult:
+    """Result of a single-point execution via Pipeline.run_point()."""
+    kernel_name: str
+    point: SearchPoint
+    compiled: CompiledKernel | None          # None if compilation failed
+    compile_error: CompilationError | None
+    verification: VerificationResult | None  # None if verify=False
+    profile_result: AutotuneResult | None    # None if profile=False
 ```
 
 ### `core/compiler.py` — Compiler Protocol
@@ -553,7 +583,11 @@ class Observer(Protocol):
 
     def setup(self, device: DeviceHandle) -> None: ...
     def before_run(self, device: DeviceHandle, point: SearchPoint) -> None: ...
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, float]: ...
+    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, Any]:
+        """Returns metric_name → value.  Values are typically float
+        (timing, occupancy) but may be other types for instrument-owned
+        observers (file paths, structured diagnostics)."""
+        ...
     def teardown(self, device: DeviceHandle) -> None: ...
 ```
 
@@ -582,6 +616,89 @@ class MemoryObserver:
     """Tracks peak GPU memory allocation during kernel execution.
     supported_backends = None, run_once = False."""
     ...
+```
+
+### `autotuner/instrument/instrument.py` — Instrument Protocol
+
+Instruments are user-supplied pluggable classes that span both compilation
+and execution (see [ADR-0012](adr/0012-single-point-execution.md)).  Unlike
+Observers which only hook into execution, Instruments participate in
+compilation by transforming the kernel source and/or flags *before* the
+Compiler sees them.
+
+Each Instrument contains an optional Observer that is automatically
+registered with the Profiler — this ensures compile-time instrumentation
+and runtime artifact capture are always enabled together.
+
+```python
+class Instrument(Protocol):
+    """User-supplied instrumentation spanning compilation and execution.
+
+    Transforms the kernel at compile time (source wrapping, flag
+    overrides) and optionally provides a paired Observer for runtime
+    artifact capture.
+
+    The Pipeline applies instruments before calling compiler.compile():
+      1. source = instrument.transform_source(source, spec)
+      2. flags  = instrument.transform_compile_flags(flags)
+      3. instrument.observer is auto-added to the Profiler's observer list
+    """
+
+    @property
+    def observer(self) -> Observer | None:
+        """Paired Observer for runtime artifact capture.
+        Automatically registered with the Profiler alongside any
+        explicitly-provided observers.  Returns None if this instrument
+        does not need runtime observation (e.g., pure flag overrides)."""
+        ...
+
+    def transform_source(self, source: Any, spec: KernelSpec) -> Any:
+        """Transform the kernel source before compilation.
+
+        Receives the full spec for context (backend, flags, etc.)
+        but returns only the modified source.  The Pipeline handles
+        creating a new spec with the modified source.
+
+        Return the source unmodified if no transformation is needed."""
+        ...
+
+    def transform_compile_flags(
+        self, flags: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Modify compilation flags before passing to the Compiler.
+
+        Called after CompileOptions.extra_flags have been merged.
+        Return the flags dict (possibly modified)."""
+        ...
+```
+
+### Instrument vs Observer vs CompileOptions
+
+| Mechanism | When to use | Compile-time | Runtime |
+|-----------|------------|-------------|---------|
+| **Observer** | Collect metrics around execution | No | Yes |
+| **CompileOptions** | Quick flag overrides (`-G`, `-O0`) | Flags only | No |
+| **Instrument** | Source transformation + artifact capture | Source + flags | Via contained Observer |
+
+### Responsibility boundaries
+
+```
+Pipeline.run_point()
+      │
+      │ 1. Merge CompileOptions.extra_flags
+      │ 2. For each Instrument:
+      │    a. transform_source()  → modified source
+      │    b. transform_compile_flags() → modified flags
+      │    c. collect instrument.observer
+      │
+      ▼
+compiler.compile(modified_spec, config)   ◄── unchanged protocol
+      │
+      ▼
+Profiler  with  observers = explicit + instrument-owned
+      │
+      ▼
+PointResult
 ```
 
 ---
@@ -813,6 +930,27 @@ class Pipeline:
         skip_autotune: bool = False,      # skip autotuning stage
     ) -> PipelineResult: ...
 
+    async def run_point(
+        self,
+        spec: KernelSpec,
+        point: SearchPoint,
+        problem: Problem | None,
+        observers: list[Observer] | None = None,
+        *,
+        instruments: list[Instrument] | None = None,
+        compile_options: CompileOptions | None = None,
+        verify: bool = True,
+        profile: bool = True,
+    ) -> PointResult:
+        """Run a single search point through compile → verify → profile.
+
+        Bypasses the Autotuner strategy loop.  Applies CompileOptions
+        and Instruments to the spec before compilation.  Instrument-owned
+        observers are automatically combined with explicit observers.
+        Results are ephemeral (not stored) by default.
+        """
+        ...
+
 @dataclass
 class PipelineResult:
     verified: list[VerificationResult]
@@ -841,6 +979,53 @@ For each kernel in ``kernels``:
      and autotune plugin events (``AUTOTUNE_START``, ``AUTOTUNE_PROGRESS``,
      ``AUTOTUNE_COMPLETE``).
    - Profiler teardown is handled in a ``finally`` block.
+
+### Single-point orchestration (``run_point``)
+
+For a single ``(sizes, config)`` pair — used for debugging and
+investigation ([ADR-0012](adr/0012-single-point-execution.md)):
+
+1. **Merge CompileOptions** — apply ``extra_flags``, ``optimization_level``
+2. **Apply Instruments** — for each instrument:
+   ``transform_source()`` then ``transform_compile_flags()``
+3. **Compile** — ``compiler.compile(modified_spec, config)``
+4. **Collect observers** — explicit observers + ``instrument.observer``
+   for each instrument
+5. **Verify** (if enabled) — ``Verifier.verify()`` at the single size point
+6. **Profile** (if enabled) — ``Profiler.profile()`` with combined observers
+7. Return ``PointResult``
+
+No version hashing, no strategy loop, no result storage (ephemeral).
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Pipeline.run_point()                      │
+│                                                              │
+│   CompileOptions ──┐                                         │
+│   Instruments ─────┤                                         │
+│                    ▼                                         │
+│            ┌───────────────┐                                 │
+│            │ Merge flags & │                                 │
+│            │ transform src │                                 │
+│            └───────┬───────┘                                 │
+│                    ▼                                         │
+│            ┌───────────────┐                                 │
+│            │   Compile     │  compiler.compile() ← unchanged │
+│            │  (one config) │                                 │
+│            └───────┬───────┘                                 │
+│                    ▼                                         │
+│            ┌───────────────┐                                 │
+│            │    Verify     │  optional                       │
+│            └───────┬───────┘                                 │
+│                    ▼                                         │
+│            ┌───────────────┐                                 │
+│            │   Profile     │  observers = explicit           │
+│            │               │            + instrument-owned   │
+│            └───────┬───────┘                                 │
+│                    ▼                                         │
+│              PointResult                                     │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -1227,6 +1412,28 @@ class TuneService:
         run with skip_verify=True.
         """
         ...
+
+    async def run_point(
+        self,
+        kernel_name: str,
+        point: SearchPoint,
+        *,
+        problem: str | None = None,
+        observers: list[Observer] | None = None,
+        instruments: list[Instrument] | None = None,
+        compile_options: CompileOptions | None = None,
+        verify: bool = True,
+        profile: bool = True,
+    ) -> PointResult:
+        """Run a single search point for debugging or investigation.
+
+        Bypasses the Autotuner strategy loop.  Resolves kernel/problem
+        from Registry, applies CompileOptions and Instruments, then
+        delegates to Pipeline.run_point().
+
+        Results are ephemeral (not stored in ResultStore by default).
+        """
+        ...
 ```
 
 ### Per-request pipeline construction
@@ -1282,6 +1489,38 @@ result = await service.tune_problem("matmul")
 
 # Tune everything in the registry
 results = await service.tune_all()
+```
+
+### Single-point debugging example
+
+```python
+from kernel_pipeline_backend.core.types import (
+    CompileOptions, SearchPoint, KernelConfig,
+)
+
+# Debug a specific point that failed verification
+result = await service.run_point(
+    "matmul_splitk",
+    SearchPoint(
+        sizes={"M": 4096, "N": 4096, "K": 512},
+        config=KernelConfig(params={"BLOCK_M": 128, "BLOCK_N": 128, ...}),
+    ),
+    compile_options=CompileOptions(extra_flags={"-G": True}),
+    observers=[NCUObserver(), MemoryObserver()],
+    verify=True,
+    profile=True,
+)
+
+# Triton-viz instrumentation (user-supplied instrument bundles observer)
+from my_project.instruments import TritonVizInstrument
+
+result = await service.run_point(
+    "matmul_persistent",
+    point,
+    instruments=[TritonVizInstrument(output_dir="/tmp/traces")],
+    profile=True,
+)
+trace_path = result.profile_result.metrics["triton_viz_trace_path"]
 ```
 
 ---
@@ -1490,4 +1729,6 @@ User calls TuneService:
 | `versioning/` | [ADR-0001](adr/0001-llvm-inspired-pipeline-architecture.md) | Content-based kernel versioning |
 | `registry/` | [ADR-0010](adr/0010-kernel-problem-registry.md) | Kernel & problem catalog with many-to-many linkage |
 | `service/` | [ADR-0011](adr/0011-tune-service.md) | TuneService — user-facing orchestration, pipeline-per-request |
+| `autotuner/instrument/` | [ADR-0012](adr/0012-single-point-execution.md) | Instrument protocol — pluggable compile-time transform + paired observer |
+| `pipeline/` `run_point()` | [ADR-0012](adr/0012-single-point-execution.md) | Single-point execution for debugging and investigation |
 | `backends/` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Isolated backend implementations |

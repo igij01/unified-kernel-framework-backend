@@ -70,6 +70,7 @@ class FakeCompiler:
         ]
         self._fail_configs = fail_configs or set()
         self.compile_count = 0
+        self.last_compiled_spec: KernelSpec | None = None
 
     @property
     def backend_name(self) -> str:
@@ -89,6 +90,7 @@ class FakeCompiler:
         if key in self._fail_configs:
             raise CompilationError(spec, config, "fake compilation error")
         self.compile_count += 1
+        self.last_compiled_spec = spec
         return CompiledKernel(spec=spec, config=config)
 
 
@@ -209,6 +211,23 @@ class FakeStrategy:
 
     def is_converged(self, results: list[AutotuneResult]) -> bool:
         return False  # loop exits when suggest() returns []
+
+
+class FakeInstrument:
+    """Identity instrument — passes source and flags through unchanged."""
+
+    def __init__(self, observer: Any = None) -> None:
+        self._observer = observer
+
+    @property
+    def observer(self) -> Any:
+        return self._observer
+
+    def transform_source(self, source: Any, spec: Any) -> Any:
+        return source
+
+    def transform_compile_flags(self, flags: dict[str, Any]) -> dict[str, Any]:
+        return dict(flags)
 
 
 class TrackingPlugin:

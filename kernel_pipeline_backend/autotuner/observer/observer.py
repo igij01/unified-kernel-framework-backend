@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from kernel_pipeline_backend.core.types import SearchPoint
 
@@ -72,7 +72,7 @@ class Observer(Protocol):
         """
         ...
 
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, float]:
+    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, Any]:
         """Called after a kernel invocation.
 
         Args:
@@ -81,6 +81,8 @@ class Observer(Protocol):
 
         Returns:
             Dict of metric_name → value, merged into the AutotuneResult.
+            Values are typically ``float`` but may be other types for
+            instrument-owned observers.
         """
         ...
 

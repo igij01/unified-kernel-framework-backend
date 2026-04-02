@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, unique
-from typing import Any, Callable, Union
+from typing import TYPE_CHECKING, Any, Callable, Union
+
+if TYPE_CHECKING:
+    from kernel_pipeline_backend.core.compiler import CompilationError
+    from kernel_pipeline_backend.verifier.verifier import VerificationResult
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +289,21 @@ class SearchSpace:
     configs: list[KernelConfig] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CompileOptions:
+    """Compilation overrides for a single run_point() call.
+
+    Attributes:
+        extra_flags: Additional compile flags merged over the spec's flags.
+            Later keys win on collision.
+        optimization_level: If set, stored under the ``"optimization_level"``
+            key after merging ``extra_flags``.
+    """
+
+    extra_flags: dict[str, Any] = field(default_factory=dict)
+    optimization_level: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
@@ -301,7 +320,7 @@ class RunResult:
 
     outputs: list[Any] = field(default_factory=list)  # list[torch.Tensor]
     time_ms: float = 0.0
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,5 +340,28 @@ class AutotuneResult:
     arch: CUDAArch | None = None
     point: SearchPoint = field(default_factory=SearchPoint)
     time_ms: float = 0.0
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class PointResult:
+    """Result from a single-point execution via Pipeline.run_point().
+
+    Attributes:
+        kernel_name: Name of the kernel that was executed.
+        point: The (sizes, config) pair that was executed.
+        compiled: The compiled kernel, or None if compilation failed.
+        compile_error: Compilation error, or None if compilation succeeded.
+        verification: Verification result, or None if verify=False or
+            no problem was provided.
+        profile_result: Profiling result (AutotuneResult), or None if
+            profile=False or no problem was provided.
+    """
+
+    kernel_name: str = ""
+    point: SearchPoint = field(default_factory=SearchPoint)
+    compiled: CompiledKernel | None = None
+    compile_error: CompilationError | None = None
+    verification: VerificationResult | None = None
+    profile_result: AutotuneResult | None = None

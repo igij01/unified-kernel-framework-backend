@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
@@ -161,8 +161,8 @@ class Profiler:
         self,
         observers: list[Observer],
         point: SearchPoint,
-        base_metrics: dict[str, float] | None = None,
-    ) -> dict[str, float]:
+        base_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Run after_run on *observers* and merge their metrics.
 
         Args:
@@ -175,7 +175,7 @@ class Profiler:
         Returns:
             Merged metrics dict.
         """
-        metrics = dict(base_metrics) if base_metrics else {}
+        metrics: dict[str, Any] = dict(base_metrics) if base_metrics else {}
         seen_keys: dict[str, str] = {}
         for obs in observers:
             obs_metrics = obs.after_run(self._device, point)
@@ -227,7 +227,7 @@ class Profiler:
             self._runner.run(compiled, inputs, self._device, grid)
 
         # -- Run-once observers (single dedicated execution) -----------
-        run_once_metrics: dict[str, float] = {}
+        run_once_metrics: dict[str, Any] = {}
         if self._run_once_observers:
             for obs in self._run_once_observers:
                 obs.before_run(self._device, point)
@@ -240,7 +240,7 @@ class Profiler:
 
         # -- Profiling (regular observers) -----------------------------
         timings: list[float] = []
-        all_metrics: list[dict[str, float]] = []
+        all_metrics: list[dict[str, Any]] = []
 
         for _ in range(self._profiling_cycles):
             for obs in self._regular_observers:
@@ -258,7 +258,7 @@ class Profiler:
         # -- Average profiling results ---------------------------------
         avg_time = sum(timings) / len(timings)
 
-        avg_metrics: dict[str, float] = {}
+        avg_metrics: dict[str, Any] = {}
         if all_metrics:
             for key in all_metrics[0]:
                 values = [m[key] for m in all_metrics if key in m]

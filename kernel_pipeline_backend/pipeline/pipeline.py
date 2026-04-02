@@ -7,12 +7,15 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from kernel_pipeline_backend.autotuner.autotuner import Autotuner
+from kernel_pipeline_backend.autotuner.instrument import Instrument
 from kernel_pipeline_backend.autotuner.profiler import Profiler
 from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
+    CompileOptions,
     CompiledKernel,
     KernelSpec,
+    PointResult,
     SearchSpace,
 )
 from kernel_pipeline_backend.plugin.plugin import (
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.strategy import Strategy
     from kernel_pipeline_backend.core.compiler import Compiler
     from kernel_pipeline_backend.core.runner import Runner
+    from kernel_pipeline_backend.core.types import SearchPoint
     from kernel_pipeline_backend.device.device import DeviceHandle
     from kernel_pipeline_backend.plugin.manager import PluginManager
     from kernel_pipeline_backend.problem.problem import Problem
@@ -267,6 +271,125 @@ class Pipeline:
             result.errors.append(
                 PipelineError(spec, "autotune", err.message, err.exception),
             )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def run_point(
+        self,
+        spec: KernelSpec,
+        point: SearchPoint,
+        problem: Problem | None,
+        observers: list[Observer] | None = None,
+        *,
+        instruments: list[Instrument] | None = None,
+        compile_options: CompileOptions | None = None,
+        verify: bool = True,
+        profile: bool = True,
+    ) -> PointResult:
+        """Execute a single (spec, point) pair: compile, verify, profile.
+
+        Instruments are applied in order before compilation — each can
+        transform the source and flags and optionally attach an observer.
+        Plugin events use the original ``spec`` so event consumers see the
+        canonical kernel identity.
+
+        Args:
+            spec: Kernel specification (used as-is for plugin events;
+                transformed copy used for compilation only).
+            point: The (sizes, config) pair to evaluate.
+            problem: Problem for verification and profiling inputs.
+                If ``None``, verify and profile stages are skipped.
+            observers: Observers for the profiling stage.
+            instruments: Instruments to apply before compilation.
+            compile_options: Extra flags / optimization level overrides.
+            verify: Whether to run the verification stage.
+            profile: Whether to run the profiling stage.
+
+        Returns:
+            :class:`PointResult` with compilation, verification, and
+            profiling outcomes.
+        """
+        # 1. Start with spec's source and compile_flags
+        source = spec.source
+        flags: dict = dict(spec.compile_flags)
+
+        # 2. Merge CompileOptions
+        if compile_options:
+            flags.update(compile_options.extra_flags)
+            if compile_options.optimization_level is not None:
+                flags["optimization_level"] = compile_options.optimization_level
+
+        # 3. Apply Instruments — accumulate their observers
+        all_observers: list[Observer] = list(observers or [])
+        for inst in (instruments or []):
+            source = inst.transform_source(source, spec)
+            flags = inst.transform_compile_flags(flags)
+            if inst.observer is not None:
+                all_observers.append(inst.observer)
+
+        # 4. Build modified spec for compilation only (original spec used in events)
+        modified_spec = replace(spec, source=source, compile_flags=flags)
+
+        # 5. Compile
+        try:
+            await self._emit(
+                EVENT_COMPILE_START,
+                {"spec": spec, "config": point.config},
+            )
+            compiled = self._compiler.compile(modified_spec, point.config)
+            await self._emit(
+                EVENT_COMPILE_COMPLETE,
+                {"spec": spec, "config": point.config, "compiled": compiled},
+            )
+        except CompilationError as exc:
+            await self._emit(
+                EVENT_COMPILE_ERROR,
+                {"spec": spec, "config": point.config, "error": exc},
+            )
+            error_result = PointResult(
+                kernel_name=spec.name,
+                point=point,
+                compiled=None,
+                compile_error=exc,
+                verification=None,
+                profile_result=None,
+            )
+            await self._plugins.await_plugins()
+            return error_result
+
+        # 6. Verify (optional — requires a problem)
+        verification = None
+        if verify and problem is not None:
+            verifier = Verifier(runner=self._runner, device=self._device)
+            verification = verifier.verify(compiled, problem, point.sizes)
+
+        # 7. Profile (optional — requires a problem for input initialization)
+        profile_result = None
+        if profile and problem is not None:
+            profiler = Profiler(
+                runner=self._runner,
+                device=self._device,
+                backend=self._compiler.backend_name,
+                observers=all_observers,
+            )
+            profiler.setup()
+            try:
+                profile_result = profiler.profile(compiled, problem, point.sizes)
+            finally:
+                profiler.teardown()
+
+        result = PointResult(
+            kernel_name=spec.name,
+            point=point,
+            compiled=compiled,
+            compile_error=None,
+            verification=verification,
+            profile_result=profile_result,
+        )
+        await self._plugins.await_plugins()
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
