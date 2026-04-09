@@ -190,28 +190,27 @@ class TestBuildNameExpression:
 
     def test_single_int_param(self) -> None:
         expr = CUDACompiler._build_name_expression(
-            "kernel", KernelConfig(params={"BLOCK_SIZE": 128}), ["BLOCK_SIZE"]
+            "kernel", {"BLOCK_SIZE": 128}, ["BLOCK_SIZE"]
         )
         assert expr == "kernel<128>"
 
     def test_multi_param_preserves_order(self) -> None:
-        config = KernelConfig(params={"A": 1, "B": 2, "C": 3})
+        params = {"A": 1, "B": 2, "C": 3}
         expr = CUDACompiler._build_name_expression(
-            "func", config, ["C", "A", "B"]
+            "func", params, ["C", "A", "B"]
         )
         assert expr == "func<3, 1, 2>"
 
     def test_type_param_as_string(self) -> None:
-        config = KernelConfig(params={"T": "float", "N": 64})
+        params = {"T": "float", "N": 64}
         expr = CUDACompiler._build_name_expression(
-            "kernel", config, ["T", "N"]
+            "kernel", params, ["T", "N"]
         )
         assert expr == "kernel<float, 64>"
 
     def test_missing_param_raises_key_error(self) -> None:
-        config = KernelConfig(params={"A": 1})
         with pytest.raises(KeyError):
-            CUDACompiler._build_name_expression("f", config, ["MISSING"])
+            CUDACompiler._build_name_expression("f", {"A": 1}, ["MISSING"])
 
 
 # ===================================================================

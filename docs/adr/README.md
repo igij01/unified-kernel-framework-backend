@@ -18,6 +18,8 @@ This directory contains Architecture Decision Records (ADRs) for kernel-pipeline
 | [0010](0010-kernel-problem-registry.md) | Kernel and Problem Registry | Accepted | 2026-03-30 |
 | [0011](0011-tune-service.md) | TuneService — Frontend Orchestration Layer | Accepted | 2026-03-31 |
 | [0012](0012-single-point-execution.md) | Single-Point Execution for Debugging and Investigation | Proposed | 2026-04-01 |
+| [0013](0013-link-time-size-bindings.md) | Link-Time Size Bindings for Kernel Specialization and Runtime Shape Arguments | Proposed | 2026-04-08 |
+| [0014](0014-jit-compilation-with-constexpr-sizes.md) | JIT Compilation with Per-Point Constexpr-Size Resolution | Proposed | 2026-04-09 |
 
 ## Creating a New ADR
 

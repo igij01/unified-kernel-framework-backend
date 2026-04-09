@@ -13,7 +13,6 @@ from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompileOptions,
-    CompiledKernel,
     KernelSpec,
     PointResult,
     SearchSpace,
@@ -25,6 +24,11 @@ from kernel_pipeline_backend.plugin.plugin import (
     EVENT_KERNEL_DISCOVERED,
     EVENT_PIPELINE_COMPLETE,
     PipelineEvent,
+)
+from kernel_pipeline_backend.problem.problem import has_reference
+from kernel_pipeline_backend.registry.registry import (
+    Registry,
+    _resolve_link_binding,
 )
 from kernel_pipeline_backend.verifier.verifier import Verifier, VerificationResult
 from kernel_pipeline_backend.versioning.hasher import KernelHasher
@@ -140,6 +144,7 @@ class Pipeline:
         force: bool = False,
         skip_verify: bool = False,
         skip_autotune: bool = False,
+        problem_name: str | None = None,
     ) -> PipelineResult:
         """Execute the full pipeline for a list of kernels.
 
@@ -151,6 +156,9 @@ class Pipeline:
             force: If True, reprocess all kernels regardless of cache.
             skip_verify: If True, skip verification stage.
             skip_autotune: If True, skip autotuning stage.
+            problem_name: Registered name of ``problem``, used to look
+                up link bindings (``constexpr_args`` / ``runtime_args``)
+                from the Registry for each kernel.
 
         Returns:
             Aggregate PipelineResult with verification, autotuning,
@@ -166,6 +174,7 @@ class Pipeline:
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
                 result=result,
+                problem_name=problem_name,
             )
 
         await self._emit(EVENT_PIPELINE_COMPLETE, {"result": result})
@@ -187,6 +196,7 @@ class Pipeline:
         skip_verify: bool,
         skip_autotune: bool,
         result: PipelineResult,
+        problem_name: str | None = None,
     ) -> None:
         """Process a single kernel through the full pipeline."""
         # -- 1. Version hash and change detection -------------------------
@@ -199,41 +209,16 @@ class Pipeline:
 
         await self._emit(EVENT_KERNEL_DISCOVERED, {"spec": spec})
 
-        # -- 2. Compile all configurations --------------------------------
+        # -- 2. Generate configs (shape-independent) ----------------------
         configs = self._compiler.generate_configs(spec)
-        compiled_kernels: list[CompiledKernel] = []
-
-        for config in configs:
-            await self._emit(
-                EVENT_COMPILE_START,
-                {"spec": spec, "config": config},
-            )
-            try:
-                compiled = self._compiler.compile(spec, config)
-                compiled_kernels.append(compiled)
-                await self._emit(
-                    EVENT_COMPILE_COMPLETE,
-                    {"spec": spec, "config": config, "compiled": compiled},
-                )
-            except CompilationError as exc:
-                result.errors.append(
-                    PipelineError(spec, "compile", str(exc), exc),
-                )
-                await self._emit(
-                    EVENT_COMPILE_ERROR,
-                    {"spec": spec, "config": config, "error": exc},
-                )
-
-        if not compiled_kernels:
-            return  # all compilations failed
 
         # -- 3. Build search space ----------------------------------------
         space = SearchSpace(
             size_specs=dict(problem.sizes),
-            configs=[ck.config for ck in compiled_kernels],
+            configs=configs,
         )
 
-        # -- 4. Autotuner: strategy loop, verification, profiling ---------
+        # -- 4. Autotuner: JIT compile, strategy loop, verify, profile ----
         profiler = Profiler(
             runner=self._runner,
             device=self._device,
@@ -253,23 +238,29 @@ class Pipeline:
             arch=self._device.info.arch,
         )
 
+        # Skip verification if the problem provides no reference implementation
+        effective_skip_verify = skip_verify or not has_reference(problem)
+
         autotune_result = await autotuner.run(
             spec=spec,
             space=space,
-            compiled_kernels=compiled_kernels,
+            compiler=self._compiler,
+            configs=configs,
             problem=problem,
             strategy=strategy,
             existing_results=existing,
-            skip_verify=skip_verify,
+            skip_verify=effective_skip_verify,
             skip_autotune=skip_autotune,
+            problem_name=problem_name,
         )
 
         # Merge autotuner results into pipeline result
         result.verified.extend(autotune_result.verified)
         result.autotuned.extend(autotune_result.tuned)
         for err in autotune_result.errors:
+            stage = "compile" if isinstance(err.exception, CompilationError) else "autotune"
             result.errors.append(
-                PipelineError(spec, "autotune", err.message, err.exception),
+                PipelineError(spec, stage, err.message, err.exception),
             )
 
     # ------------------------------------------------------------------
@@ -283,6 +274,7 @@ class Pipeline:
         problem: Problem | None,
         observers: list[Observer] | None = None,
         *,
+        problem_name: str | None = None,
         instruments: list[Instrument] | None = None,
         compile_options: CompileOptions | None = None,
         verify: bool = True,
@@ -302,6 +294,11 @@ class Pipeline:
             problem: Problem for verification and profiling inputs.
                 If ``None``, verify and profile stages are skipped.
             observers: Observers for the profiling stage.
+            problem_name: Registered problem name used to look up link
+                bindings (``constexpr_args`` / ``runtime_args``).  When
+                provided, constexpr bindings are merged into the effective
+                ``KernelConfig`` before compilation and runtime bindings
+                are forwarded as ``extra_args`` to ``Runner.run()``.
             instruments: Instruments to apply before compilation.
             compile_options: Extra flags / optimization level overrides.
             verify: Whether to run the verification stage.
@@ -315,13 +312,21 @@ class Pipeline:
         source = spec.source
         flags: dict = dict(spec.compile_flags)
 
-        # 2. Merge CompileOptions
+        # 2. Resolve link bindings for this (kernel, problem) pair
+        extra_args: tuple = ()
+        constexpr_sizes: dict | None = None
+        if problem_name is not None:
+            binding = Registry.get_link_binding(spec.name, problem_name)
+            extra_args, constexpr_kwargs = _resolve_link_binding(binding, point.sizes)
+            constexpr_sizes = constexpr_kwargs or None
+
+        # 3. Merge CompileOptions
         if compile_options:
             flags.update(compile_options.extra_flags)
             if compile_options.optimization_level is not None:
                 flags["optimization_level"] = compile_options.optimization_level
 
-        # 3. Apply Instruments — accumulate their observers
+        # 4. Apply Instruments — accumulate their observers
         all_observers: list[Observer] = list(observers or [])
         for inst in (instruments or []):
             source = inst.transform_source(source, spec)
@@ -329,16 +334,18 @@ class Pipeline:
             if inst.observer is not None:
                 all_observers.append(inst.observer)
 
-        # 4. Build modified spec for compilation only (original spec used in events)
+        # 5. Build modified spec for compilation only (original spec used in events)
         modified_spec = replace(spec, source=source, compile_flags=flags)
 
-        # 5. Compile
+        # 6. Compile — pass constexpr_sizes so the backend can bake them in
         try:
             await self._emit(
                 EVENT_COMPILE_START,
                 {"spec": spec, "config": point.config},
             )
-            compiled = self._compiler.compile(modified_spec, point.config)
+            compiled = self._compiler.compile(
+                modified_spec, point.config, constexpr_sizes=constexpr_sizes
+            )
             await self._emit(
                 EVENT_COMPILE_COMPLETE,
                 {"spec": spec, "config": point.config, "compiled": compiled},
@@ -359,13 +366,13 @@ class Pipeline:
             await self._plugins.await_plugins()
             return error_result
 
-        # 6. Verify (optional — requires a problem)
+        # 7. Verify (optional — requires a problem with a reference implementation)
         verification = None
-        if verify and problem is not None:
+        if verify and problem is not None and has_reference(problem):
             verifier = Verifier(runner=self._runner, device=self._device)
-            verification = verifier.verify(compiled, problem, point.sizes)
+            verification = verifier.verify(compiled, problem, point.sizes, extra_args)
 
-        # 7. Profile (optional — requires a problem for input initialization)
+        # 8. Profile (optional — requires a problem for input initialization)
         profile_result = None
         if profile and problem is not None:
             profiler = Profiler(
@@ -376,7 +383,10 @@ class Pipeline:
             )
             profiler.setup()
             try:
-                profile_result = profiler.profile(compiled, problem, point.sizes)
+                profile_result = profiler.profile(
+                    compiled, problem, point.sizes, extra_args,
+                    original_config=point.config,
+                )
             finally:
                 profiler.teardown()
 

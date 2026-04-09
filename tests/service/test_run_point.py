@@ -44,7 +44,7 @@ class _FakeProblem:
     def initialize(self, sizes: dict[str, int]) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
         return []
 
 
@@ -163,6 +163,7 @@ class _RunPointCall:
     point: SearchPoint | None = None
     problem: Any = None
     observers: list[Any] = field(default_factory=list)
+    problem_name: str | None = None
     instruments: list[Any] | None = None
     compile_options: CompileOptions | None = None
     verify: bool = True
@@ -203,6 +204,7 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_RunPointCall]:
         problem,
         observers=None,
         *,
+        problem_name=None,
         instruments=None,
         compile_options=None,
         verify=True,
@@ -213,6 +215,7 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_RunPointCall]:
             point=point,
             problem=problem,
             observers=list(observers or []),
+            problem_name=problem_name,
             instruments=instruments,
             compile_options=compile_options,
             verify=verify,
@@ -241,7 +244,8 @@ class TestRunPointNameResolution:
     async def test_known_kernel_resolves(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
         result = await service.run_point("k", point)
         assert isinstance(result, PointResult)
@@ -281,16 +285,15 @@ class TestRunPointProblemResolution:
 
         assert isinstance(captured_calls[0].problem, _FakeProblem)
 
-    async def test_no_linked_problem_forces_verify_false(
-        self, service: TuneService, captured_calls: list[_RunPointCall],
+    async def test_no_linked_problem_raises_validation_error(
+        self, service: TuneService,
     ) -> None:
+        """run_point with an unlinked kernel now raises ValueError (ADR-0013)."""
         _register_kernel("orphan")
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
-        await service.run_point("orphan", point, verify=True)
-
-        assert captured_calls[0].problem is None
-        assert captured_calls[0].verify is False
+        with pytest.raises(ValueError, match="error"):
+            await service.run_point("orphan", point, verify=True)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +307,8 @@ class TestRunPointObserverResolution:
     async def test_per_request_observers_forwarded(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         obs = _FakeObserver()
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
@@ -315,7 +319,8 @@ class TestRunPointObserverResolution:
     async def test_default_observer_used_when_none_given(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
         await service.run_point("k", point)
@@ -335,7 +340,8 @@ class TestRunPointInstrumentsForwarded:
     async def test_instruments_forwarded(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         inst = _FakeInstrument()
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
@@ -355,7 +361,8 @@ class TestRunPointCompileOptionsForwarded:
     async def test_compile_options_forwarded(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         opts = CompileOptions(extra_flags={"x": 1}, optimization_level="O2")
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
@@ -387,7 +394,8 @@ class TestRunPointBackendDispatch:
     async def test_unknown_backend_raises(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _register_kernel("k", backend="nonexistent")
+        _register_problem("p")
+        _register_kernel("k", backend="nonexistent", problem="p")
 
         def _raise(name: str):
             raise KeyError(f"No backend '{name}' registered")

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
+    KernelConfig,
     SearchPoint,
 )
 from kernel_pipeline_backend.autotuner.observer import Observer
@@ -197,6 +198,9 @@ class Profiler:
         compiled: CompiledKernel,
         problem: Problem,
         sizes: dict[str, int],
+        extra_args: tuple[Any, ...] = (),
+        *,
+        original_config: KernelConfig | None = None,
     ) -> AutotuneResult:
         """Benchmark a compiled kernel at a specific size point.
 
@@ -213,18 +217,27 @@ class Profiler:
             problem: Problem supplying input tensors via
                 :meth:`~Problem.initialize`.
             sizes: Size parameters for this evaluation point.
+            extra_args: Additional scalar arguments forwarded to
+                ``Runner.run()``.  Resolved from link bindings by the
+                caller.  Defaults to an empty tuple.
+            original_config: When provided, used for the
+                ``AutotuneResult.point.config`` so the stored result
+                references the canonical tunable config rather than the
+                compiled artifact's config (which may include merged
+                constexpr sizes).
 
         Returns:
             ``AutotuneResult`` with averaged ``time_ms`` and merged
             observer ``metrics``.
         """
-        point = SearchPoint(sizes=sizes, config=compiled.config)
+        point_config = original_config if original_config is not None else compiled.config
+        point = SearchPoint(sizes=sizes, config=point_config)
         inputs = problem.initialize(sizes)
         grid = compiled.spec.grid_generator(sizes, compiled.config)
 
         # -- Warmup (untimed, no observer calls) -----------------------
         for _ in range(self._warmup_cycles):
-            self._runner.run(compiled, inputs, self._device, grid)
+            self._runner.run(compiled, inputs, self._device, grid, extra_args)
 
         # -- Run-once observers (single dedicated execution) -----------
         run_once_metrics: dict[str, Any] = {}
@@ -232,7 +245,7 @@ class Profiler:
             for obs in self._run_once_observers:
                 obs.before_run(self._device, point)
 
-            self._runner.run(compiled, inputs, self._device, grid)
+            self._runner.run(compiled, inputs, self._device, grid, extra_args)
 
             run_once_metrics = self._collect_observer_metrics(
                 self._run_once_observers, point,
@@ -246,7 +259,7 @@ class Profiler:
             for obs in self._regular_observers:
                 obs.before_run(self._device, point)
 
-            run_result = self._runner.run(compiled, inputs, self._device, grid)
+            run_result = self._runner.run(compiled, inputs, self._device, grid, extra_args)
 
             metrics = self._collect_observer_metrics(
                 self._regular_observers, point, run_result.metrics,

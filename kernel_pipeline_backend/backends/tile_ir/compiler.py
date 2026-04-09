@@ -32,7 +32,12 @@ class TileIRCompiler:
         """
         ...
 
-    def compile(self, spec: KernelSpec, config: KernelConfig) -> CompiledKernel:
+    def compile(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompiledKernel:
         """Compile TileIR source with the given configuration.
 
         Args:

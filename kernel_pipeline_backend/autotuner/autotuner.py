@@ -5,6 +5,8 @@ single-point benchmarking to the Profiler, handles per-point verification,
 stores results incrementally, and emits plugin events throughout.
 
 See ADR-0009 for the rationale behind the Profiler/Autotuner split.
+See ADR-0014 for the JIT compilation design (compilation moves from
+Pipeline into the per-point loop here).
 """
 
 from __future__ import annotations
@@ -15,17 +17,24 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from kernel_pipeline_backend.autotuner.profiler import Profiler
+from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
-    CompiledKernel,
     KernelConfig,
     KernelSpec,
     SearchSpace,
+)
+from kernel_pipeline_backend.registry.registry import (
+    _EMPTY_BINDING,
+    _resolve_link_binding,
 )
 from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
     EVENT_AUTOTUNE_PROGRESS,
     EVENT_AUTOTUNE_START,
+    EVENT_COMPILE_COMPLETE,
+    EVENT_COMPILE_ERROR,
+    EVENT_COMPILE_START,
     EVENT_VERIFY_COMPLETE,
     EVENT_VERIFY_FAIL,
     EVENT_VERIFY_START,
@@ -35,6 +44,7 @@ from kernel_pipeline_backend.verifier.verifier import VerificationResult
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.strategy import Strategy
+    from kernel_pipeline_backend.core.compiler import Compiler
     from kernel_pipeline_backend.plugin.manager import PluginManager
     from kernel_pipeline_backend.problem.problem import Problem
     from kernel_pipeline_backend.storage.store import ResultStore
@@ -95,6 +105,11 @@ def _sizes_key(sizes: dict[str, int]) -> str:
     return json.dumps(sizes, sort_keys=True)
 
 
+def _compile_cache_key(config: KernelConfig, constexpr_sizes: dict[str, int]) -> tuple:
+    """Cache key for a (config, constexpr_sizes) compilation."""
+    return (_config_key(config), frozenset(constexpr_sizes.items()))
+
+
 # ---------------------------------------------------------------------------
 # Autotuner
 # ---------------------------------------------------------------------------
@@ -108,12 +123,16 @@ class Autotuner:
     handles per-point verification via the :class:`Verifier`, stores
     results incrementally, and emits plugin events throughout.
 
+    Compilation is JIT — performed per ``(config, constexpr_sizes)`` point
+    inside the strategy loop (ADR-0014).  An in-memory compile cache
+    prevents redundant re-compilations within a single ``run()`` call.
+
     Typical usage by the Pipeline::
 
         profiler = Profiler(runner, device, backend, observers)
         autotuner = Autotuner(profiler, verifier, store, plugin_manager)
         result = await autotuner.run(
-            spec, space, compiled_kernels, problem, strategy,
+            spec, space, compiler, configs, problem, strategy,
         )
 
     The autotuner loop:
@@ -125,6 +144,8 @@ class Autotuner:
        b. Filter invalid size combinations via ``problem.filter_sizes``.
        c. For each valid point:
 
+          - JIT-compile via ``compiler.compile(spec, config, constexpr_sizes)``
+            (with compile cache).
           - Verify (unless ``skip_verify``), with caching.
           - Profile via the Profiler (unless ``skip_autotune``).
           - Store the result and emit ``AUTOTUNE_PROGRESS``.
@@ -156,21 +177,24 @@ class Autotuner:
         self,
         spec: KernelSpec,
         space: SearchSpace,
-        compiled_kernels: list[CompiledKernel],
+        compiler: Compiler,
+        configs: list[KernelConfig],
         problem: Problem,
         strategy: Strategy,
         *,
         existing_results: list[AutotuneResult] | None = None,
         skip_verify: bool = False,
         skip_autotune: bool = False,
+        problem_name: str | None = None,
     ) -> AutotuneRunResult:
         """Execute the full autotune loop for a single kernel.
 
         Args:
             spec: Kernel specification (with version hash set).
             space: The ``(sizes x configs)`` search space.
-            compiled_kernels: Pre-compiled kernel artifacts, one per
-                configuration that compiled successfully.
+            compiler: Backend compiler used for JIT compilation.
+            configs: Candidate configurations from
+                ``compiler.generate_configs(spec)``.
             problem: Problem providing reference implementation, input
                 generation, and optional size filtering.
             strategy: Search strategy that suggests batches of points
@@ -182,6 +206,10 @@ class Autotuner:
                 straight to profiling.
             skip_autotune: If True, skip profiling — only run
                 verification (useful for verify-only mode).
+            problem_name: Registered name of ``problem``.  When
+                provided, ``runtime_args`` and ``constexpr_args``
+                bindings are resolved from the Registry per search
+                point and forwarded to the verifier and profiler.
 
         Returns:
             :class:`AutotuneRunResult` containing profiling results,
@@ -189,11 +217,6 @@ class Autotuner:
         """
         result = AutotuneRunResult()
         existing = list(existing_results) if existing_results else []
-
-        # Build compiled-kernel lookup keyed by deterministic config key
-        compiled_map: dict[str, CompiledKernel] = {}
-        for ck in compiled_kernels:
-            compiled_map[_config_key(ck.config)] = ck
 
         # Set up profiler (observer validation + initialisation)
         if not skip_autotune:
@@ -206,13 +229,26 @@ class Autotuner:
         # Per-(config, sizes) verification cache
         verified_cache: dict[str, bool] = {}
 
+        # Compile cache: (config_key, frozenset(constexpr)) → CompiledKernel
+        compile_cache: dict[tuple, object] = {}
+        # Failed compile keys — emit error only once per (config, constexpr) pair
+        failed_compile_keys: set[tuple] = set()
+
+        # Resolve link binding once per (kernel, problem) pair.
+        if problem_name is not None:
+            from kernel_pipeline_backend.registry.registry import Registry
+            binding = Registry.get_link_binding(spec.name, problem_name)
+        else:
+            binding = _EMPTY_BINDING
+
         try:
             await self._run_strategy_loop(
-                result, existing, compiled_map,
+                result, existing, compiler, configs,
                 spec, space, problem, strategy,
-                verified_cache,
+                verified_cache, compile_cache, failed_compile_keys,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
+                binding=binding,
             )
         finally:
             if not skip_autotune:
@@ -234,33 +270,51 @@ class Autotuner:
         self,
         result: AutotuneRunResult,
         existing: list[AutotuneResult],
-        compiled_map: dict[str, CompiledKernel],
+        compiler: Compiler,
+        configs: list[KernelConfig],
         spec: KernelSpec,
         space: SearchSpace,
         problem: Problem,
         strategy: Strategy,
         verified_cache: dict[str, bool],
+        compile_cache: dict[tuple, object],
+        failed_compile_keys: set[tuple],
         *,
         skip_verify: bool,
         skip_autotune: bool,
+        binding: object = _EMPTY_BINDING,
     ) -> None:
         """Drive the strategy and process each suggested batch of points.
 
-        This is the core loop extracted from ``run()`` so that the
-        ``finally`` block in ``run()`` can guarantee profiler teardown.
+        Compilation is JIT: for each ``(config, constexpr_sizes)`` pair,
+        the compiler is called on first encounter and the result cached
+        for subsequent points with the same pair.
 
         Args:
             result: Mutable result accumulator (tuned, verified, errors).
             existing: Previously cached autotune results for this kernel.
-            compiled_map: Config-key to CompiledKernel lookup.
+            compiler: Backend compiler for JIT compilation.
+            configs: Candidate KernelConfig objects (shape-independent).
             spec: Kernel specification.
             space: Search space definition.
             problem: Problem for inputs, reference, and size filtering.
             strategy: Search strategy driving point selection.
             verified_cache: Mutable cache tracking verification outcomes.
+            compile_cache: Mutable cache from (config_key, constexpr_frozen)
+                to CompiledKernel.
+            failed_compile_keys: Set of keys whose compilation already
+                failed — used to suppress duplicate error events.
             skip_verify: Whether to skip verification.
             skip_autotune: Whether to skip profiling.
+            binding: Link binding resolved from the Registry for this
+                ``(kernel, problem)`` pair.
         """
+        # Build a quick lookup from config-key to KernelConfig so we can
+        # retrieve the canonical config object for a suggested point.
+        config_by_key: dict[str, KernelConfig] = {
+            _config_key(c): c for c in configs
+        }
+
         while not strategy.is_converged(result.tuned + existing):
             points = strategy.suggest(space, result.tuned + existing)
             if not points:
@@ -275,26 +329,68 @@ class Autotuner:
                         continue
 
                 ck = _config_key(point.config)
-                compiled = compiled_map.get(ck)
+                if ck not in config_by_key:
+                    continue  # config not in the candidate set
+
+                # Resolve size bindings for this point.
+                extra_args, constexpr_sizes = _resolve_link_binding(
+                    binding, point.sizes,  # type: ignore[arg-type]
+                )
+
+                # -- JIT Compile (with cache) ----------------------------
+                cache_key = _compile_cache_key(point.config, constexpr_sizes)
+                if cache_key in failed_compile_keys:
+                    continue  # already failed, skip silently
+
+                compiled = compile_cache.get(cache_key)
                 if compiled is None:
-                    continue  # config failed compilation
+                    await self._emit(
+                        EVENT_COMPILE_START,
+                        {"spec": spec, "config": point.config},
+                    )
+                    try:
+                        compiled = compiler.compile(
+                            spec,
+                            point.config,
+                            constexpr_sizes=constexpr_sizes or None,
+                        )
+                        compile_cache[cache_key] = compiled
+                        await self._emit(
+                            EVENT_COMPILE_COMPLETE,
+                            {"spec": spec, "compiled": compiled},
+                        )
+                    except CompilationError as exc:
+                        failed_compile_keys.add(cache_key)
+                        await self._emit(
+                            EVENT_COMPILE_ERROR,
+                            {"spec": spec, "config": point.config, "error": str(exc)},
+                        )
+                        result.errors.append(
+                            AutotuneError(
+                                sizes=dict(point.sizes),
+                                config=point.config,
+                                message=str(exc),
+                                exception=exc,
+                            )
+                        )
+                        continue
 
                 # -- Verify before profiling -------------------------
                 if not skip_verify:
                     sk = _sizes_key(point.sizes)
-                    cache_key = f"{ck}:{sk}"
+                    cache_key_v = f"{ck}:{sk}"
 
-                    if cache_key not in verified_cache:
+                    if cache_key_v not in verified_cache:
                         await self._emit(
                             EVENT_VERIFY_START,
                             {"spec": spec, "sizes": point.sizes,
                              "config": point.config},
                         )
                         vr = self._verifier.verify(
-                            compiled, problem, point.sizes,
+                            compiled, problem, point.sizes, extra_args,  # type: ignore[arg-type]
                         )
                         result.verified.append(vr)
-                        verified_cache[cache_key] = vr.passed
+                        verified_cache[cache_key_v] = vr.passed
 
                         if vr.passed:
                             await self._emit(
@@ -307,14 +403,18 @@ class Autotuner:
                                 {"spec": spec, "result": vr},
                             )
 
-                    if not verified_cache.get(cache_key, False):
+                    if not verified_cache.get(cache_key_v, False):
                         continue  # skip profiling for failed point
 
                 # -- Profile -----------------------------------------
                 if not skip_autotune:
                     try:
                         ar = self._profiler.profile(
-                            compiled, problem, point.sizes,
+                            compiled,  # type: ignore[arg-type]
+                            problem,
+                            point.sizes,
+                            extra_args,
+                            original_config=point.config,
                         )
                         result.tuned.append(ar)
                         self._store.store([ar])

@@ -34,6 +34,9 @@ from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
     EVENT_AUTOTUNE_PROGRESS,
     EVENT_AUTOTUNE_START,
+    EVENT_COMPILE_COMPLETE,
+    EVENT_COMPILE_ERROR,
+    EVENT_COMPILE_START,
     EVENT_VERIFY_COMPLETE,
     EVENT_VERIFY_FAIL,
     EVENT_VERIFY_START,
@@ -42,6 +45,7 @@ from kernel_pipeline_backend.plugin.plugin import (
 from kernel_pipeline_backend.verifier.verifier import Verifier
 
 from .conftest import (
+    FakeCompiler,
     FakeDeviceHandle,
     FakeProblem,
     FakeResultStore,
@@ -106,19 +110,6 @@ class TrackingPlugin:
 # ---------------------------------------------------------------------------
 
 
-def _compile_all(
-    spec: Any = None,
-    configs: list[KernelConfig] | None = None,
-) -> list[CompiledKernel]:
-    """Build a list of CompiledKernels with sensible defaults."""
-    spec = spec or make_spec()
-    configs = configs or [
-        KernelConfig(params={"BS": 64}),
-        KernelConfig(params={"BS": 128}),
-    ]
-    return [CompiledKernel(spec=spec, config=c) for c in configs]
-
-
 async def _run_autotuner(
     *,
     runner: FakeRunner | None = None,
@@ -126,7 +117,8 @@ async def _run_autotuner(
     device: FakeDeviceHandle | None = None,
     problem: FakeProblem | None = None,
     strategy: Any | None = None,
-    compiled_kernels: list[CompiledKernel] | None = None,
+    configs: list[KernelConfig] | None = None,
+    compiler: FakeCompiler | None = None,
     spec: Any | None = None,
     space: SearchSpace | None = None,
     plugins: PluginManager | None = None,
@@ -149,10 +141,14 @@ async def _run_autotuner(
     _plugins = plugins or PluginManager()
     _spec = spec or make_spec()
 
-    _compiled = compiled_kernels if compiled_kernels is not None else _compile_all(_spec)
+    _configs = configs if configs is not None else [
+        KernelConfig(params={"BS": 64}),
+        KernelConfig(params={"BS": 128}),
+    ]
+    _compiler = compiler if compiler is not None else FakeCompiler(configs=_configs)
     _space = space or SearchSpace(
         size_specs=dict(_problem.sizes),
-        configs=[ck.config for ck in _compiled],
+        configs=_configs,
     )
 
     profiler = Profiler(
@@ -173,7 +169,8 @@ async def _run_autotuner(
     return await autotuner.run(
         spec=_spec,
         space=_space,
-        compiled_kernels=_compiled,
+        compiler=_compiler,
+        configs=_configs,
         problem=_problem,
         strategy=_strategy,
         existing_results=existing_results,
@@ -225,27 +222,19 @@ class TestStrategyLoop:
     async def test_exhaustive_all_points_profiled(self) -> None:
         """With exhaustive strategy, every (size, config) point is profiled."""
         problem = FakeProblem(sizes={"M": [128, 256]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        result = await _run_autotuner(
-            problem=problem, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        result = await _run_autotuner(problem=problem, configs=configs)
         # 2 sizes x 1 config = 2 tuned results
         assert len(result.tuned) == 2
 
     async def test_multi_config_multi_size(self) -> None:
         """Multiple configs and sizes produce the full cartesian product."""
         problem = FakeProblem(sizes={"M": [128, 256]})
-        compiled = _compile_all(
-            configs=[
-                KernelConfig(params={"BS": 64}),
-                KernelConfig(params={"BS": 128}),
-            ],
-        )
-        result = await _run_autotuner(
-            problem=problem, compiled_kernels=compiled,
-        )
+        configs = [
+            KernelConfig(params={"BS": 64}),
+            KernelConfig(params={"BS": 128}),
+        ]
+        result = await _run_autotuner(problem=problem, configs=configs)
         # 2 sizes x 2 configs = 4 tuned results
         assert len(result.tuned) == 4
 
@@ -262,18 +251,15 @@ class TestStrategyLoop:
         result = await _run_autotuner(strategy=ImmediateConverge())
         assert result.tuned == []
 
-    async def test_empty_compiled_kernels_no_results(self) -> None:
-        """No compiled kernels means no points can be profiled."""
-        result = await _run_autotuner(compiled_kernels=[])
+    async def test_empty_configs_no_results(self) -> None:
+        """No configs means no points can be profiled."""
+        result = await _run_autotuner(configs=[])
         assert result.tuned == []
 
     async def test_no_progress_breaks_loop(self) -> None:
         """If a batch produces no new results, the loop breaks."""
-        # Strategy that always suggests the same point but it fails
-        # verification, so no tuned results accumulate.
         problem = FakeProblem(
             sizes={"M": [128]},
-            # Reference returns a mismatch so verification fails
             filter_fn=lambda s: False,  # filter out all sizes
         )
         result = await _run_autotuner(problem=problem)
@@ -291,25 +277,15 @@ class TestVerification:
     async def test_verification_runs_before_profiling(self) -> None:
         """Each profiled point has a corresponding verification result."""
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        result = await _run_autotuner(
-            problem=problem, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        result = await _run_autotuner(problem=problem, configs=configs)
         assert len(result.verified) == 1
         assert result.verified[0].passed
         assert len(result.tuned) == 1
 
     async def test_failed_verification_skips_profiling(self) -> None:
         """If verification fails, that point is not profiled."""
-        problem = FakeProblem(
-            sizes={"M": [128]},
-            # Return a mismatch: init returns [0.0], reference returns [999.0]
-            filter_fn=None,
-        )
-        runner = FakeRunner()
-        # Make reference produce a different output than the kernel
+
         class MismatchProblem:
             sizes = {"M": [128]}
             atol = 1e-3
@@ -318,7 +294,7 @@ class TestVerification:
             def initialize(self, sizes):
                 return [[0.0]]
 
-            def reference(self, inputs):
+            def reference(self, inputs, sizes):
                 return [[999.0]]
 
             def filter_sizes(self, sizes):
@@ -326,9 +302,7 @@ class TestVerification:
 
         result = await _run_autotuner(
             problem=MismatchProblem(),
-            compiled_kernels=_compile_all(
-                configs=[KernelConfig(params={"BS": 64})],
-            ),
+            configs=[KernelConfig(params={"BS": 64})],
         )
         assert any(not vr.passed for vr in result.verified)
         assert result.tuned == []
@@ -359,12 +333,10 @@ class TestVerification:
                 return self._calls > 2
 
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
+        configs = [KernelConfig(params={"BS": 64})]
         result = await _run_autotuner(
             problem=problem,
-            compiled_kernels=compiled,
+            configs=configs,
             strategy=RepeatStrategy(),
         )
         # Only 1 unique (config, size) pair → 1 verification
@@ -384,7 +356,7 @@ class TestVerification:
             def initialize(self, sizes):
                 return [[1.0, 2.0, 3.0]]
 
-            def reference(self, inputs):
+            def reference(self, inputs, sizes):
                 nonlocal call_count
                 call_count += 1
                 if call_count % 2 == 0:
@@ -394,15 +366,13 @@ class TestVerification:
             def filter_sizes(self, sizes):
                 return True
 
-        compiled = _compile_all(
-            configs=[
-                KernelConfig(params={"A": 1}),
-                KernelConfig(params={"A": 2}),
-            ],
-        )
+        configs = [
+            KernelConfig(params={"A": 1}),
+            KernelConfig(params={"A": 2}),
+        ]
         result = await _run_autotuner(
             problem=AlternatingRefProblem(),
-            compiled_kernels=compiled,
+            configs=configs,
         )
         passed = [vr for vr in result.verified if vr.passed]
         failed = [vr for vr in result.verified if not vr.passed]
@@ -429,12 +399,8 @@ class TestResultStorage:
         """Each result is stored in its own individual batch."""
         store = FakeResultStore()
         problem = FakeProblem(sizes={"M": [128, 256]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        await _run_autotuner(
-            store=store, problem=problem, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        await _run_autotuner(store=store, problem=problem, configs=configs)
         # Each result stored in its own batch (one at a time)
         assert len(store.store_calls) == len(store.results)
         assert all(len(batch) == 1 for batch in store.store_calls)
@@ -443,11 +409,7 @@ class TestResultStorage:
         """Previously cached results are passed to the strategy so it
         can account for prior evaluations and skip already-evaluated points."""
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        spec = make_spec()
-        compiled = [CompiledKernel(spec=spec, config=c.config) for c in compiled]
+        configs = [KernelConfig(params={"BS": 64})]
 
         # Pre-existing result for the only point in the space
         existing = [
@@ -462,7 +424,7 @@ class TestResultStorage:
         ]
         result = await _run_autotuner(
             problem=problem,
-            compiled_kernels=compiled,
+            configs=configs,
             existing_results=existing,
         )
         # Strategy sees the existing result → no unevaluated points → no work
@@ -518,7 +480,7 @@ class TestPluginEvents:
             def initialize(self, sizes):
                 return [[0.0]]
 
-            def reference(self, inputs):
+            def reference(self, inputs, sizes):
                 return [[999.0]]
 
             def filter_sizes(self, sizes):
@@ -526,12 +488,20 @@ class TestPluginEvents:
 
         _, tracker = await self._run_with_tracker(
             problem=MismatchProblem(),
-            compiled_kernels=_compile_all(
-                configs=[KernelConfig(params={"BS": 64})],
-            ),
+            configs=[KernelConfig(params={"BS": 64})],
         )
         types = [e.event_type for e in tracker.events]
         assert EVENT_VERIFY_FAIL in types
+
+    async def test_compile_events_emitted(self) -> None:
+        """Compile events are emitted during JIT compilation."""
+        _, tracker = await self._run_with_tracker(
+            problem=FakeProblem(sizes={"M": [128]}),
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_COMPILE_START in types
+        assert EVENT_COMPILE_COMPLETE in types
 
     async def test_no_autotune_events_when_skip_autotune(self) -> None:
         """When skip_autotune=True, AUTOTUNE_START/PROGRESS/COMPLETE
@@ -545,24 +515,39 @@ class TestPluginEvents:
         assert EVENT_VERIFY_START in types
 
     async def test_event_ordering(self) -> None:
-        """Events follow: start → verify → progress → complete."""
+        """Events follow: autotune_start → compile → verify → progress → complete."""
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
+        configs = [KernelConfig(params={"BS": 64})]
         _, tracker = await self._run_with_tracker(
-            problem=problem, compiled_kernels=compiled,
+            problem=problem, configs=configs,
         )
         types = [e.event_type for e in tracker.events]
 
         idx_start = types.index(EVENT_AUTOTUNE_START)
+        idx_compile = types.index(EVENT_COMPILE_START)
         idx_verify = types.index(EVENT_VERIFY_START)
         idx_progress = types.index(EVENT_AUTOTUNE_PROGRESS)
         idx_complete = types.index(EVENT_AUTOTUNE_COMPLETE)
 
-        assert idx_start < idx_verify
+        assert idx_start < idx_compile
+        assert idx_compile < idx_verify
         assert idx_verify < idx_progress
         assert idx_progress < idx_complete
+
+    async def test_compile_error_emitted_on_failure(self) -> None:
+        """A compile error emits EVENT_COMPILE_ERROR."""
+        configs = [KernelConfig(params={"BS": 64})]
+        fail_key = json.dumps({"BS": 64}, sort_keys=True)
+        compiler = FakeCompiler(
+            configs=configs, fail_configs={fail_key},
+        )
+        _, tracker = await self._run_with_tracker(
+            configs=configs,
+            compiler=compiler,
+            problem=FakeProblem(sizes={"M": [128]}),
+        )
+        types = [e.event_type for e in tracker.events]
+        assert EVENT_COMPILE_ERROR in types
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +593,8 @@ class TestSizeFiltering:
             sizes={"M": [128, 256, 512]},
             filter_fn=lambda s: s["M"] != 256,
         )
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        result = await _run_autotuner(
-            problem=problem, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        result = await _run_autotuner(problem=problem, configs=configs)
         verified_sizes = [vr.sizes for vr in result.verified]
         for vs in verified_sizes:
             assert vs["M"] != 256
@@ -624,12 +605,8 @@ class TestSizeFiltering:
             sizes={"M": [128, 256]},
             filter_fn=lambda s: s["M"] == 128,
         )
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
-        result = await _run_autotuner(
-            problem=problem, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        result = await _run_autotuner(problem=problem, configs=configs)
         for ar in result.tuned:
             assert ar.point.sizes["M"] == 128
 
@@ -660,13 +637,11 @@ class TestErrorHandling:
                 )
 
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
+        configs = [KernelConfig(params={"BS": 64})]
         result = await _run_autotuner(
             runner=FailOnceRunner(),
             problem=problem,
-            compiled_kernels=compiled,
+            configs=configs,
         )
         assert len(result.errors) >= 1
         assert "GPU error" in result.errors[0].message
@@ -686,16 +661,28 @@ class TestErrorHandling:
                 )
 
         problem = FakeProblem(sizes={"M": [128]})
-        compiled = _compile_all(
-            configs=[KernelConfig(params={"BS": 64})],
-        )
+        configs = [KernelConfig(params={"BS": 64})]
         # Should not raise
         result = await _run_autotuner(
             runner=FailAlwaysRunner(),
             problem=problem,
-            compiled_kernels=compiled,
+            configs=configs,
         )
         assert len(result.errors) >= 1
+
+    async def test_compile_error_recorded(self) -> None:
+        """CompilationError during JIT compile is captured as an AutotuneError."""
+        configs = [KernelConfig(params={"BS": 64})]
+        fail_key = json.dumps({"BS": 64}, sort_keys=True)
+        compiler = FakeCompiler(configs=configs, fail_configs={fail_key})
+        result = await _run_autotuner(
+            configs=configs,
+            compiler=compiler,
+            problem=FakeProblem(sizes={"M": [128]}),
+        )
+        assert len(result.errors) >= 1
+        from kernel_pipeline_backend.core.compiler import CompilationError
+        assert isinstance(result.errors[0].exception, CompilationError)
 
 
 # ---------------------------------------------------------------------------
@@ -724,17 +711,17 @@ class TestProfilerLifecycle:
         verifier = Verifier(runner=runner, device=device)
         store = FakeResultStore()
         plugins = PluginManager()
+        configs = [KernelConfig(params={"BS": 64})]
 
         autotuner = Autotuner(profiler, verifier, store, plugins)
         await autotuner.run(
             spec=make_spec(),
             space=SearchSpace(
                 size_specs={"M": [128]},
-                configs=[KernelConfig(params={"BS": 64})],
+                configs=configs,
             ),
-            compiled_kernels=_compile_all(
-                configs=[KernelConfig(params={"BS": 64})],
-            ),
+            compiler=FakeCompiler(configs=configs),
+            configs=configs,
             problem=FakeProblem(sizes={"M": [128]}),
             strategy=FakeStrategy(),
         )
@@ -765,6 +752,7 @@ class TestProfilerLifecycle:
         verifier = Verifier(runner=runner, device=device)
         store = FakeResultStore()
         plugins = PluginManager()
+        configs = [KernelConfig(params={"BS": 64})]
 
         autotuner = Autotuner(profiler, verifier, store, plugins)
         with pytest.raises(RuntimeError, match="strategy exploded"):
@@ -772,11 +760,10 @@ class TestProfilerLifecycle:
                 spec=make_spec(),
                 space=SearchSpace(
                     size_specs={"M": [128]},
-                    configs=[KernelConfig(params={"BS": 64})],
+                    configs=configs,
                 ),
-                compiled_kernels=_compile_all(
-                    configs=[KernelConfig(params={"BS": 64})],
-                ),
+                compiler=FakeCompiler(configs=configs),
+                configs=configs,
                 problem=FakeProblem(sizes={"M": [128]}),
                 strategy=ExplodingStrategy(),
             )
@@ -804,17 +791,17 @@ class TestProfilerLifecycle:
         verifier = Verifier(runner=runner, device=device)
         store = FakeResultStore()
         plugins = PluginManager()
+        configs = [KernelConfig(params={"BS": 64})]
 
         autotuner = Autotuner(profiler, verifier, store, plugins)
         await autotuner.run(
             spec=make_spec(),
             space=SearchSpace(
                 size_specs={"M": [128]},
-                configs=[KernelConfig(params={"BS": 64})],
+                configs=configs,
             ),
-            compiled_kernels=_compile_all(
-                configs=[KernelConfig(params={"BS": 64})],
-            ),
+            compiler=FakeCompiler(configs=configs),
+            configs=configs,
             problem=FakeProblem(sizes={"M": [128]}),
             strategy=FakeStrategy(),
             skip_autotune=True,
@@ -840,15 +827,252 @@ class TestResultCorrectness:
         """When spec has a version hash, it propagates to results."""
         spec = make_spec()
         from kernel_pipeline_backend.versioning.hasher import KernelHasher
-
-        kh = KernelHasher().hash(spec)
         from dataclasses import replace
 
+        kh = KernelHasher().hash(spec)
         spec = replace(spec, version_hash=kh)
 
-        compiled = _compile_all(spec=spec)
-        result = await _run_autotuner(
-            spec=spec, compiled_kernels=compiled,
-        )
+        configs = [KernelConfig(params={"BS": 64})]
+        result = await _run_autotuner(spec=spec, configs=configs)
         for ar in result.tuned:
             assert ar.kernel_hash is not None
+
+    async def test_tuned_result_config_is_canonical(self) -> None:
+        """AutotuneResult.point.config is the original tunable config,
+        not a merged version with constexpr sizes."""
+        from kernel_pipeline_backend.registry import Registry
+
+        Registry.clear()
+        Registry.register_problem("p_canon", FakeProblem(sizes={"HEAD": [64]}))
+        Registry.register_kernel(
+            "k_canon",
+            source="fake",
+            backend="fake",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=lambda s, c: __import__(
+                "kernel_pipeline_backend.core.types", fromlist=["GridResult"]
+            ).GridResult(grid=(1,)),
+            problem="p_canon",
+            constexpr_args={"HEAD_DIM": "HEAD"},
+        )
+
+        spec = make_spec(name="k_canon")
+        configs = [KernelConfig(params={"BS": 64})]
+        compiler = FakeCompiler(configs=configs)
+        profiler = Profiler(
+            runner=FakeRunner(), device=FakeDeviceHandle(),
+            backend="fake", warmup_cycles=0, profiling_cycles=1,
+        )
+        verifier = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
+        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+
+        result = await autotuner.run(
+            spec=spec,
+            space=SearchSpace(size_specs={"HEAD": [64]}, configs=configs),
+            compiler=compiler,
+            configs=configs,
+            problem=FakeProblem(sizes={"HEAD": [64]}),
+            strategy=FakeStrategy(),
+            skip_verify=True,
+            problem_name="p_canon",
+        )
+
+        # The stored config must be the canonical tunable config, not merged
+        for ar in result.tuned:
+            assert ar.point.config == KernelConfig(params={"BS": 64})
+            assert "HEAD_DIM" not in ar.point.config.params
+
+        Registry.clear()
+
+
+# ---------------------------------------------------------------------------
+# Link binding resolution
+# ---------------------------------------------------------------------------
+
+
+class TestLinkBindings:
+    """Autotuner resolves runtime_args and constexpr_args from link bindings."""
+
+    async def test_runtime_args_forwarded_as_extra_args(self) -> None:
+        """runtime_args values are passed to Runner.run() as extra_args."""
+        from kernel_pipeline_backend.registry import Registry
+
+        received_extra: list[tuple] = []
+
+        class CapturingRunner(FakeRunner):
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                received_extra.append(extra_args)
+                return super().run(compiled, inputs, device, grid, extra_args)
+
+        # Register kernel + problem with runtime_args binding
+        Registry.clear()
+        Registry.register_problem("p", FakeProblem(sizes={"M": [128]}))
+        Registry.register_kernel(
+            "k",
+            source="fake",
+            backend="fake",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=lambda s, c: __import__(
+                "kernel_pipeline_backend.core.types", fromlist=["GridResult"]
+            ).GridResult(grid=(1,)),
+            problem="p",
+            runtime_args=["M"],
+        )
+
+        runner = CapturingRunner()
+        profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
+                            backend="fake", warmup_cycles=0, profiling_cycles=1)
+        verifier = Verifier(runner=runner, device=FakeDeviceHandle())
+        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+
+        spec = make_spec(name="k")
+        configs = [KernelConfig(params={"BS": 64})]
+        await autotuner.run(
+            spec=spec,
+            space=SearchSpace(size_specs={"M": [128]}, configs=configs),
+            compiler=FakeCompiler(configs=configs),
+            configs=configs,
+            problem=FakeProblem(sizes={"M": [128]}),
+            strategy=FakeStrategy(),
+            skip_verify=True,
+            problem_name="p",
+        )
+
+        # Every runner call should have received (128,) as extra_args
+        assert len(received_extra) > 0
+        assert all(ea == (128,) for ea in received_extra), received_extra
+
+        Registry.clear()
+
+    async def test_constexpr_args_passed_to_compiler(self) -> None:
+        """constexpr_args values are passed to compiler.compile() as
+        constexpr_sizes so the backend can bake them in at compile time."""
+        from kernel_pipeline_backend.registry import Registry
+
+        seen_constexpr: list[dict] = []
+
+        class CapturingCompiler(FakeCompiler):
+            def compile(self, spec, config, constexpr_sizes=None):
+                seen_constexpr.append(dict(constexpr_sizes or {}))
+                return super().compile(spec, config, constexpr_sizes)
+
+        Registry.clear()
+        Registry.register_problem("p", FakeProblem(sizes={"HEAD": [64]}))
+        Registry.register_kernel(
+            "k",
+            source="fake",
+            backend="fake",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=lambda s, c: __import__(
+                "kernel_pipeline_backend.core.types", fromlist=["GridResult"]
+            ).GridResult(grid=(1,)),
+            problem="p",
+            constexpr_args={"HEAD_DIM": "HEAD"},
+        )
+
+        spec = make_spec(name="k")
+        configs = [KernelConfig(params={"BS": 64})]
+        compiler = CapturingCompiler(configs=configs)
+        profiler = Profiler(runner=FakeRunner(), device=FakeDeviceHandle(),
+                            backend="fake", warmup_cycles=0, profiling_cycles=1)
+        verifier = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
+        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+
+        await autotuner.run(
+            spec=spec,
+            space=SearchSpace(size_specs={"HEAD": [64]}, configs=configs),
+            compiler=compiler,
+            configs=configs,
+            problem=FakeProblem(sizes={"HEAD": [64]}),
+            strategy=FakeStrategy(),
+            skip_verify=True,
+            problem_name="p",
+        )
+
+        assert len(seen_constexpr) > 0
+        for cs in seen_constexpr:
+            assert cs.get("HEAD_DIM") == 64, cs
+
+        Registry.clear()
+
+    async def test_constexpr_args_merged_into_compiled_artifact(self) -> None:
+        """FakeCompiler merges constexpr_sizes into the compiled artifact's
+        config so the runner receives them as kwargs — this mirrors the
+        Triton backend's behaviour."""
+        from kernel_pipeline_backend.registry import Registry
+
+        seen_configs: list[dict] = []
+
+        class CapturingRunner(FakeRunner):
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                seen_configs.append(dict(compiled.config.params))
+                return super().run(compiled, inputs, device, grid, extra_args)
+
+        Registry.clear()
+        Registry.register_problem("p", FakeProblem(sizes={"HEAD": [64]}))
+        Registry.register_kernel(
+            "k",
+            source="fake",
+            backend="fake",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=lambda s, c: __import__(
+                "kernel_pipeline_backend.core.types", fromlist=["GridResult"]
+            ).GridResult(grid=(1,)),
+            problem="p",
+            constexpr_args={"HEAD_DIM": "HEAD"},
+        )
+
+        runner = CapturingRunner()
+        profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
+                            backend="fake", warmup_cycles=0, profiling_cycles=1)
+        verifier = Verifier(runner=runner, device=FakeDeviceHandle())
+        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+
+        spec = make_spec(name="k")
+        configs = [KernelConfig(params={"BS": 64})]
+        await autotuner.run(
+            spec=spec,
+            space=SearchSpace(size_specs={"HEAD": [64]}, configs=configs),
+            compiler=FakeCompiler(configs=configs),
+            configs=configs,
+            problem=FakeProblem(sizes={"HEAD": [64]}),
+            strategy=FakeStrategy(),
+            skip_verify=True,
+            problem_name="p",
+        )
+
+        assert len(seen_configs) > 0
+        for cfg in seen_configs:
+            assert cfg.get("HEAD_DIM") == 64, cfg
+
+        Registry.clear()
+
+    async def test_no_binding_uses_empty_extra_args(self) -> None:
+        """When problem_name is None, extra_args is always empty."""
+        received_extra: list[tuple] = []
+
+        class CapturingRunner(FakeRunner):
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                received_extra.append(extra_args)
+                return super().run(compiled, inputs, device, grid, extra_args)
+
+        runner = CapturingRunner()
+        profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
+                            backend="fake", warmup_cycles=0, profiling_cycles=1)
+        verifier = Verifier(runner=runner, device=FakeDeviceHandle())
+        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+
+        spec = make_spec(name="k_no_binding")
+        configs = [KernelConfig(params={"BS": 64})]
+        await autotuner.run(
+            spec=spec,
+            space=SearchSpace(size_specs={"M": [128]}, configs=configs),
+            compiler=FakeCompiler(configs=configs),
+            configs=configs,
+            problem=FakeProblem(sizes={"M": [128]}),
+            strategy=FakeStrategy(),
+            skip_verify=True,
+            # problem_name deliberately omitted
+        )
+
+        assert all(ea == () for ea in received_extra)

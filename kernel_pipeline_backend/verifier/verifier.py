@@ -172,7 +172,7 @@ class Verifier:
     Flow::
 
         inputs   = problem.initialize(sizes)
-        expected = problem.reference(inputs)
+        expected = problem.reference(inputs, sizes)
         grid     = compiled.spec.grid_generator(sizes, compiled.config)
         actual   = runner.run(compiled, inputs, device, grid).outputs
         compare(expected, actual, problem.atol, problem.rtol)
@@ -193,6 +193,7 @@ class Verifier:
         compiled: CompiledKernel,
         problem: Problem,
         sizes: dict[str, int],
+        extra_args: tuple[Any, ...] = (),
     ) -> VerificationResult:
         """Verify a compiled kernel at a single size point.
 
@@ -201,17 +202,20 @@ class Verifier:
             problem: Problem providing reference implementation and
                 tolerances (``atol``, ``rtol``).
             sizes: Concrete size parameters for this verification point.
+            extra_args: Additional scalar arguments forwarded to
+                ``Runner.run()``.  Resolved from link bindings by the
+                caller.  Defaults to an empty tuple.
 
         Returns:
             :class:`VerificationResult` with pass/fail and failure
             details if applicable.
         """
         inputs = problem.initialize(sizes)
-        expected = problem.reference(inputs)
+        expected = problem.reference(inputs, sizes)
 
         grid = compiled.spec.grid_generator(sizes, compiled.config)
         run_result = self._runner.run(
-            compiled, inputs, self._device, grid,
+            compiled, inputs, self._device, grid, extra_args,
         )
         actual = run_result.outputs
 

@@ -226,7 +226,7 @@ class TestVerification:
     async def test_failed_verification_skips_autotune(self) -> None:
         """If verification fails, that point is not autotuned."""
         problem = FakeProblem(
-            ref_fn=lambda inputs: [[999.0]],  # mismatch
+            ref_fn=lambda inputs, sizes: [[999.0]],  # mismatch
             init_fn=lambda s: [[0.0]],
         )
         result = await _run_pipeline(problem=problem)
@@ -273,7 +273,7 @@ class TestVerification:
         """One config fails verification, another passes — only passed one autotuned."""
         call_count = 0
 
-        def ref_fn(inputs):
+        def ref_fn(inputs, sizes):
             nonlocal call_count
             call_count += 1
             # Alternate: first call passes (identity), second fails
@@ -436,7 +436,7 @@ class TestPluginEvents:
 
     async def test_verify_fail_event_emitted(self) -> None:
         problem = FakeProblem(
-            ref_fn=lambda inputs: [[999.0]],
+            ref_fn=lambda inputs, sizes: [[999.0]],
             init_fn=lambda s: [[0.0]],
         )
         result, tracker = await self._run_with_tracker(problem=problem)
@@ -458,7 +458,11 @@ class TestPluginEvents:
         assert tracker.events[-1].event_type == EVENT_PIPELINE_COMPLETE
 
     async def test_event_ordering(self) -> None:
-        """Events follow: discovered → compile → autotune_start → verify → progress → complete."""
+        """Events follow: discovered → autotune_start → compile → verify → progress → complete.
+
+        Compilation is JIT (ADR-0014): it happens inside the autotuner's
+        per-point loop, after AUTOTUNE_START and before VERIFY_START.
+        """
         problem = FakeProblem(sizes={"M": [128]})
         compiler = FakeCompiler(
             configs=[KernelConfig(params={"BS": 64})],
@@ -469,17 +473,17 @@ class TestPluginEvents:
         types = [e.event_type for e in tracker.events]
 
         idx_discovered = types.index(EVENT_KERNEL_DISCOVERED)
-        idx_compile = types.index(EVENT_COMPILE_START)
         idx_autotune_start = types.index(EVENT_AUTOTUNE_START)
+        idx_compile = types.index(EVENT_COMPILE_START)
         idx_verify = types.index(EVENT_VERIFY_START)
         idx_progress = types.index(EVENT_AUTOTUNE_PROGRESS)
         idx_autotune_done = types.index(EVENT_AUTOTUNE_COMPLETE)
         idx_complete = types.index(EVENT_PIPELINE_COMPLETE)
 
-        assert idx_discovered < idx_compile
-        assert idx_compile < idx_autotune_start
-        # Verify and autotune happen per-point inside the strategy loop
-        assert idx_autotune_start < idx_verify
+        assert idx_discovered < idx_autotune_start
+        # Compile happens per-point inside the strategy loop (JIT)
+        assert idx_autotune_start < idx_compile
+        assert idx_compile < idx_verify
         assert idx_verify < idx_progress
         assert idx_progress < idx_autotune_done
         assert idx_autotune_done < idx_complete

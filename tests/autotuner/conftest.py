@@ -81,13 +81,24 @@ class FakeCompiler:
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         return list(self._configs)
 
-    def compile(self, spec: KernelSpec, config: KernelConfig) -> CompiledKernel:
+    def compile(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict | None = None,
+    ) -> CompiledKernel:
         import json
         key = json.dumps(config.params, sort_keys=True)
         if key in self._fail_configs:
             from kernel_pipeline_backend.core.compiler import CompilationError
             raise CompilationError(spec, config, "fake compilation error")
-        return CompiledKernel(spec=spec, config=config)
+        # Merge constexpr_sizes into artifact config so tests can inspect them
+        effective_config = config
+        if constexpr_sizes:
+            effective_config = KernelConfig(
+                params={**config.params, **constexpr_sizes}
+            )
+        return CompiledKernel(spec=spec, config=effective_config)
 
 
 class FakeRunner:
@@ -138,7 +149,7 @@ class FakeProblem:
     def initialize(self, sizes: dict[str, int]) -> list[Any]:
         return [f"tensor_{k}={v}" for k, v in sizes.items()]
 
-    def reference(self, inputs: list[Any]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
         return list(inputs)
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:

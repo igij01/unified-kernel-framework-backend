@@ -35,12 +35,23 @@ class Compiler(Protocol):
         """
         ...
 
-    def compile(self, spec: KernelSpec, config: KernelConfig) -> CompiledKernel:
+    def compile(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompiledKernel:
         """Compile a kernel with a specific configuration.
 
         Args:
             spec: Kernel source and metadata.
             config: Configuration to apply (tile sizes, warps, etc.).
+            constexpr_sizes: Problem size values that must be baked into
+                the compiled artifact at specialization time (e.g. Triton
+                ``tl.constexpr`` parameters, CUDA template arguments).
+                The backend decides how to encode them; the autotuner only
+                resolves which values to forward.  Defaults to ``None``
+                (no compile-time size specialization).
 
         Returns:
             A CompiledKernel whose ``artifact`` the corresponding Runner

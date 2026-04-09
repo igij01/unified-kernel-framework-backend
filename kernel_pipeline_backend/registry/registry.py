@@ -44,8 +44,51 @@ T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
-# Internal storage type
+# Internal storage types
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _LinkBinding:
+    """Resolved size-binding metadata for a kernel–problem link.
+
+    Attributes:
+        constexpr_args: Maps kernel param name → problem size key.
+            Resolved into compile-time kwargs merged into KernelConfig.
+        runtime_args: Ordered problem size keys whose values are passed
+            as extra positional args to Runner.run(extra_args=...).
+    """
+
+    constexpr_args: dict[str, str]
+    runtime_args: tuple[str, ...]
+
+
+_EMPTY_BINDING = _LinkBinding(constexpr_args={}, runtime_args=())
+
+
+def _resolve_link_binding(
+    binding: _LinkBinding,
+    sizes: dict[str, int],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Resolve a link binding against a concrete size point.
+
+    Args:
+        binding: The link binding to resolve.
+        sizes: Concrete size values for the current search point.  Must
+            contain all keys referenced in the binding — callers are
+            expected to run ``Registry.validate()`` upfront to ensure
+            this invariant.
+
+    Returns:
+        ``(extra_args_tuple, constexpr_kwargs)`` where:
+
+        - ``extra_args_tuple`` is passed as ``Runner.run(extra_args=...)``
+        - ``constexpr_kwargs`` is merged into ``KernelConfig.params``
+          before compilation.
+    """
+    extra = tuple(sizes[k] for k in binding.runtime_args)
+    constexpr = {param: sizes[key] for param, key in binding.constexpr_args.items()}
+    return extra, constexpr
 
 
 @dataclass
@@ -100,6 +143,9 @@ class Registry:
     # many-to-many maps — both directions maintained in sync
     _kernel_to_problems: dict[str, set[str]] = {}  # kernel name → problem names
     _problem_to_kernels: dict[str, set[str]] = {}  # problem name → kernel names
+
+    # optional size-binding metadata per link pair
+    _link_bindings: dict[tuple[str, str], _LinkBinding] = {}
 
     # -------------------------------------------------------------------------
     # Problem registration
@@ -170,6 +216,8 @@ class Registry:
         *,
         compile_flags: dict[str, Any] | None = None,
         problem: str | None = None,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
     ) -> None:
         """Register a kernel imperatively.
 
@@ -187,9 +235,15 @@ class Registry:
                 an empty dict.
             problem: If given, also links this kernel to the named problem
                 (equivalent to calling ``link(name, problem)`` afterwards).
+            constexpr_args: Maps kernel param name → problem size key for
+                compile-time specialisation.  Requires ``problem`` to be set.
+            runtime_args: Ordered problem size keys forwarded as scalar
+                ``extra_args`` to ``Runner.run()``.  Requires ``problem``.
 
         Raises:
             ValueError: If ``name`` is already registered as a kernel.
+            ValueError: If ``constexpr_args`` or ``runtime_args`` is
+                provided without ``problem``.
 
         Example::
 
@@ -201,6 +255,12 @@ class Registry:
                 grid_generator=my_grid_fn,
             )
         """
+        if constexpr_args is not None or runtime_args is not None:
+            if problem is None:
+                raise ValueError(
+                    "constexpr_args and runtime_args require a linked problem. "
+                    "Pass problem= when specifying bindings."
+                )
         if name in Registry._kernels:
             raise ValueError(
                 f"Kernel '{name}' is already registered. "
@@ -216,7 +276,11 @@ class Registry:
         # Initialise linkage entry (empty set) so the kernel appears in queries
         Registry._kernel_to_problems.setdefault(name, set())
         if problem is not None:
-            Registry.link(name, problem)
+            Registry.link(
+                name, problem,
+                constexpr_args=constexpr_args,
+                runtime_args=runtime_args,
+            )
 
     @staticmethod
     def kernel(
@@ -227,6 +291,8 @@ class Registry:
         *,
         compile_flags: dict[str, Any] | None = None,
         problem: str | None = None,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator that registers the decorated callable as a kernel source.
 
@@ -265,6 +331,8 @@ class Registry:
                 grid_generator=grid_generator,
                 compile_flags=compile_flags,
                 problem=problem,
+                constexpr_args=constexpr_args,
+                runtime_args=runtime_args,
             )
             return fn
         return decorator
@@ -274,27 +342,70 @@ class Registry:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def link(kernel_name: str, problem_name: str) -> None:
+    def link(
+        kernel_name: str,
+        problem_name: str,
+        *,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
+    ) -> None:
         """Create a many-to-many link between a kernel and a problem.
 
         Both sides are allowed to not yet exist at the time of the call —
         validation is deferred to ``validate()`` or pipeline entry.
         Duplicate links are silently ignored.
 
+        If either ``constexpr_args`` or ``runtime_args`` is provided, the
+        binding is stored (or replaced) under ``(kernel_name, problem_name)``.
+        Calling ``link()`` with both as ``None`` on an already-bound pair does
+        **not** erase the existing binding.
+
         Args:
             kernel_name: Registered (or future) kernel name.
             problem_name: Registered (or future) problem name.
+            constexpr_args: Maps kernel param name → problem size key for
+                compile-time specialisation.
+            runtime_args: Ordered problem size keys passed as scalar
+                ``extra_args`` to ``Runner.run()``.
 
         Example::
 
-            Registry.link("matmul_naive", "matmul")
+            Registry.link("matmul_naive", "matmul",
+                          runtime_args=["M", "N", "K"])
         """
         Registry._kernel_to_problems.setdefault(kernel_name, set()).add(problem_name)
         Registry._problem_to_kernels.setdefault(problem_name, set()).add(kernel_name)
 
+        if constexpr_args is not None or runtime_args is not None:
+            Registry._link_bindings[(kernel_name, problem_name)] = _LinkBinding(
+                constexpr_args=dict(constexpr_args or {}),
+                runtime_args=tuple(runtime_args or []),
+            )
+
+    @staticmethod
+    def _drop_bindings_for(
+        kernel: str | None = None,
+        problem: str | None = None,
+    ) -> None:
+        """Remove binding entries matching the given kernel and/or problem.
+
+        Args:
+            kernel: If given, remove all bindings whose first key equals this.
+            problem: If given, remove all bindings whose second key equals this.
+        """
+        to_remove = [
+            key for key in Registry._link_bindings
+            if (kernel is None or key[0] == kernel)
+            and (problem is None or key[1] == problem)
+        ]
+        for key in to_remove:
+            del Registry._link_bindings[key]
+
     @staticmethod
     def unlink(kernel_name: str, problem_name: str) -> None:
         """Remove a kernel–problem link.  No-op if the link does not exist.
+
+        Also removes any binding stored under this pair.
 
         Args:
             kernel_name: Kernel name.
@@ -302,6 +413,25 @@ class Registry:
         """
         Registry._kernel_to_problems.get(kernel_name, set()).discard(problem_name)
         Registry._problem_to_kernels.get(problem_name, set()).discard(kernel_name)
+        Registry._link_bindings.pop((kernel_name, problem_name), None)
+
+    @staticmethod
+    def get_link_binding(kernel_name: str, problem_name: str) -> _LinkBinding:
+        """Return the link binding for a kernel–problem pair.
+
+        Returns ``_EMPTY_BINDING`` (no constexpr or runtime args) if no
+        binding was registered for this pair, keeping call sites uniform.
+
+        Args:
+            kernel_name: Registered kernel name.
+            problem_name: Registered problem name.
+
+        Returns:
+            The stored :class:`_LinkBinding`, or :data:`_EMPTY_BINDING`.
+        """
+        return Registry._link_bindings.get(
+            (kernel_name, problem_name), _EMPTY_BINDING
+        )
 
     # -------------------------------------------------------------------------
     # Query API
@@ -420,6 +550,8 @@ class Registry:
         linked_problems = Registry._kernel_to_problems.pop(name, set())
         for prob_name in linked_problems:
             Registry._problem_to_kernels.get(prob_name, set()).discard(name)
+        # Remove any stored link bindings for this kernel
+        Registry._drop_bindings_for(kernel=name)
 
     @staticmethod
     def unregister_problem(name: str) -> None:
@@ -443,6 +575,8 @@ class Registry:
         linked_kernels = Registry._problem_to_kernels.pop(name, set())
         for kernel_name in linked_kernels:
             Registry._kernel_to_problems.get(kernel_name, set()).discard(name)
+        # Remove any stored link bindings for this problem
+        Registry._drop_bindings_for(problem=name)
 
     @staticmethod
     def remove_unlinked_kernels() -> list[str]:
@@ -469,6 +603,7 @@ class Registry:
             # Use internal removal to avoid raising on keys we know exist
             Registry._kernels.pop(name, None)
             Registry._kernel_to_problems.pop(name, None)
+            Registry._drop_bindings_for(kernel=name)
         return sorted(unlinked)
 
     @staticmethod
@@ -482,6 +617,7 @@ class Registry:
         Registry._problems.clear()
         Registry._kernel_to_problems.clear()
         Registry._problem_to_kernels.clear()
+        Registry._link_bindings.clear()
 
     # -------------------------------------------------------------------------
     # Validation
@@ -498,7 +634,10 @@ class Registry:
 
         - Every link from a kernel references a problem that is registered.
         - Every link from a problem references a kernel that is registered.
-        - Kernels with no linked problems are reported as warnings.
+        - Every key in ``constexpr_args`` and ``runtime_args`` bindings
+          exists in the linked problem's ``sizes`` dict.
+        - Kernels with no linked problems are reported as errors (tuning
+          an unlinked kernel is not supported).
 
         Returns:
             List of human-readable error/warning strings.  An empty list
@@ -542,12 +681,33 @@ class Registry:
                         f"unregistered kernel '{kernel_name}'"
                     )
 
-        # Warn about kernels with no linked problems
+        # Error: kernels with no linked problems cannot be tuned
         for kernel_name in sorted(Registry._kernels.keys()):
             if not Registry._kernel_to_problems.get(kernel_name):
                 messages.append(
-                    f"warning: kernel '{kernel_name}' has no linked problems"
+                    f"error: kernel '{kernel_name}' has no linked problems"
                 )
+
+        # Check that binding keys exist in the linked problem's sizes
+        for (kernel_name, prob_name), binding in sorted(Registry._link_bindings.items()):
+            problem = Registry._problems.get(prob_name)
+            if problem is None:
+                continue  # already reported as dangling link above
+            valid_keys = set(problem.sizes.keys())
+            for param, size_key in binding.constexpr_args.items():
+                if size_key not in valid_keys:
+                    messages.append(
+                        f"error: kernel '{kernel_name}' binding constexpr_args"
+                        f"['{param}'] references unknown size key '{size_key}'"
+                        f" in problem '{prob_name}'"
+                    )
+            for size_key in binding.runtime_args:
+                if size_key not in valid_keys:
+                    messages.append(
+                        f"error: kernel '{kernel_name}' binding runtime_args"
+                        f" references unknown size key '{size_key}'"
+                        f" in problem '{prob_name}'"
+                    )
 
         return messages
 

@@ -311,7 +311,12 @@ class Problem(Protocol):
         ...
 
     def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Ground truth implementation."""
+        """Ground truth implementation.
+
+        **Optional** (see [ADR-0013](adr/0013-link-time-size-bindings.md)).
+        Problems that omit ``reference`` cause the pipeline to skip the
+        verifier stage entirely; ``atol``/``rtol`` are then unused.
+        """
         ...
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -337,6 +342,11 @@ Depends on: `core`, `problem`
 The verifier checks a **single compiled kernel at a single size point**
 against the Problem's reference implementation.  The Pipeline owns the
 loop over multiple size points.
+
+If the linked `Problem` does not implement `reference()` (it is optional —
+see [ADR-0013](adr/0013-link-time-size-bindings.md)), the Pipeline skips
+the Verifier stage entirely for that problem and proceeds directly to
+autotuning.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1091,10 +1101,15 @@ class Registry:
         *,
         compile_flags: dict[str, Any] | None = None,
         problem: str | None = None,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
     ) -> None:
         """Register a kernel imperatively.
 
-        If ``problem`` is given, also links the kernel to that problem.
+        If ``problem`` is given, also links the kernel to that problem,
+        forwarding ``constexpr_args`` and ``runtime_args`` into the link
+        binding (see ``link()`` and
+        [ADR-0013](adr/0013-link-time-size-bindings.md)).
         Raises ValueError if ``name`` is already registered.
         """
         ...
@@ -1108,6 +1123,8 @@ class Registry:
         *,
         compile_flags: dict[str, Any] | None = None,
         problem: str | None = None,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
     ) -> Callable[[Callable], Callable]:
         """Decorator form — the decorated callable becomes the kernel source::
 
@@ -1122,11 +1139,33 @@ class Registry:
     # ── Linkage ───────────────────────────────────────────────────
 
     @staticmethod
-    def link(kernel_name: str, problem_name: str) -> None:
+    def link(
+        kernel_name: str,
+        problem_name: str,
+        *,
+        constexpr_args: dict[str, str] | None = None,
+        runtime_args: list[str] | None = None,
+    ) -> None:
         """Create a many-to-many link between a kernel and a problem.
 
+        ``constexpr_args`` maps **kernel parameter name → problem size key**
+        and is resolved per ``SearchPoint`` into compile-time specialization
+        values (Triton ``tl.constexpr`` kwargs, CUDA template params or
+        ``-D`` defines). Resolved values participate in the compile cache
+        key.
+
+        ``runtime_args`` is an ordered list of problem size keys whose
+        resolved values are spliced into ``Runner.run(extra_args=...)`` at
+        launch time.
+
+        Both default to empty (current behavior). Names are validated
+        against the linked ``Problem.sizes`` keys at ``validate()`` /
+        pipeline entry — see
+        [ADR-0013](adr/0013-link-time-size-bindings.md).
+
         Does not validate that both sides exist — deferred to pipeline.
-        Duplicate links are silently ignored.
+        Re-linking the same pair with a new binding replaces the previous
+        binding (duplicate links with identical bindings are no-ops).
         """
         ...
 
@@ -1212,8 +1251,12 @@ class Registry:
         Checks performed:
           - Every kernel link references a registered problem name.
           - Every problem link references a registered kernel name.
-          - Kernels with no links are reported as warnings (valid but
-            may indicate a missing link).
+          - For each link with bindings (see ADR-0013), every name in
+            ``constexpr_args.values()`` and every entry in ``runtime_args``
+            exists as a key in the linked ``Problem.sizes``.
+          - Kernels with no links are reported as **errors** — tuning an
+            unlinked kernel is not supported (ADR-0013): a kernel by itself
+            has no shape information and therefore nothing to tune over.
         """
         ...
 
@@ -1264,6 +1307,26 @@ class Registry:
         ...
 ```
 
+### Link Bindings (ADR-0013)
+
+Each `(kernel, problem)` link may carry a **binding** describing how the
+problem's `sizes` dict feeds into the kernel signature. Bindings live on the
+link, not on the kernel, because the same kernel may link to multiple problems
+whose size keys differ.
+
+Two channels are supported:
+
+| Channel | API field | Resolves into | When |
+|---------|-----------|---------------|------|
+| Compile-time specialization | `constexpr_args: dict[str, str]` (kernel param → size key) | Triton `tl.constexpr` kwargs / CUDA template params or `-D` defines | At compile, **part of cache key** |
+| Runtime shape arg | `runtime_args: list[str]` (ordered size keys) | `Runner.run(extra_args=...)` | At launch |
+
+Internally the registry stores bindings keyed by `(kernel_name, problem_name)`
+alongside the existing many-to-many maps. The pipeline's per-`SearchPoint`
+preparation step resolves them into `(extra_args_tuple, constexpr_kwargs)`
+and threads them into the compile + run path. The `Runner` protocol does not
+change.
+
 ### Usage examples
 
 ```python
@@ -1298,6 +1361,14 @@ Registry.register_kernel(
     grid_generator=naive_grid_fn,
 )
 Registry.link("matmul_naive", "matmul")
+
+# Link with shape bindings (ADR-0013): the attention kernel needs HEAD_DIM
+# as a tl.constexpr at compile time and SEQ_LEN as a runtime int arg.
+Registry.link(
+    "attn_kernel", "attention",
+    constexpr_args={"HEAD_DIM": "head_dim"},
+    runtime_args=["seq_len"],
+)
 
 # ── In orchestration layer ────────────────────────────────────
 
@@ -1732,3 +1803,4 @@ User calls TuneService:
 | `autotuner/instrument/` | [ADR-0012](adr/0012-single-point-execution.md) | Instrument protocol — pluggable compile-time transform + paired observer |
 | `pipeline/` `run_point()` | [ADR-0012](adr/0012-single-point-execution.md) | Single-point execution for debugging and investigation |
 | `backends/` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Isolated backend implementations |
+| `registry/` link bindings, `problem/` optional `reference` | [ADR-0013](adr/0013-link-time-size-bindings.md) | Link-time `constexpr_args` / `runtime_args`, optional reference, no tuning of unlinked kernels |

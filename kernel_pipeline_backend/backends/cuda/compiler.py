@@ -88,16 +88,25 @@ class CUDACompiler:
         ]
 
     def compile(
-        self, spec: KernelSpec, config: KernelConfig
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
     ) -> CompiledKernel:
         """Compile CUDA source with the given configuration.
 
         Chooses template mode or macro mode based on the presence
         of ``compile_flags["template_params"]``.
 
+        ``constexpr_sizes`` are merged into the ``-D`` defines (and
+        optionally into template arguments) so that problem sizes
+        baked in at compile time receive actual values.
+
         Args:
             spec: CUDA kernel source and metadata.
             config: Configuration (tile sizes, stages, etc.).
+            constexpr_sizes: Problem size values to bake in as
+                preprocessor defines (e.g. ``{"HEAD_DIM": 64}``).
 
         Returns:
             ``CompiledKernel`` whose ``artifact`` is a CuPy kernel
@@ -114,12 +123,15 @@ class CUDACompiler:
             "template_params"
         )
 
+        # Merge constexpr sizes into effective params for -D defines.
+        effective_params = {**config.params, **(constexpr_sizes or {})}
+
         # --- NVRTC options ------------------------------------------
         # Config params that are NOT template args become -D defines.
         template_set = set(template_params) if template_params else set()
         options: list[str] = [
             f"-D{k}={v}"
-            for k, v in sorted(config.params.items())
+            for k, v in sorted(effective_params.items())
             if k not in template_set
         ]
         options.extend(spec.compile_flags.get("nvrtc_options", []))
@@ -128,7 +140,7 @@ class CUDACompiler:
         try:
             if template_params:
                 name_expr = self._build_name_expression(
-                    entry_point, config, template_params
+                    entry_point, effective_params, template_params
                 )
                 module = cupy.RawModule(
                     code=str(spec.source),
@@ -156,7 +168,7 @@ class CUDACompiler:
 
         return CompiledKernel(
             spec=spec,
-            config=config,
+            config=config,  # canonical tunable config, not merged
             artifact=kernel,
             compile_info=compile_info,
         )
@@ -164,7 +176,7 @@ class CUDACompiler:
     @staticmethod
     def _build_name_expression(
         entry_point: str,
-        config: KernelConfig,
+        params: dict[str, Any],
         template_params: list[str],
     ) -> str:
         """Build a C++ name expression for a template specialization.
@@ -174,16 +186,15 @@ class CUDACompiler:
 
         Args:
             entry_point: Kernel function name.
-            config: Configuration whose ``params`` supply the values.
-            template_params: Ordered list of config param names
-                matching the kernel's C++ template parameter order.
+            params: Merged params dict (config + constexpr_sizes).
+            template_params: Ordered list of param names matching
+                the kernel's C++ template parameter order.
 
         Returns:
             Name expression string, e.g. ``"matmul<128, 64>"``.
 
         Raises:
-            KeyError: If a template param name is missing from
-                ``config.params``.
+            KeyError: If a template param name is missing from ``params``.
         """
-        args = ", ".join(str(config.params[p]) for p in template_params)
+        args = ", ".join(str(params[p]) for p in template_params)
         return f"{entry_point}<{args}>"

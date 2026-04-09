@@ -45,6 +45,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _enforce_registry_valid() -> None:
+    """Raise ValueError if the Registry has any error-level issues.
+
+    Calls ``Registry.validate()`` and raises if any message starts with
+    ``"error:"``.  Callers are expected to invoke this at the start of
+    every tune request so that misconfigured registries are caught early
+    rather than producing confusing failures mid-pipeline.
+
+    Raises:
+        ValueError: If any registry errors are present, with all error
+            messages included in the exception string.
+    """
+    messages = Registry.validate()
+    errors = [m for m in messages if m.startswith("error:")]
+    if errors:
+        raise ValueError(
+            "Registry validation failed — fix errors before tuning:\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
@@ -266,6 +292,9 @@ class TuneService:
         Raises:
             KeyError: If ``kernel_name`` or ``problem`` is not registered.
         """
+        # Validate registry state before proceeding
+        _enforce_registry_valid()
+
         spec = Registry.get_kernel(kernel_name)
 
         # Resolve problem
@@ -296,6 +325,7 @@ class TuneService:
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
+                problem_name=problem_name,
             )
         finally:
             await pm.shutdown_all()
@@ -342,6 +372,9 @@ class TuneService:
             ValueError: If no kernels are linked to the problem, or if
                 linked kernels span multiple backends.
         """
+        # Validate registry state before proceeding
+        _enforce_registry_valid()
+
         problem_obj = Registry.get_problem(problem_name)
         kernel_names = Registry.kernels_for_problem(problem_name)
         if not kernel_names:
@@ -375,6 +408,7 @@ class TuneService:
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
+                problem_name=problem_name,
             )
         finally:
             await pm.shutdown_all()
@@ -398,8 +432,9 @@ class TuneService:
         """Tune every kernel in the registry.
 
         Groups kernels by problem, issues one ``tune_problem()`` per
-        group.  Unlinked kernels are collected into a final
-        ``tune()`` call per kernel with ``skip_verify=True``.
+        group.  All kernels must be linked to at least one problem —
+        unlinked kernels will cause registry validation to fail (see
+        ADR-0013).
 
         Args:
             strategy: Override the service-level default strategy.
@@ -410,34 +445,32 @@ class TuneService:
             skip_autotune: If ``True``, skip autotuning.
 
         Returns:
-            A list of ``TuneResult`` — one per problem group, plus one
-            per unlinked kernel.
+            A list of ``TuneResult`` — one per problem group.
 
         Raises:
-            ValueError: If the registry is empty.
+            ValueError: If the registry is empty or has validation errors
+                (e.g. unlinked kernels).
         """
         all_kernels = Registry.list_kernels()
         if not all_kernels:
             raise ValueError("Registry is empty — nothing to tune.")
 
+        # Validate once upfront; catches unlinked kernels and dangling links.
+        _enforce_registry_valid()
+
         results: list[TuneResult] = []
 
-        # Track which kernels we've already scheduled via a problem group
-        scheduled: set[str] = set()
-
-        # Phase 1: tune each problem group
+        # Tune each problem group (tune_problem calls _enforce_registry_valid)
         for problem_name in Registry.list_problems():
             kernel_names = Registry.kernels_for_problem(problem_name)
             if not kernel_names:
                 continue
-            scheduled.update(kernel_names)
             # Split by backend — tune_problem requires single-backend groups
             specs = [Registry.get_kernel(n) for n in kernel_names]
             by_backend: dict[str, list[str]] = {}
             for spec_item in specs:
                 by_backend.setdefault(spec_item.backend, []).append(spec_item.name)
             for backend_kernel_names in by_backend.values():
-                # For multi-backend problems, fall back to individual tune() calls
                 if len(by_backend) == 1:
                     result = await self.tune_problem(
                         problem_name,
@@ -464,21 +497,6 @@ class TuneService:
                             skip_autotune=skip_autotune,
                         )
                         results.append(result)
-
-        # Phase 2: tune unlinked kernels individually
-        for kernel_name in all_kernels:
-            if kernel_name in scheduled:
-                continue
-            result = await self.tune(
-                kernel_name,
-                strategy=strategy,
-                observers=observers,
-                plugins=plugins,
-                force=force,
-                skip_verify=True,
-                skip_autotune=skip_autotune,
-            )
-            results.append(result)
 
         return results
 
@@ -528,6 +546,9 @@ class TuneService:
         Raises:
             KeyError: If ``kernel_name`` or ``problem`` is not registered.
         """
+        # Validate registry state before proceeding
+        _enforce_registry_valid()
+
         spec = Registry.get_kernel(kernel_name)
 
         # Resolve problem
@@ -554,6 +575,7 @@ class TuneService:
                 point,
                 problem_obj,
                 resolved_observers,
+                problem_name=problem_name,
                 instruments=instruments,
                 compile_options=compile_options,
                 verify=verify,

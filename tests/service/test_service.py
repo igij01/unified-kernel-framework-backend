@@ -50,7 +50,7 @@ class _FakeProblem:
     def initialize(self, sizes: dict[str, int]) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
         return []
 
 
@@ -247,6 +247,7 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_PipelineCall]:
         force=False,
         skip_verify=False,
         skip_autotune=False,
+        problem_name=None,
     ):
         calls.append(
             _PipelineCall(
@@ -318,17 +319,14 @@ class TestTune:
         assert isinstance(call.problem, _FakeProblem)
         assert call.skip_verify is False
 
-    async def test_tune_unlinked_kernel_skips_verify(
-        self, service: TuneService, captured_calls: list[_PipelineCall],
+    async def test_tune_unlinked_kernel_raises_validation_error(
+        self, service: TuneService,
     ) -> None:
-        """Kernel with no linked problem: skip_verify is forced True."""
+        """Kernel with no linked problem now raises ValueError (ADR-0013)."""
         _register_kernel("orphan")
 
-        result = await service.tune("orphan")
-
-        assert result.problem_name is None
-        assert len(captured_calls) == 1
-        assert captured_calls[0].skip_verify is True
+        with pytest.raises(ValueError, match="error"):
+            await service.tune("orphan")
 
     async def test_tune_with_explicit_problem_override(
         self, service: TuneService, captured_calls: list[_PipelineCall],
@@ -351,23 +349,36 @@ class TestTune:
     async def test_tune_unknown_problem_override_raises(
         self, service: TuneService,
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         with pytest.raises(KeyError, match="bad_problem"):
             await service.tune("k", problem="bad_problem")
 
     async def test_tune_passes_force_flag(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await service.tune("k", force=True)
         assert captured_calls[0].force is True
 
     async def test_tune_passes_skip_autotune_flag(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await service.tune("k", skip_autotune=True)
         assert captured_calls[0].skip_autotune is True
+
+    async def test_tune_validation_error_includes_all_errors(
+        self, service: TuneService,
+    ) -> None:
+        """All validation errors are surfaced in the exception message."""
+        _register_kernel("orphan1")
+        _register_kernel("orphan2")
+        with pytest.raises(ValueError) as exc_info:
+            await service.tune("orphan1")
+        assert "orphan" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -440,31 +451,29 @@ class TestTuneAll:
         assert results[0].problem_name == "matmul"
         assert sorted(results[0].kernel_names) == ["k1", "k2"]
 
-    async def test_tune_all_unlinked_kernels_skip_verify(
-        self, service: TuneService, captured_calls: list[_PipelineCall],
+    async def test_tune_all_unlinked_kernels_raises_validation_error(
+        self, service: TuneService,
     ) -> None:
+        """tune_all() with an unlinked kernel raises ValueError (ADR-0013)."""
         _register_kernel("orphan")
 
-        results = await service.tune_all()
+        with pytest.raises(ValueError, match="error"):
+            await service.tune_all()
 
-        assert len(results) == 1
-        assert results[0].problem_name is None
-        # The unlinked kernel's pipeline call should have skip_verify=True
-        assert captured_calls[0].skip_verify is True
-
-    async def test_tune_all_mixed_linked_and_unlinked(
+    async def test_tune_all_all_linked(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_problem("p")
-        _register_kernel("linked", problem="p")
-        _register_kernel("orphan")
+        """tune_all() succeeds when all kernels are linked to problems."""
+        _register_problem("p1")
+        _register_problem("p2")
+        _register_kernel("k1", problem="p1")
+        _register_kernel("k2", problem="p2")
 
         results = await service.tune_all()
 
         assert len(results) == 2
-        problem_names = [r.problem_name for r in results]
-        assert "p" in problem_names
-        assert None in problem_names
+        problem_names = {r.problem_name for r in results}
+        assert problem_names == {"p1", "p2"}
 
     async def test_tune_all_empty_registry_raises(
         self, service: TuneService,
@@ -484,7 +493,8 @@ class TestStrategyResolution:
     async def test_per_request_override(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         custom = _FakeStrategy()
         await service.tune("k", strategy=custom)
         assert captured_calls[0].strategy is custom
@@ -498,7 +508,8 @@ class TestStrategyResolution:
             store=_FakeStore(),
             strategy=default_strat,
         )
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await svc.tune("k")
         assert captured_calls[0].strategy is default_strat
 
@@ -506,7 +517,8 @@ class TestStrategyResolution:
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
         """When no strategy is set, falls back to Exhaustive."""
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await service.tune("k")
         from kernel_pipeline_backend.autotuner.strategy import Exhaustive
         assert isinstance(captured_calls[0].strategy, Exhaustive)
@@ -523,7 +535,8 @@ class TestObserverResolution:
     async def test_per_request_override(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         custom = _FakeObserver()
         await service.tune("k", observers=[custom])
         assert captured_calls[0].observers == [custom]
@@ -535,14 +548,16 @@ class TestObserverResolution:
         svc = TuneService(
             device=_FakeDevice(), store=_FakeStore(), observers=[obs],
         )
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await svc.tune("k")
         assert captured_calls[0].observers[0] is obs
 
     async def test_fallback_to_timing_observer(
         self, service: TuneService, captured_calls: list[_PipelineCall],
     ) -> None:
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
         await service.tune("k")
         from kernel_pipeline_backend.autotuner.observer import TimingObserver
         assert isinstance(captured_calls[0].observers[0], TimingObserver)
@@ -563,7 +578,8 @@ class TestPluginLifecycle:
         svc = TuneService(
             device=_FakeDevice(), store=_FakeStore(), plugins=[plugin],
         )
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
 
         await svc.tune("k")
 
@@ -579,7 +595,8 @@ class TestPluginLifecycle:
         svc = TuneService(
             device=_FakeDevice(), store=_FakeStore(), plugins=[default_plugin],
         )
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
 
         await svc.tune("k", plugins=[override_plugin])
 
@@ -596,7 +613,8 @@ class TestPluginLifecycle:
         svc = TuneService(
             device=_FakeDevice(), store=_FakeStore(), plugins=[plugin],
         )
-        _register_kernel("k")
+        _register_problem("p")
+        _register_kernel("k", problem="p")
 
         async def _failing_run(self, **kwargs):
             raise RuntimeError("boom")
@@ -644,7 +662,8 @@ class TestBackendResolution:
         BackendRegistry.get_compiler is currently a stub, so we patch it
         to raise KeyError to verify the TuneService propagates it.
         """
-        _register_kernel("k", backend="nonexistent_backend")
+        _register_problem("p")
+        _register_kernel("k", backend="nonexistent_backend", problem="p")
 
         def _raise(name: str):
             raise KeyError(f"No backend '{name}' registered")

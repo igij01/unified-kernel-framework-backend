@@ -11,10 +11,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
+test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "numpy>=2.1.0",
+]
+dev = [
+    "kernel-pipeline-backend[test]",
 ]
 
 [tool.scikit-build]

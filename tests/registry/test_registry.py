@@ -22,6 +22,7 @@ from kernel_pipeline_backend.core.types import (
     KernelSpec,
 )
 from kernel_pipeline_backend.registry import Registry
+from kernel_pipeline_backend.registry.registry import _EMPTY_BINDING, _LinkBinding
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ class _FakeProblem:
     def initialize(self, sizes: dict[str, int]) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
         return []
 
 
@@ -125,7 +126,7 @@ class TestProblemRegistration:
             atol: float = 1e-3
             rtol: float = 1e-3
             def initialize(self, s: dict[str, int]) -> list[Any]: return []
-            def reference(self, i: list[Any]) -> list[Any]: return []
+            def reference(self, i: list[Any], sizes: dict[str, int]) -> list[Any]: return []
 
         # Class is still usable directly
         assert Conv2DProblem is not None
@@ -141,7 +142,7 @@ class TestProblemRegistration:
                 sizes: dict[str, Any] = {}
                 atol = rtol = 0.0
                 def initialize(self, s: dict[str, int]) -> list[Any]: return []
-                def reference(self, i: list[Any]) -> list[Any]: return []
+                def reference(self, i: list[Any], sizes: dict[str, int]) -> list[Any]: return []
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +437,17 @@ class TestRemoveUnlinkedKernels:
         removed = Registry.remove_unlinked_kernels()
         assert removed == ["a_orphan", "z_orphan"]
 
+    def test_drops_bindings_for_removed_kernels(self) -> None:
+        """Bindings stored for removed unlinked kernels are cleaned up."""
+        _register_problem("p")
+        _register_kernel("k")
+        # Store a binding even though the kernel ends up unlinked
+        Registry._link_bindings[("k", "p")] = _LinkBinding(
+            constexpr_args={}, runtime_args=("M",)
+        )
+        Registry.remove_unlinked_kernels()
+        assert Registry.get_link_binding("k", "p") is _EMPTY_BINDING
+
 
 # ---------------------------------------------------------------------------
 # TestValidate
@@ -453,11 +465,12 @@ class TestValidate:
         _register_kernel("k", problem="p")
         assert Registry.validate() == []
 
-    def test_warns_about_unlinked_kernel(self) -> None:
-        """A registered kernel with no problem link produces a warning."""
+    def test_errors_about_unlinked_kernel(self) -> None:
+        """A registered kernel with no problem link is now an error (not warning)."""
         _register_kernel("orphan")
         messages = Registry.validate()
-        assert any("warning" in m and "orphan" in m for m in messages)
+        assert any("error" in m and "orphan" in m for m in messages)
+        assert not any("warning" in m and "orphan" in m for m in messages)
 
     def test_error_for_kernel_linking_unknown_problem(self) -> None:
         """A link from a kernel to a non-existent problem is reported."""
@@ -487,8 +500,165 @@ class TestValidate:
         _register_kernel("orphan2")
         Registry.link("orphan1", "bad_prob")
         messages = Registry.validate()
-        # At least two warnings (one per orphan) plus one error for bad_prob link
+        # At least two errors (one per orphan) plus one error for bad_prob link
         assert len(messages) >= 2
+
+
+# ---------------------------------------------------------------------------
+# TestLinkBindings
+# ---------------------------------------------------------------------------
+
+
+class TestLinkBindings:
+    """_LinkBinding storage and retrieval."""
+
+    def test_link_with_runtime_args_stores_binding(self) -> None:
+        """link() with runtime_args stores a _LinkBinding."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p", runtime_args=["M", "N"])
+        binding = Registry.get_link_binding("k", "p")
+        assert isinstance(binding, _LinkBinding)
+        assert binding.runtime_args == ("M", "N")
+        assert binding.constexpr_args == {}
+
+    def test_link_with_constexpr_args_stores_binding(self) -> None:
+        """link() with constexpr_args stores a _LinkBinding."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p", constexpr_args={"HEAD_DIM": "D"})
+        binding = Registry.get_link_binding("k", "p")
+        assert binding.constexpr_args == {"HEAD_DIM": "D"}
+        assert binding.runtime_args == ()
+
+    def test_get_link_binding_returns_empty_for_unbound_link(self) -> None:
+        """get_link_binding returns _EMPTY_BINDING when no bindings were set."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p")
+        binding = Registry.get_link_binding("k", "p")
+        assert binding is _EMPTY_BINDING
+
+    def test_get_link_binding_returns_empty_for_unknown_pair(self) -> None:
+        """get_link_binding returns _EMPTY_BINDING for an unregistered pair."""
+        binding = Registry.get_link_binding("ghost", "phantom")
+        assert binding is _EMPTY_BINDING
+
+    def test_relinking_with_bindings_replaces_existing(self) -> None:
+        """Re-calling link() with new bindings replaces the previous entry."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.link("k", "p", runtime_args=["M", "N"])
+        binding = Registry.get_link_binding("k", "p")
+        assert binding.runtime_args == ("M", "N")
+
+    def test_relinking_without_bindings_does_not_erase(self) -> None:
+        """Re-calling link() with None/None does not erase an existing binding."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.link("k", "p")  # membership-only call
+        binding = Registry.get_link_binding("k", "p")
+        assert binding.runtime_args == ("M",)
+
+    def test_unlink_drops_binding(self) -> None:
+        """unlink() also removes the stored binding."""
+        _register_problem("p")
+        _register_kernel("k")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.unlink("k", "p")
+        assert Registry.get_link_binding("k", "p") is _EMPTY_BINDING
+
+    def test_unregister_kernel_drops_bindings(self) -> None:
+        """unregister_kernel() cleans up all bindings for that kernel."""
+        _register_problem("p")
+        _register_kernel("k", problem="p")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.unregister_kernel("k")
+        assert Registry.get_link_binding("k", "p") is _EMPTY_BINDING
+
+    def test_unregister_problem_drops_bindings(self) -> None:
+        """unregister_problem() cleans up all bindings for that problem."""
+        _register_problem("p")
+        _register_kernel("k", problem="p")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.unregister_problem("p")
+        assert Registry.get_link_binding("k", "p") is _EMPTY_BINDING
+
+    def test_register_kernel_with_bindings_but_no_problem_raises(self) -> None:
+        """Passing constexpr_args without problem= raises ValueError."""
+        with pytest.raises(ValueError, match="require a linked problem"):
+            Registry.register_kernel(
+                "k",
+                source=_SOURCE,
+                backend="cuda",
+                target_archs=_ARCHS,
+                grid_generator=_noop_grid,
+                constexpr_args={"HEAD_DIM": "D"},
+            )
+
+    def test_register_kernel_with_runtime_args_but_no_problem_raises(self) -> None:
+        """Passing runtime_args without problem= raises ValueError."""
+        with pytest.raises(ValueError, match="require a linked problem"):
+            Registry.register_kernel(
+                "k",
+                source=_SOURCE,
+                backend="cuda",
+                target_archs=_ARCHS,
+                grid_generator=_noop_grid,
+                runtime_args=["N"],
+            )
+
+    def test_validate_flags_constexpr_key_not_in_problem_sizes(self) -> None:
+        """validate() reports an error when a constexpr_args key is not in sizes."""
+        class ProblemXY:
+            sizes = {"X": [1], "Y": [2]}
+            atol = rtol = 1e-3
+            def initialize(self, s): return []
+            def reference(self, i, s): return []
+
+        Registry.register_problem("p", ProblemXY())
+        _register_kernel("k")
+        Registry.link("k", "p", constexpr_args={"HEAD_DIM": "Z"})
+        messages = Registry.validate()
+        assert any("error" in m and "Z" in m for m in messages)
+
+    def test_validate_flags_runtime_arg_key_not_in_problem_sizes(self) -> None:
+        """validate() reports an error when a runtime_args key is not in sizes."""
+        class ProblemM:
+            sizes = {"M": [128]}
+            atol = rtol = 1e-3
+            def initialize(self, s): return []
+            def reference(self, i, s): return []
+
+        Registry.register_problem("p", ProblemM())
+        _register_kernel("k")
+        Registry.link("k", "p", runtime_args=["M", "BAD_KEY"])
+        messages = Registry.validate()
+        assert any("error" in m and "BAD_KEY" in m for m in messages)
+
+    def test_validate_valid_binding_produces_no_error(self) -> None:
+        """A binding whose keys all exist in problem.sizes produces no extra error."""
+        class ProblemMN:
+            sizes = {"M": [128], "N": [64]}
+            atol = rtol = 1e-3
+            def initialize(self, s): return []
+            def reference(self, i, s): return []
+
+        Registry.register_problem("p", ProblemMN())
+        _register_kernel("k")
+        Registry.link("k", "p", constexpr_args={"HEAD": "N"}, runtime_args=["M"])
+        messages = Registry.validate()
+        assert not any("BAD" in m or "unknown size key" in m for m in messages)
+
+    def test_clear_removes_all_bindings(self) -> None:
+        """clear() resets link bindings along with all other state."""
+        _register_problem("p")
+        _register_kernel("k", problem="p")
+        Registry.link("k", "p", runtime_args=["M"])
+        Registry.clear()
+        assert Registry.get_link_binding("k", "p") is _EMPTY_BINDING
 
 
 # ---------------------------------------------------------------------------

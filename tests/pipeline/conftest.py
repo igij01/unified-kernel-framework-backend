@@ -80,7 +80,10 @@ class FakeCompiler:
         return list(self._configs)
 
     def compile(
-        self, spec: KernelSpec, config: KernelConfig,
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict | None = None,
     ) -> CompiledKernel:
         import json
 
@@ -91,7 +94,13 @@ class FakeCompiler:
             raise CompilationError(spec, config, "fake compilation error")
         self.compile_count += 1
         self.last_compiled_spec = spec
-        return CompiledKernel(spec=spec, config=config)
+        # Merge constexpr_sizes into artifact config so tests can inspect them
+        effective_config = config
+        if constexpr_sizes:
+            effective_config = KernelConfig(
+                params={**config.params, **constexpr_sizes}
+            )
+        return CompiledKernel(spec=spec, config=effective_config)
 
 
 class FakeRunner:
@@ -139,15 +148,15 @@ class FakeProblem:
         self.atol = 1e-3
         self.rtol = 1e-3
         self._init_fn = init_fn or (lambda s: [[1.0, 2.0, 3.0]])
-        self._ref_fn = ref_fn or (lambda inputs: list(inputs))
+        self._ref_fn = ref_fn or (lambda inputs, sizes: list(inputs))
         self._filter_fn = filter_fn
         self._fail_sizes = fail_sizes or set()
 
     def initialize(self, sizes: dict[str, int]) -> list[Any]:
         return self._init_fn(sizes)
 
-    def reference(self, inputs: list[Any]) -> list[Any]:
-        return self._ref_fn(inputs)
+    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+        return self._ref_fn(inputs, sizes)
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
         if self._filter_fn is not None:

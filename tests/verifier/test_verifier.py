@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from kernel_pipeline_backend.core.types import KernelHash
+from kernel_pipeline_backend.problem.problem import has_reference
 from kernel_pipeline_backend.verifier.verifier import (
     Verifier,
     VerificationFailure,
@@ -68,7 +69,7 @@ class TestVerifyFailure:
         """Outputs that differ beyond tolerance produce a failure."""
         problem = FakeProblem(
             init_fn=lambda s: [[1.0, 2.0, 3.0]],
-            ref_fn=lambda inputs: [[0.0, 0.0, 0.0]],  # reference returns zeros
+            ref_fn=lambda inputs, sizes: [[0.0, 0.0, 0.0]],  # reference returns zeros
         )
         # Runner returns inputs (identity) = [1.0, 2.0, 3.0]
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
@@ -81,7 +82,7 @@ class TestVerifyFailure:
 
     def test_failure_has_correct_sizes(self) -> None:
         problem = FakeProblem(
-            ref_fn=lambda inputs: [[999.0]],
+            ref_fn=lambda inputs, sizes: [[999.0]],
             init_fn=lambda s: [[0.0]],
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
@@ -94,7 +95,7 @@ class TestVerifyFailure:
         """max_abs_error reflects the largest absolute difference."""
         problem = FakeProblem(
             init_fn=lambda s: [[10.0]],
-            ref_fn=lambda inputs: [[0.0]],  # expected=0, actual=10
+            ref_fn=lambda inputs, sizes: [[0.0]],  # expected=0, actual=10
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -105,7 +106,7 @@ class TestVerifyFailure:
     def test_failure_total_elements(self) -> None:
         problem = FakeProblem(
             init_fn=lambda s: [[1.0, 2.0, 3.0, 4.0, 5.0]],
-            ref_fn=lambda inputs: [[0.0, 0.0, 0.0, 0.0, 0.0]],
+            ref_fn=lambda inputs, sizes: [[0.0, 0.0, 0.0, 0.0, 0.0]],
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -118,7 +119,7 @@ class TestVerifyFailure:
         """Different number of output tensors is a failure."""
         problem = FakeProblem(
             init_fn=lambda s: [[1.0], [2.0]],
-            ref_fn=lambda inputs: [[1.0], [2.0], [3.0]],  # 3 vs 2
+            ref_fn=lambda inputs, sizes: [[1.0], [2.0], [3.0]],  # 3 vs 2
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -139,7 +140,7 @@ class TestVerifyTolerance:
         """Difference within atol passes."""
         problem = FakeProblem(
             init_fn=lambda s: [[1.0]],
-            ref_fn=lambda inputs: [[1.0005]],  # diff = 0.0005
+            ref_fn=lambda inputs, sizes: [[1.0005]],  # diff = 0.0005
             atol=1e-3,
             rtol=0.0,
         )
@@ -153,7 +154,7 @@ class TestVerifyTolerance:
         """Difference outside atol fails (with rtol=0)."""
         problem = FakeProblem(
             init_fn=lambda s: [[1.0]],
-            ref_fn=lambda inputs: [[1.01]],  # diff = 0.01
+            ref_fn=lambda inputs, sizes: [[1.01]],  # diff = 0.01
             atol=1e-3,
             rtol=0.0,
         )
@@ -165,7 +166,7 @@ class TestVerifyTolerance:
         """Difference within rtol passes (with atol=0)."""
         problem = FakeProblem(
             init_fn=lambda s: [[100.0]],
-            ref_fn=lambda inputs: [[100.05]],  # rel diff = 0.0005
+            ref_fn=lambda inputs, sizes: [[100.05]],  # rel diff = 0.0005
             atol=0.0,
             rtol=1e-3,
         )
@@ -178,7 +179,7 @@ class TestVerifyTolerance:
         """Zero difference passes even with zero tolerance."""
         problem = FakeProblem(
             init_fn=lambda s: [[42.0]],
-            ref_fn=lambda inputs: list(inputs),  # identity
+            ref_fn=lambda inputs, sizes: list(inputs),  # identity
             atol=0.0,
             rtol=0.0,
         )
@@ -198,7 +199,7 @@ class TestVerifyMultipleOutputs:
     def test_all_outputs_correct_passes(self) -> None:
         problem = FakeProblem(
             init_fn=lambda s: [[1.0, 2.0], [3.0, 4.0]],
-            ref_fn=lambda inputs: list(inputs),
+            ref_fn=lambda inputs, sizes: list(inputs),
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -208,7 +209,7 @@ class TestVerifyMultipleOutputs:
         """If any output tensor mismatches, the whole verification fails."""
         problem = FakeProblem(
             init_fn=lambda s: [[1.0], [2.0]],
-            ref_fn=lambda inputs: [[1.0], [999.0]],  # second output wrong
+            ref_fn=lambda inputs, sizes: [[1.0], [999.0]],  # second output wrong
         )
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -295,7 +296,7 @@ class TestVerifyCustomRunner:
         # Reference returns [99.0] — should match
         problem = FakeProblem(
             init_fn=lambda s: [[0.0]],
-            ref_fn=lambda inputs: [[99.0]],
+            ref_fn=lambda inputs, sizes: [[99.0]],
         )
         v = Verifier(runner=runner, device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
@@ -305,8 +306,65 @@ class TestVerifyCustomRunner:
         runner = FakeRunner(output_fn=lambda c, i: [[0.0]])
         problem = FakeProblem(
             init_fn=lambda s: [[0.0]],
-            ref_fn=lambda inputs: [[99.0]],
+            ref_fn=lambda inputs, sizes: [[99.0]],
         )
         v = Verifier(runner=runner, device=FakeDeviceHandle())
         result = v.verify(make_compiled(), problem, {"M": 128})
         assert result.passed is False
+
+
+# ---------------------------------------------------------------------------
+# has_reference helper
+# ---------------------------------------------------------------------------
+
+
+class TestHasReference:
+    """has_reference() detects whether a problem supplies a reference."""
+
+    def test_problem_with_reference_returns_true(self) -> None:
+        """FakeProblem has a reference method — has_reference returns True."""
+        assert has_reference(FakeProblem()) is True
+
+    def test_problem_without_reference_returns_false(self) -> None:
+        """An object with no reference attribute returns False."""
+        class NoRef:
+            sizes = {"M": [128]}
+            atol = rtol = 1e-3
+            def initialize(self, sizes): return []
+
+        assert has_reference(NoRef()) is False
+
+    def test_problem_with_none_reference_returns_false(self) -> None:
+        """If reference is set to None (not callable), returns False."""
+        class NoneRef:
+            sizes = {"M": [128]}
+            atol = rtol = 1e-3
+            reference = None
+            def initialize(self, sizes): return []
+
+        assert has_reference(NoneRef()) is False
+
+
+# ---------------------------------------------------------------------------
+# extra_args forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyExtraArgs:
+    """verify() forwards extra_args to Runner.run()."""
+
+    def test_extra_args_forwarded_to_runner(self) -> None:
+        """Extra args passed to verify() are forwarded to the runner."""
+        received: list = []
+
+        class CapturingRunner:
+            call_count = 0
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                received.extend(extra_args)
+                self.call_count += 1
+                return type("R", (), {"outputs": list(inputs), "time_ms": 0.0, "metrics": {}})()
+
+        runner = CapturingRunner()
+        v = Verifier(runner=runner, device=FakeDeviceHandle())
+        v.verify(make_compiled(), FakeProblem(), {"M": 128}, extra_args=(64, 128))
+        assert received == [64, 128]

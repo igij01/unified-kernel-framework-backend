@@ -15,15 +15,16 @@ Example::
             "N": range(128, 4097, 128),
             "K": [128, 256, 512],
         }
+        dtypes = [torch.float16, torch.float16]
         atol = 1e-3
         rtol = 1e-3
 
         def initialize(self, sizes):
             M, N, K = sizes["M"], sizes["N"], sizes["K"]
-            return [rand_tensor(M, K, dtype=torch.float16),
-                    rand_tensor(K, N, dtype=torch.float16)]
+            return [rand_tensor(M, K, dtype=self.dtypes[0]),
+                    rand_tensor(K, N, dtype=self.dtypes[1])]
 
-        def reference(self, inputs):
+        def reference(self, inputs, sizes):
             A, B = inputs
             return [torch.matmul(A, B)]
 """
@@ -56,6 +57,9 @@ class Problem(Protocol):
     sizes: dict[str, SizeSpec]
     """Size parameter axes and their domains for autotuning sweeps."""
 
+    dtypes: list[torch.dtype]
+    """Dtypes for input tensors, passed to ``initialize`` to generate inputs."""
+
     atol: float
     """Absolute tolerance for output comparison."""
 
@@ -75,11 +79,21 @@ class Problem(Protocol):
         """
         ...
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(
+        self,
+        inputs: list[torch.Tensor],
+        sizes: dict[str, int],
+    ) -> list[torch.Tensor]:
         """Ground truth implementation using PyTorch.
+
+        This method is **optional**.  When not implemented, the verifier
+        stage is skipped entirely.  Use :func:`has_reference` to test
+        whether a problem provides one.
 
         Args:
             inputs: Tensors returned by ``initialize``.
+            sizes: A dict mapping each size parameter name to a concrete
+                integer value — the same point passed to ``initialize``.
 
         Returns:
             Expected output tensors that the kernel should match.
@@ -100,6 +114,38 @@ class Problem(Protocol):
             Whether to include this size point.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Reference detection helper
+# ---------------------------------------------------------------------------
+
+
+def has_reference(problem: Problem) -> bool:
+    """Return True if ``problem`` provides a callable ``reference`` method.
+
+    Used by the pipeline to decide whether to run the verifier stage.
+    A problem without a ``reference`` implementation simply skips
+    verification; it can still be autotuned.
+
+    Args:
+        problem: Any object satisfying the :class:`Problem` protocol.
+
+    Returns:
+        ``True`` if ``problem.reference`` exists and is callable.
+
+    Example::
+
+        class BenchmarkOnlyProblem:
+            sizes = {"N": [1024]}
+            atol = rtol = 0.0
+            def initialize(self, sizes): ...
+            # No reference — benchmark only
+
+        assert not has_reference(BenchmarkOnlyProblem())
+    """
+    ref = getattr(problem, "reference", None)
+    return callable(ref)
 
 
 # ---------------------------------------------------------------------------

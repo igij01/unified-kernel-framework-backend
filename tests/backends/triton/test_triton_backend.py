@@ -807,3 +807,195 @@ class TestTritonAutotuneGPU:
             assert torch.allclose(
                 result.outputs[0], x + y
             ), f"Failed with config {config.params}"
+
+
+# -------------------------------------------------------------------
+# Shape-as-runtime-args kernels — test runtime_args binding (ADR-0013)
+# -------------------------------------------------------------------
+
+
+if _HAS_GPU:
+
+    @triton.jit
+    def _shape_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        M,
+        N,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Kernel that receives M and N as runtime scalar args."""
+        pid = tl.program_id(axis=0)
+        n_elements = M * N
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        tl.store(out_ptr + offsets, x + y, mask=mask)
+
+    @triton.jit
+    def _constexpr_block_kernel(
+        x_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """Kernel with HEAD_DIM as constexpr — resolved from problem size."""
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        # Use HEAD_DIM to demonstrate constexpr binding (identity op)
+        scale = 1.0 if HEAD_DIM > 0 else 0.0
+        tl.store(out_ptr + offsets, x * scale, mask=mask)
+
+
+@requires_gpu
+class TestTritonShapeAsArgsGPU:
+    """Kernels that receive shape dimensions as runtime or constexpr args."""
+
+    @pytest.fixture()
+    def compiler(self) -> TritonCompiler:
+        return TritonCompiler()
+
+    @pytest.fixture()
+    def runner(self) -> TritonRunner:
+        return TritonRunner()
+
+    @pytest.fixture()
+    def device(self) -> _FakeDevice:
+        return _FakeDevice()
+
+    def test_shape_as_runtime_args(
+        self,
+        compiler: TritonCompiler,
+        runner: TritonRunner,
+        device: _FakeDevice,
+    ) -> None:
+        """M and N are passed as runtime extra_args (simulating runtime_args binding)."""
+        M, N = 32, 64
+        n_elements = M * N
+        block_size = 128
+
+        x = torch.randn(n_elements, device="cuda")
+        y = torch.randn(n_elements, device="cuda")
+        out = torch.zeros(n_elements, device="cuda")
+
+        spec = _make_spec(source=_shape_add_kernel)
+        compiled = compiler.compile(spec, KernelConfig(params={"BLOCK_SIZE": block_size}))
+        grid = GridResult(grid=((n_elements + block_size - 1) // block_size,))
+
+        result = runner.run(
+            compiled, [x, y, out], device, grid, extra_args=(M, N)
+        )
+
+        assert torch.allclose(result.outputs[0], x + y)
+
+    def test_shape_as_runtime_args_different_sizes(
+        self,
+        compiler: TritonCompiler,
+        runner: TritonRunner,
+        device: _FakeDevice,
+    ) -> None:
+        """Same kernel runs correctly for multiple (M, N) size combinations."""
+        spec = _make_spec(source=_shape_add_kernel)
+        compiled = compiler.compile(spec, KernelConfig(params={"BLOCK_SIZE": 256}))
+
+        for M, N in [(16, 32), (64, 128), (128, 256)]:
+            n_elements = M * N
+            x = torch.randn(n_elements, device="cuda")
+            y = torch.randn(n_elements, device="cuda")
+            out = torch.zeros(n_elements, device="cuda")
+            grid = GridResult(grid=((n_elements + 256 - 1) // 256,))
+
+            result = runner.run(
+                compiled, [x, y, out], device, grid, extra_args=(M, N)
+            )
+            assert torch.allclose(result.outputs[0], x + y), f"Failed at M={M}, N={N}"
+
+    def test_constexpr_head_dim_from_constexpr_sizes(
+        self,
+        compiler: TritonCompiler,
+        runner: TritonRunner,
+        device: _FakeDevice,
+    ) -> None:
+        """HEAD_DIM constexpr passed via constexpr_sizes param (ADR-0014 style)."""
+        N = 512
+        head_dim = 64
+        block_size = 128
+
+        x = torch.randn(N, device="cuda")
+        out = torch.zeros(N, device="cuda")
+
+        # Pass HEAD_DIM via constexpr_sizes — the canonical ADR-0014 way
+        config = KernelConfig(params={"BLOCK_SIZE": block_size})
+        spec = _make_spec(source=_constexpr_block_kernel)
+        compiled = compiler.compile(spec, config, constexpr_sizes={"HEAD_DIM": head_dim})
+        # The compiled artifact's config should have HEAD_DIM merged in for runner kwargs
+        assert compiled.config.params.get("HEAD_DIM") == head_dim
+        grid = GridResult(grid=((N + block_size - 1) // block_size,))
+
+        result = runner.run(compiled, [x, out], device, grid, extra_args=(N,))
+
+        assert torch.allclose(result.outputs[0], x)
+
+    def test_registry_runtime_args_binding_end_to_end(
+        self,
+        compiler: TritonCompiler,
+        runner: TritonRunner,
+        device: _FakeDevice,
+    ) -> None:
+        """End-to-end: registry binding resolves M,N from sizes → extra_args."""
+        from kernel_pipeline_backend.registry import Registry
+        from kernel_pipeline_backend.registry.registry import _resolve_link_binding
+
+        M, N = 32, 64
+        n_elements = M * N
+
+        class ShapeProblem:
+            sizes = {"M": [M], "N": [N]}
+            atol = rtol = 1e-5
+            def initialize(self, sizes):
+                m, n = sizes["M"], sizes["N"]
+                ne = m * n
+                x = torch.randn(ne, device="cuda")
+                y = torch.randn(ne, device="cuda")
+                out = torch.zeros(ne, device="cuda")
+                return [x, y, out]
+            def reference(self, inputs, sizes):
+                x, y, _ = inputs
+                return [x + y]
+
+        Registry.clear()
+        try:
+            Registry.register_problem("shape_add", ShapeProblem())
+            Registry.register_kernel(
+                "shape_add_k", source=_shape_add_kernel, backend="triton",
+                target_archs=[], grid_generator=lambda s, c: None,
+                problem="shape_add",
+                runtime_args=["M", "N"],
+            )
+
+            binding = Registry.get_link_binding("shape_add_k", "shape_add")
+            extra_args, constexpr = _resolve_link_binding(binding, {"M": M, "N": N})
+
+            assert extra_args == (M, N)
+            assert constexpr == {}
+
+            # Now actually run the kernel
+            block_size = 128
+            config = KernelConfig(params={"BLOCK_SIZE": block_size})
+            spec = _make_spec(name="shape_add_k", source=_shape_add_kernel)
+            compiled = compiler.compile(spec, config)
+            grid = GridResult(grid=((n_elements + block_size - 1) // block_size,))
+
+            problem_obj = ShapeProblem()
+            inputs = problem_obj.initialize({"M": M, "N": N})
+            x, y, out = inputs
+
+            result = runner.run(compiled, inputs, device, grid, extra_args=extra_args)
+            assert torch.allclose(result.outputs[0], x + y)
+        finally:
+            Registry.clear()

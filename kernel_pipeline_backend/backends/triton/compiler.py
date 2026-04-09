@@ -136,7 +136,10 @@ class TritonCompiler:
         ]
 
     def compile(
-        self, spec: KernelSpec, config: KernelConfig
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
     ) -> CompiledKernel:
         """Bind a Triton kernel with the given configuration.
 
@@ -144,12 +147,21 @@ class TritonCompiler:
         inner ``@triton.jit`` function is unwrapped and used as the
         artifact.  Otherwise the source is used directly.
 
+        ``constexpr_sizes`` values are merged into the artifact's
+        ``config.params`` so that the runner can forward them as keyword
+        arguments — Triton distinguishes ``tl.constexpr`` params from
+        regular params internally at specialization time.
+
         Args:
             spec: Triton kernel (``@triton.jit`` or ``@triton.autotune``).
-            config: Configuration (block sizes, warps, stages, etc.).
+            config: Tunable configuration (block sizes, warps, stages, etc.).
+            constexpr_sizes: Problem size values to bake in as compile-time
+                constants (e.g. ``{"HEAD_DIM": 64}``).  Merged into
+                ``config.params`` in the returned artifact.
 
         Returns:
-            ``CompiledKernel`` whose ``artifact`` is the JIT function.
+            ``CompiledKernel`` whose ``artifact`` is the JIT function and
+            whose ``config`` includes constexpr sizes merged in.
 
         Raises:
             CompilationError: If the (possibly unwrapped) source is
@@ -169,9 +181,17 @@ class TritonCompiler:
                 f"(@triton.jit function), got {type(kernel_fn).__name__}",
             )
 
+        # Merge constexpr sizes into the effective config so the runner
+        # passes them as kwargs: kernel[grid](*inputs, *extra_args, **config.params)
+        effective_config = config
+        if constexpr_sizes:
+            effective_config = KernelConfig(
+                params={**config.params, **constexpr_sizes}
+            )
+
         return CompiledKernel(
             spec=spec,
-            config=config,
+            config=effective_config,
             artifact=kernel_fn,
             compile_info={},
         )

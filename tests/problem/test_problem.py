@@ -32,7 +32,7 @@ class SimpleProblem(Problem):
     def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["N"])]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -49,7 +49,7 @@ class FilteredProblem(Problem):
     def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["N"])]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -66,7 +66,7 @@ class NoFilterProblem(Problem):
     def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
         return [torch.zeros(sizes["X"])]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         return inputs
 
 
@@ -80,7 +80,7 @@ class RangeProblem(Problem):
     def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["K"])]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -101,7 +101,7 @@ class MatMulProblem(Problem):
             ones_tensor(K, N, device="cpu"),
         ]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         A, B = inputs
         return [torch.matmul(A, B)]
 
@@ -123,7 +123,7 @@ class VectorAddProblem(Problem):
             ones_tensor(N, device="cpu"),
         ]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         a, b = inputs
         return [a + b]
 
@@ -148,7 +148,7 @@ class SoftmaxProblem(Problem):
     def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
         return [rand_tensor(sizes["B"], sizes["D"], device="cpu")]
 
-    def reference(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
         return [torch.softmax(inputs[0], dim=-1)]
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -316,7 +316,7 @@ class TestFilterSizePoints:
             def initialize(self, sizes):
                 return []
 
-            def reference(self, inputs):
+            def reference(self, inputs, sizes):
                 return []
 
             def filter_sizes(self, sizes):
@@ -415,7 +415,7 @@ class TestEndToEnd:
             assert A.shape == (point["M"], point["K"])
             assert B.shape == (point["K"], point["N"])
 
-            outputs = p.reference(inputs)
+            outputs = p.reference(inputs, point)
             assert len(outputs) == 1
             C = outputs[0]
             assert C.shape == (point["M"], point["N"])
@@ -437,7 +437,7 @@ class TestEndToEnd:
 
         for point in sampled:
             inputs = p.initialize(point)
-            outputs = p.reference(inputs)
+            outputs = p.reference(inputs, point)
             C = outputs[0]
             assert torch.allclose(
                 C,
@@ -464,7 +464,7 @@ class TestEndToEnd:
             assert a.shape == (N,)
             assert b.shape == (N,)
 
-            outputs = p.reference(inputs)
+            outputs = p.reference(inputs, point)
             expected = torch.arange(N, dtype=torch.float32) + 1.0
             assert torch.equal(outputs[0], expected)
 
@@ -493,7 +493,7 @@ class TestEndToEnd:
             x = inputs[0]
             assert x.shape == (point["B"], point["D"])
 
-            outputs = p.reference(inputs)
+            outputs = p.reference(inputs, point)
             sm = outputs[0]
             assert sm.shape == x.shape
 
@@ -544,7 +544,7 @@ class TestEndToEnd:
         p = MatMulProblem()
         point = {"M": 2, "N": 2, "K": 2}
         inputs = p.initialize(point)
-        outputs = p.reference(inputs)
+        outputs = p.reference(inputs, point)
 
         # Exact result
         assert torch.allclose(

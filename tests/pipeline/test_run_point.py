@@ -117,7 +117,7 @@ class TestRunPointHappyPath:
 
         assert isinstance(result, PointResult)
         assert result.kernel_name == spec.name
-        assert result.point is point
+        assert result.point == point
 
     async def test_compile_error_is_none_on_success(self) -> None:
         pipeline = _make_pipeline()
@@ -456,3 +456,142 @@ class TestRunPointNoStoreInteraction:
         )
 
         assert store.store_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Binding resolution (ADR-0013)
+# ---------------------------------------------------------------------------
+
+
+class TestRunPointBindingResolution:
+    """run_point() resolves link bindings into extra_args and effective config."""
+
+    async def test_runtime_args_forwarded_as_extra_args(self) -> None:
+        """runtime_args values are looked up in point.sizes and forwarded to runner."""
+        from kernel_pipeline_backend.registry import Registry
+
+        received_extra_args: list = []
+
+        class CapturingRunner:
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                received_extra_args.append(tuple(extra_args))
+                return type("R", (), {"outputs": list(inputs), "time_ms": 1.0, "metrics": {}})()
+
+        Registry.clear()
+        try:
+            class _P:
+                sizes = {"M": [128], "N": [64]}
+                atol = rtol = 1e-3
+                def initialize(self, s): return [[1.0]]
+                def reference(self, i, s): return list(i)
+
+            Registry.register_problem("p", _P())
+            Registry.register_kernel(
+                "k", source="x", backend="fake",
+                target_archs=[], grid_generator=lambda s, c: __import__("kernel_pipeline_backend.core.types", fromlist=["GridResult"]).GridResult(grid=(1,)),
+                problem="p",
+                runtime_args=["M", "N"],
+            )
+
+            from kernel_pipeline_backend.core.types import GridResult
+
+            def _grid(sizes, config):
+                return GridResult(grid=(1,))
+
+            Registry.unregister_kernel("k")
+            Registry.register_kernel(
+                "k", source="x", backend="fake",
+                target_archs=[], grid_generator=_grid,
+                problem="p",
+                runtime_args=["M", "N"],
+            )
+
+            spec = make_spec(name="k")
+            point = _make_point(sizes={"M": 128, "N": 64})
+            pipeline = _make_pipeline(runner=CapturingRunner())
+
+            await pipeline.run_point(spec, point, _P(), problem_name="p", verify=False, profile=True)
+
+            assert all(args == (128, 64) for args in received_extra_args)
+            assert len(received_extra_args) > 0
+        finally:
+            Registry.clear()
+
+    async def test_constexpr_args_passed_to_compile_as_constexpr_sizes(self) -> None:
+        """constexpr_args values are forwarded to compiler.compile() as
+        constexpr_sizes so the backend can bake them in at compile time (ADR-0014)."""
+        from kernel_pipeline_backend.registry import Registry
+        from kernel_pipeline_backend.core.types import GridResult, KernelConfig
+
+        captured_constexpr: list[dict] = []
+
+        class CapturingCompiler:
+            backend_name = "fake"
+            def generate_configs(self, spec):
+                return [KernelConfig(params={"BS": 64})]
+            def compile(self, spec, config, constexpr_sizes=None):
+                captured_constexpr.append(dict(constexpr_sizes or {}))
+                from kernel_pipeline_backend.core.types import CompiledKernel
+                return CompiledKernel(spec=spec, config=config)
+
+        def _grid(sizes, config):
+            return GridResult(grid=(1,))
+
+        Registry.clear()
+        try:
+            class _P:
+                sizes = {"M": [128], "HEAD_DIM": [64]}
+                atol = rtol = 1e-3
+                def initialize(self, s): return [[1.0]]
+                def reference(self, i, s): return list(i)
+
+            Registry.register_problem("p", _P())
+            Registry.register_kernel(
+                "k", source="x", backend="fake",
+                target_archs=[], grid_generator=_grid,
+                problem="p",
+                constexpr_args={"HEAD_DIM": "HEAD_DIM"},
+            )
+
+            spec = make_spec(name="k")
+            point = _make_point(params={"BS": 64}, sizes={"M": 128, "HEAD_DIM": 64})
+            pipeline = _make_pipeline(compiler=CapturingCompiler())
+
+            await pipeline.run_point(spec, point, _P(), problem_name="p", verify=False, profile=False)
+
+            assert len(captured_constexpr) == 1
+            assert captured_constexpr[0].get("HEAD_DIM") == 64
+        finally:
+            Registry.clear()
+
+    async def test_no_problem_name_uses_empty_binding(self) -> None:
+        """When problem_name is not provided, no extra_args are passed."""
+        received: list = []
+
+        class CapturingRunner:
+            def run(self, compiled, inputs, device, grid, extra_args=()):
+                received.append(extra_args)
+                return type("R", (), {"outputs": list(inputs), "time_ms": 1.0, "metrics": {}})()
+
+        pipeline = _make_pipeline(runner=CapturingRunner())
+        await pipeline.run_point(
+            make_spec(), _make_point(), FakeProblem(), verify=False, profile=True
+        )
+
+        assert all(a == () for a in received)
+
+    async def test_skip_verify_when_no_reference(self) -> None:
+        """Verification is skipped when the problem has no reference method."""
+        class NoRefProblem:
+            sizes = {"M": [128]}
+            atol = rtol = 1e-3
+            def initialize(self, s): return [[1.0]]
+            # No reference method
+
+        pipeline = _make_pipeline()
+        result = await pipeline.run_point(
+            make_spec(), _make_point(), NoRefProblem(), verify=True
+        )
+
+        # Verification not run — no VerificationResult
+        assert result.verification is None
