@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from kernel_pipeline_backend.autotuner.instrument.pass_ import BaseInstrumentationPass
 from kernel_pipeline_backend.core.types import SearchPoint
 
 if TYPE_CHECKING:
+    from kernel_pipeline_backend.core.types import LaunchRequest
     from kernel_pipeline_backend.device.device import DeviceHandle
 
 
-class MemoryObserver:
+class MemoryObserver(BaseInstrumentationPass):
     """Tracks peak GPU memory allocation during kernel execution.
 
     Compares ``device.memory_allocated()`` before and after each kernel
@@ -38,11 +40,21 @@ class MemoryObserver:
         """Record baseline memory state."""
         self._before_bytes = 0
 
-    def before_run(self, device: DeviceHandle, point: SearchPoint) -> None:
+    def before_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> None:
         """Snapshot memory before kernel launch."""
         self._before_bytes = device.memory_allocated()
 
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, float]:
+    def after_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> dict[str, float]:
         """Compute peak memory delta.
 
         Returns:

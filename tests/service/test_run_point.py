@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from kernel_pipeline_backend.autotuner.instrument import BaseInstrumentationPass
 from kernel_pipeline_backend.core.registry import registry as backend_registry
 from kernel_pipeline_backend.core.types import (
     CompileOptions,
@@ -99,38 +100,8 @@ class _FakeRunner:
         return None
 
 
-class _FakeObserver:
-    @property
-    def supported_backends(self) -> None:
-        return None
-
-    @property
-    def run_once(self) -> bool:
-        return False
-
-    def setup(self, device: Any) -> None:
-        pass
-
-    def before_run(self, device: Any, point: Any) -> None:
-        pass
-
-    def after_run(self, device: Any, point: Any) -> dict[str, float]:
-        return {}
-
-    def teardown(self, device: Any) -> None:
-        pass
-
-
-class _FakeInstrument:
-    @property
-    def observer(self) -> None:
-        return None
-
-    def transform_source(self, source: Any, spec: Any) -> Any:
-        return source
-
-    def transform_compile_flags(self, flags: dict[str, Any]) -> dict[str, Any]:
-        return dict(flags)
+class _FakePass(BaseInstrumentationPass):
+    """Minimal InstrumentationPass stand-in (no-op transforms, no metrics)."""
 
 
 _SOURCE = 'extern "C" __global__ void k() {}'
@@ -162,9 +133,8 @@ class _RunPointCall:
     spec: KernelSpec | None = None
     point: SearchPoint | None = None
     problem: Any = None
-    observers: list[Any] = field(default_factory=list)
+    passes: list[Any] = field(default_factory=list)
     problem_name: str | None = None
-    instruments: list[Any] | None = None
     compile_options: CompileOptions | None = None
     verify: bool = True
     profile: bool = True
@@ -202,10 +172,9 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_RunPointCall]:
         spec,
         point,
         problem,
-        observers=None,
         *,
         problem_name=None,
-        instruments=None,
+        passes=None,
         compile_options=None,
         verify=True,
         profile=True,
@@ -214,9 +183,8 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_RunPointCall]:
             spec=spec,
             point=point,
             problem=problem,
-            observers=list(observers or []),
+            passes=list(passes or []),
             problem_name=problem_name,
-            instruments=instruments,
             compile_options=compile_options,
             verify=verify,
             profile=profile,
@@ -301,22 +269,22 @@ class TestRunPointProblemResolution:
 # ---------------------------------------------------------------------------
 
 
-class TestRunPointObserverResolution:
-    """Observers resolved: per-request override > service default > [TimingObserver]."""
+class TestRunPointPassResolution:
+    """passes forwarded: per-request override passed to Pipeline.run_point."""
 
-    async def test_per_request_observers_forwarded(
+    async def test_per_request_passes_forwarded(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
         _register_problem("p")
         _register_kernel("k", problem="p")
-        obs = _FakeObserver()
+        p = _FakePass()
         point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
 
-        await service.run_point("k", point, observers=[obs])
+        await service.run_point("k", point, passes=[p])
 
-        assert captured_calls[0].observers == [obs]
+        assert captured_calls[0].passes == [p]
 
-    async def test_default_observer_used_when_none_given(
+    async def test_none_passes_forwarded_as_empty(
         self, service: TuneService, captured_calls: list[_RunPointCall],
     ) -> None:
         _register_problem("p")
@@ -325,29 +293,7 @@ class TestRunPointObserverResolution:
 
         await service.run_point("k", point)
 
-        from kernel_pipeline_backend.autotuner.observer import TimingObserver
-        assert isinstance(captured_calls[0].observers[0], TimingObserver)
-
-
-# ---------------------------------------------------------------------------
-# TestInstrumentsForwarded
-# ---------------------------------------------------------------------------
-
-
-class TestRunPointInstrumentsForwarded:
-    """Instruments are passed through to Pipeline.run_point unchanged."""
-
-    async def test_instruments_forwarded(
-        self, service: TuneService, captured_calls: list[_RunPointCall],
-    ) -> None:
-        _register_problem("p")
-        _register_kernel("k", problem="p")
-        inst = _FakeInstrument()
-        point = SearchPoint(sizes={"M": 128}, config=KernelConfig())
-
-        await service.run_point("k", point, instruments=[inst])
-
-        assert captured_calls[0].instruments == [inst]
+        assert captured_calls[0].passes == []
 
 
 # ---------------------------------------------------------------------------

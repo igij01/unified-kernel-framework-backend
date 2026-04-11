@@ -1,3 +1,3 @@
-from .instrument import Instrument
+from .pass_ import BaseInstrumentationPass, InstrumentationPass
 
-__all__ = ["Instrument"]
+__all__ = ["BaseInstrumentationPass", "InstrumentationPass"]

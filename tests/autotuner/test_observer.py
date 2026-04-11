@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
 from kernel_pipeline_backend.autotuner.observer import (
     MemoryObserver,
     NCUObserver,
-    Observer,
     TimingObserver,
 )
 from kernel_pipeline_backend.core.types import KernelConfig, SearchPoint
@@ -33,16 +33,16 @@ def _make_point(**sizes: int) -> SearchPoint:
 
 
 class TestProtocolConformance:
-    """All built-in observers must satisfy the Observer protocol."""
+    """All built-in observers must satisfy the InstrumentationPass protocol."""
 
     def test_timing_observer_is_observer(self) -> None:
-        assert isinstance(TimingObserver(), Observer)
+        assert isinstance(TimingObserver(), InstrumentationPass)
 
     def test_ncu_observer_is_observer(self) -> None:
-        assert isinstance(NCUObserver(), Observer)
+        assert isinstance(NCUObserver(), InstrumentationPass)
 
     def test_memory_observer_is_observer(self) -> None:
-        assert isinstance(MemoryObserver(), Observer)
+        assert isinstance(MemoryObserver(), InstrumentationPass)
 
 
 # ---------------------------------------------------------------------------

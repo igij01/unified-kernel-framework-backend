@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from kernel_pipeline_backend.autotuner.autotuner import Autotuner
-from kernel_pipeline_backend.autotuner.instrument import Instrument
+from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
 from kernel_pipeline_backend.autotuner.profiler import Profiler
 from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import (
@@ -34,7 +34,6 @@ from kernel_pipeline_backend.verifier.verifier import Verifier, VerificationResu
 from kernel_pipeline_backend.versioning.hasher import KernelHasher
 
 if TYPE_CHECKING:
-    from kernel_pipeline_backend.autotuner.observer import Observer
     from kernel_pipeline_backend.autotuner.strategy import Strategy
     from kernel_pipeline_backend.core.compiler import Compiler
     from kernel_pipeline_backend.core.runner import Runner
@@ -140,7 +139,7 @@ class Pipeline:
         kernels: list[KernelSpec],
         problem: Problem,
         strategy: Strategy,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         force: bool = False,
         skip_verify: bool = False,
         skip_autotune: bool = False,
@@ -152,7 +151,11 @@ class Pipeline:
             kernels: Kernels to process.
             problem: Problem specification (reference impl + sizes).
             strategy: Autotuning search strategy.
-            observers: Optional metrics observers for profiling.
+            passes: Optional :class:`InstrumentationPass` instances for
+                observation during the autotuning session.  Only the
+                observation hooks (``setup`` / ``before_run`` /
+                ``after_run`` / ``teardown``) are invoked in the
+                autotuner loop — transform hooks are ``run_point``-only.
             force: If True, reprocess all kernels regardless of cache.
             skip_verify: If True, skip verification stage.
             skip_autotune: If True, skip autotuning stage.
@@ -169,7 +172,7 @@ class Pipeline:
         for spec in kernels:
             await self._process_kernel(
                 spec, problem, strategy,
-                observers=observers or [],
+                passes=passes or [],
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
@@ -191,7 +194,7 @@ class Pipeline:
         problem: Problem,
         strategy: Strategy,
         *,
-        observers: list[Observer],
+        passes: list[InstrumentationPass],
         force: bool,
         skip_verify: bool,
         skip_autotune: bool,
@@ -223,7 +226,7 @@ class Pipeline:
             runner=self._runner,
             device=self._device,
             backend=self._compiler.backend_name,
-            observers=observers,
+            passes=passes,
         )
         verifier = Verifier(runner=self._runner, device=self._device)
         autotuner = Autotuner(
@@ -272,20 +275,21 @@ class Pipeline:
         spec: KernelSpec,
         point: SearchPoint,
         problem: Problem | None,
-        observers: list[Observer] | None = None,
         *,
         problem_name: str | None = None,
-        instruments: list[Instrument] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         compile_options: CompileOptions | None = None,
         verify: bool = True,
         profile: bool = True,
     ) -> PointResult:
         """Execute a single (spec, point) pair: compile, verify, profile.
 
-        Instruments are applied in order before compilation — each can
-        transform the source and flags and optionally attach an observer.
-        Plugin events use the original ``spec`` so event consumers see the
-        canonical kernel identity.
+        Regular (non-``run_once``) passes have their
+        ``transform_compile_request`` applied in registration order before
+        compilation.  All passes participate in ``before_run`` /
+        ``after_run`` observation during profiling.  Plugin events use the
+        original ``spec`` so event consumers see the canonical kernel
+        identity.
 
         Args:
             spec: Kernel specification (used as-is for plugin events;
@@ -293,13 +297,14 @@ class Pipeline:
             point: The (sizes, config) pair to evaluate.
             problem: Problem for verification and profiling inputs.
                 If ``None``, verify and profile stages are skipped.
-            observers: Observers for the profiling stage.
             problem_name: Registered problem name used to look up link
                 bindings (``constexpr_args`` / ``runtime_args``).  When
                 provided, constexpr bindings are merged into the effective
                 ``KernelConfig`` before compilation and runtime bindings
                 are forwarded as ``extra_args`` to ``Runner.run()``.
-            instruments: Instruments to apply before compilation.
+            passes: :class:`InstrumentationPass` instances.  Regular
+                passes have their compile-time transforms applied here;
+                all passes observe the profiling run.
             compile_options: Extra flags / optimization level overrides.
             verify: Whether to run the verification stage.
             profile: Whether to run the profiling stage.
@@ -308,11 +313,7 @@ class Pipeline:
             :class:`PointResult` with compilation, verification, and
             profiling outcomes.
         """
-        # 1. Start with spec's source and compile_flags
-        source = spec.source
-        flags: dict = dict(spec.compile_flags)
-
-        # 2. Resolve link bindings for this (kernel, problem) pair
+        # 1. Resolve link bindings for this (kernel, problem) pair
         extra_args: tuple = ()
         constexpr_sizes: dict | None = None
         if problem_name is not None:
@@ -320,40 +321,47 @@ class Pipeline:
             extra_args, constexpr_kwargs = _resolve_link_binding(binding, point.sizes)
             constexpr_sizes = constexpr_kwargs or None
 
-        # 3. Merge CompileOptions
+        # 2. Merge CompileOptions into a working flags dict
+        flags: dict = dict(spec.compile_flags)
         if compile_options:
             flags.update(compile_options.extra_flags)
             if compile_options.optimization_level is not None:
                 flags["optimization_level"] = compile_options.optimization_level
 
-        # 4. Apply Instruments — accumulate their observers
-        all_observers: list[Observer] = list(observers or [])
-        for inst in (instruments or []):
-            source = inst.transform_source(source, spec)
-            flags = inst.transform_compile_flags(flags)
-            if inst.observer is not None:
-                all_observers.append(inst.observer)
+        # 3. Apply regular-pass compile transforms in registration order.
+        #    run_once passes are diagnostic/isolated — their transforms are
+        #    not applied on the main path here.
+        effective_spec = replace(spec, compile_flags=flags)
+        effective_config = point.config
+        for p in (passes or []):
+            if not p.run_once:
+                effective_spec, effective_config, constexpr_sizes = (
+                    p.transform_compile_request(effective_spec, effective_config, constexpr_sizes)
+                )
 
-        # 5. Build modified spec for compilation only (original spec used in events)
-        modified_spec = replace(spec, source=source, compile_flags=flags)
+        # 4. Build modified spec for compilation only (original spec used in events)
+        modified_spec = effective_spec
 
-        # 6. Compile — pass constexpr_sizes so the backend can bake them in
+        # 5. Compile — pass constexpr_sizes so the backend can bake them in
         try:
+            identity = self._compiler.compile_identity(
+                modified_spec, effective_config, constexpr_sizes or None
+            )
             await self._emit(
                 EVENT_COMPILE_START,
-                {"spec": spec, "config": point.config},
+                {"spec": spec, "config": effective_config, "identity": identity},
             )
             compiled = self._compiler.compile(
-                modified_spec, point.config, constexpr_sizes=constexpr_sizes
+                modified_spec, effective_config, constexpr_sizes=constexpr_sizes
             )
             await self._emit(
                 EVENT_COMPILE_COMPLETE,
-                {"spec": spec, "config": point.config, "compiled": compiled},
+                {"spec": spec, "config": point.config, "compiled": compiled, "identity": identity},
             )
         except CompilationError as exc:
             await self._emit(
                 EVENT_COMPILE_ERROR,
-                {"spec": spec, "config": point.config, "error": exc},
+                {"spec": spec, "config": effective_config, "error": exc},
             )
             error_result = PointResult(
                 kernel_name=spec.name,
@@ -366,10 +374,15 @@ class Pipeline:
             await self._plugins.await_plugins()
             return error_result
 
+        # 6b. Apply transform_compiled for regular passes
+        for p in (passes or []):
+            if not p.run_once:
+                compiled = p.transform_compiled(compiled)
+
         # 7. Verify (optional — requires a problem with a reference implementation)
         verification = None
         if verify and problem is not None and has_reference(problem):
-            verifier = Verifier(runner=self._runner, device=self._device)
+            verifier = Verifier(runner=self._runner, device=self._device, passes=passes or [])
             verification = verifier.verify(compiled, problem, point.sizes, extra_args)
 
         # 8. Profile (optional — requires a problem for input initialization)
@@ -379,7 +392,7 @@ class Pipeline:
                 runner=self._runner,
                 device=self._device,
                 backend=self._compiler.backend_name,
-                observers=all_observers,
+                passes=passes or [],
             )
             profiler.setup()
             try:

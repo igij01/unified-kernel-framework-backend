@@ -34,7 +34,7 @@ import itertools
 from typing import Any
 
 from kernel_pipeline_backend.core.compiler import CompilationError
-from kernel_pipeline_backend.core.types import CompiledKernel, KernelConfig, KernelSpec
+from kernel_pipeline_backend.core.types import CompileIdentity, CompiledKernel, KernelConfig, KernelSpec
 
 
 class TritonCompiler:
@@ -134,6 +134,29 @@ class TritonCompiler:
             KernelConfig(params=dict(zip(keys, combo)))
             for combo in itertools.product(*value_lists)
         ]
+
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompileIdentity:
+        """Return the compile identity for this Triton kernel compilation.
+
+        Args:
+            spec: Kernel specification.
+            config: Kernel configuration.
+            constexpr_sizes: Problem-size values baked in as constexpr params.
+
+        Returns:
+            ``CompileIdentity`` for this (spec, config, constexpr_sizes).
+        """
+        return CompileIdentity(
+            version_hash=str(spec.version_hash) if spec.version_hash else spec.name,
+            config=config,
+            constexpr_sizes=frozenset((constexpr_sizes or {}).items()),
+            backend_keys=frozenset(),  # Triton has no additional compile axes
+        )
 
     def compile(
         self,

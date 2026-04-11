@@ -16,9 +16,10 @@ from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CompiledKernel,
     KernelConfig,
+    LaunchRequest,
     SearchPoint,
 )
-from kernel_pipeline_backend.autotuner.observer import Observer
+from kernel_pipeline_backend.autotuner.instrument.pass_ import BaseInstrumentationPass, InstrumentationPass
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.core.runner import Runner
@@ -66,7 +67,7 @@ class Profiler:
         runner: Runner,
         device: DeviceHandle,
         backend: str,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         warmup_cycles: int = _DEFAULT_WARMUP_CYCLES,
         profiling_cycles: int = _DEFAULT_PROFILING_CYCLES,
     ) -> None:
@@ -78,7 +79,7 @@ class Profiler:
             backend: Backend name (e.g. ``"cuda"``, ``"triton"``).
                 Used to validate observer compatibility at
                 :meth:`setup` time.
-            observers: Optional list of observers for collecting custom
+            passes: :class:`InstrumentationPass` instances for collecting
                 metrics during kernel invocations.
             warmup_cycles: Number of untimed kernel runs before profiling.
             profiling_cycles: Number of timed kernel runs whose results
@@ -95,13 +96,13 @@ class Profiler:
         self._runner = runner
         self._device = device
         self._backend = backend
-        self._observers = list(observers) if observers else []
+        self._observers: list[InstrumentationPass] = list(passes or [])
         self._warmup_cycles = warmup_cycles
         self._profiling_cycles = profiling_cycles
 
         # Partitioned at setup() time
-        self._regular_observers: list[Observer] = []
-        self._run_once_observers: list[Observer] = []
+        self._regular_observers: list[InstrumentationPass] = []
+        self._run_once_observers: list[InstrumentationPass] = []
 
     # ------------------------------------------------------------------
     # Properties
@@ -160,9 +161,10 @@ class Profiler:
 
     def _collect_observer_metrics(
         self,
-        observers: list[Observer],
+        observers: list[InstrumentationPass],
         point: SearchPoint,
         base_metrics: dict[str, Any] | None = None,
+        launch: LaunchRequest | None = None,
     ) -> dict[str, Any]:
         """Run after_run on *observers* and merge their metrics.
 
@@ -172,6 +174,8 @@ class Profiler:
             base_metrics: Pre-existing metrics (e.g. from runner) to
                 merge into.  Keys from observers overwrite collisions
                 with a warning.
+            launch: The LaunchRequest, forwarded to InstrumentationPass
+                instances that accept it.
 
         Returns:
             Merged metrics dict.
@@ -179,7 +183,7 @@ class Profiler:
         metrics: dict[str, Any] = dict(base_metrics) if base_metrics else {}
         seen_keys: dict[str, str] = {}
         for obs in observers:
-            obs_metrics = obs.after_run(self._device, point)
+            obs_metrics = obs.after_run(self._device, point, launch)
             for key, value in obs_metrics.items():
                 if key in metrics or key in seen_keys:
                     prev_source = seen_keys.get(key, "runner")
@@ -206,11 +210,14 @@ class Profiler:
 
         Execution order:
 
-        1. Warmup iterations (untimed, no observer calls).
-        2. A single dedicated run for ``run_once`` observers (e.g. NCU).
-        3. Profiling iterations for regular observers — timing and
+        1. Build the backend launch plan once via
+           ``runner.make_launch_request`` (includes grid computation
+           and argument packing).
+        2. Warmup iterations (untimed, no observer calls).
+        3. A single dedicated run for ``run_once`` observers (e.g. NCU).
+        4. Profiling iterations for regular observers — timing and
            metrics averaged.
-        4. ``run_once`` metrics merged into the averaged result.
+        5. ``run_once`` metrics merged into the averaged result.
 
         Args:
             compiled: Pre-compiled kernel artifact.
@@ -218,8 +225,8 @@ class Profiler:
                 :meth:`~Problem.initialize`.
             sizes: Size parameters for this evaluation point.
             extra_args: Additional scalar arguments forwarded to
-                ``Runner.run()``.  Resolved from link bindings by the
-                caller.  Defaults to an empty tuple.
+                ``Runner.make_launch_request()``.  Resolved from link
+                bindings by the caller.  Defaults to an empty tuple.
             original_config: When provided, used for the
                 ``AutotuneResult.point.config`` so the stored result
                 references the canonical tunable config rather than the
@@ -233,22 +240,28 @@ class Profiler:
         point_config = original_config if original_config is not None else compiled.config
         point = SearchPoint(sizes=sizes, config=point_config)
         inputs = problem.initialize(sizes)
-        grid = compiled.spec.grid_generator(sizes, compiled.config)
+
+        # Build the backend-owned launch plan once; reuse for all runs.
+        launch = self._runner.make_launch_request(
+            compiled, inputs, sizes, compiled.config, extra_args,
+        )
+        for p in self._regular_observers:
+            launch = p.transform_launch_request(launch)
 
         # -- Warmup (untimed, no observer calls) -----------------------
         for _ in range(self._warmup_cycles):
-            self._runner.run(compiled, inputs, self._device, grid, extra_args)
+            self._runner.run(launch, self._device)
 
         # -- Run-once observers (single dedicated execution) -----------
         run_once_metrics: dict[str, Any] = {}
         if self._run_once_observers:
             for obs in self._run_once_observers:
-                obs.before_run(self._device, point)
+                obs.before_run(self._device, point, launch)
 
-            self._runner.run(compiled, inputs, self._device, grid, extra_args)
+            self._runner.run(launch, self._device)
 
             run_once_metrics = self._collect_observer_metrics(
-                self._run_once_observers, point,
+                self._run_once_observers, point, launch=launch,
             )
 
         # -- Profiling (regular observers) -----------------------------
@@ -257,12 +270,12 @@ class Profiler:
 
         for _ in range(self._profiling_cycles):
             for obs in self._regular_observers:
-                obs.before_run(self._device, point)
+                obs.before_run(self._device, point, launch)
 
-            run_result = self._runner.run(compiled, inputs, self._device, grid, extra_args)
+            run_result = self._runner.run(launch, self._device)
 
             metrics = self._collect_observer_metrics(
-                self._regular_observers, point, run_result.metrics,
+                self._regular_observers, point, run_result.metrics, launch=launch,
             )
 
             timings.append(run_result.time_ms)

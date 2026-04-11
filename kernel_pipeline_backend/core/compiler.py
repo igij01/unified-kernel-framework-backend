@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from kernel_pipeline_backend.core.types import CompiledKernel, KernelConfig, KernelSpec
+from kernel_pipeline_backend.core.types import CompileIdentity, CompiledKernel, KernelConfig, KernelSpec
 
 
 @runtime_checkable
@@ -32,6 +32,29 @@ class Compiler(Protocol):
 
         Returns:
             List of configs to search over during autotuning.
+        """
+        ...
+
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompileIdentity:
+        """Return the compile identity for this (spec, config, constexpr_sizes) triple.
+
+        The identity is used by the autotuner as a cache key and emitted
+        through the plugin system so plugins can inspect compile events.
+        Backends may include additional axes (e.g. NVRTC flags, target arch)
+        in ``backend_keys``.
+
+        Args:
+            spec: Kernel specification.
+            config: Kernel configuration.
+            constexpr_sizes: Problem-size values baked in at compile time.
+
+        Returns:
+            A ``CompileIdentity`` uniquely identifying this compilation.
         """
         ...
 

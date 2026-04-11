@@ -239,6 +239,7 @@ class TestVerifyPlumbing:
         assert calls == [{"M": 128, "N": 256}]
 
     def test_uses_spec_grid_generator(self) -> None:
+        """Grid generator is called inside make_launch_request with correct sizes."""
         grid_calls = []
 
         from kernel_pipeline_backend.core.types import GridResult, KernelConfig, KernelSpec, CUDAArch, CompiledKernel
@@ -257,6 +258,7 @@ class TestVerifyPlumbing:
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         v.verify(compiled, FakeProblem(), {"M": 128})
 
+        # grid_generator is called once inside FakeRunner.make_launch_request
         assert len(grid_calls) == 1
         assert grid_calls[0] == ({"M": 128}, config)
 
@@ -354,15 +356,32 @@ class TestVerifyExtraArgs:
     """verify() forwards extra_args to Runner.run()."""
 
     def test_extra_args_forwarded_to_runner(self) -> None:
-        """Extra args passed to verify() are forwarded to the runner."""
+        """Extra args passed to verify() are forwarded to make_launch_request."""
+        from kernel_pipeline_backend.core.types import LaunchRequest
+
         received: list = []
 
         class CapturingRunner:
             call_count = 0
-            def run(self, compiled, inputs, device, grid, extra_args=()):
+
+            def make_launch_request(self, compiled, inputs, sizes, config, extra_args=()):
                 received.extend(extra_args)
+                info = compiled.compile_info
+                num_outputs = info.get("num_outputs", 1)
+                n = len(inputs)
+                output_indices = list(range(n - num_outputs, n)) if num_outputs > 0 else []
+                return LaunchRequest(
+                    compiled=compiled, args=tuple(inputs) + extra_args,
+                    grid=(1,), block=None, shared_mem=0,
+                    output_indices=output_indices,
+                    metadata={"torch_inputs": list(inputs)},
+                )
+
+            def run(self, launch, device):
                 self.call_count += 1
-                return type("R", (), {"outputs": list(inputs), "time_ms": 0.0, "metrics": {}})()
+                torch_inputs = launch.metadata["torch_inputs"]
+                outputs = [torch_inputs[i] for i in launch.output_indices]
+                return type("R", (), {"outputs": outputs, "time_ms": 0.0, "metrics": {}})()
 
         runner = CapturingRunner()
         v = Verifier(runner=runner, device=FakeDeviceHandle())

@@ -5,15 +5,17 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from kernel_pipeline_backend.autotuner.instrument.pass_ import BaseInstrumentationPass
 from kernel_pipeline_backend.core.types import SearchPoint
 
 if TYPE_CHECKING:
+    from kernel_pipeline_backend.core.types import LaunchRequest
     from kernel_pipeline_backend.device.device import DeviceHandle
 
 logger = logging.getLogger(__name__)
 
 
-class NCUObserver:
+class NCUObserver(BaseInstrumentationPass):
     """Collects NVIDIA Nsight Compute profiling metrics.
 
     Invokes NCU / CUPTI under the hood to collect hardware counters
@@ -72,10 +74,20 @@ class NCUObserver:
             self._metrics,
         )
 
-    def before_run(self, device: DeviceHandle, point: SearchPoint) -> None:
+    def before_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> None:
         """Start NCU profiling for this invocation."""
 
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, float]:
+    def after_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> dict[str, float]:
         """Collect profiled metrics.
 
         Returns:

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from kernel_pipeline_backend.core.types import CompiledKernel, GridResult, RunResult
+from kernel_pipeline_backend.core.types import (
+    CompiledKernel,
+    KernelConfig,
+    LaunchRequest,
+    RunResult,
+)
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.device.device import DeviceHandle
@@ -17,38 +22,54 @@ class Runner(Protocol):
     Separated from Compiler so that a kernel can be compiled once and
     run many times (e.g. across different inputs during autotuning).
 
-    Grid computation is the caller's responsibility — typically the
-    autotuner calls ``spec.grid_generator(sizes, config)`` and passes
-    the resulting ``GridResult`` here.  This keeps runners free of
-    framework-agnostic grid logic.
+    The backend owns all launch realization: grid computation, argument
+    packing, shared-memory lookup, and output identification.  The
+    profiler and verifier call ``make_launch_request`` once to build an
+    opaque launch plan, then pass that plan to ``run`` on every iteration.
+    This keeps pipeline components free of backend-specific details.
     """
 
-    def run(
+    def make_launch_request(
         self,
         compiled: CompiledKernel,
         inputs: list[Any],  # list[torch.Tensor]
-        device: DeviceHandle,
-        grid: GridResult,
+        sizes: dict[str, int],
+        config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
-    ) -> RunResult:
-        """Launch the kernel and return outputs + timing.
+    ) -> LaunchRequest:
+        """Build a fully resolved launch plan.
+
+        The backend calls ``compiled.spec.grid_generator`` internally,
+        packs arguments in its own encoding (e.g. DLPack for CUDA, raw
+        tensors for Triton), resolves ``shared_mem`` and ``num_outputs``
+        from ``compile_info``, and returns an opaque ``LaunchRequest``.
 
         Args:
-            compiled: A compiled artifact from the matching Compiler.
-            inputs: Input tensors on the target device.
-            device: Handle to the GPU device.
-            grid: Pre-computed launch grid (and optional block)
-                dimensions.  Produced by the kernel spec's
-                ``grid_generator`` — the runner never computes this
-                itself.
-            extra_args: Additional scalar arguments appended after
-                the tensor inputs when launching the kernel (e.g.
-                array lengths).  Use ``numpy`` typed scalars to
-                match the kernel's C parameter types exactly.
-                Defaults to an empty tuple.
+            compiled: Pre-compiled kernel artifact.
+            inputs: Input (and output-buffer) tensors on the target device.
+            sizes: Problem size parameters for grid computation.
+            config: Kernel configuration used for grid computation.
+            extra_args: Additional scalar arguments (e.g. array lengths)
+                resolved from link bindings by the caller.
 
         Returns:
-            RunResult with output tensors, wall-clock time, and any
-            observer-contributed metrics.
+            An opaque ``LaunchRequest`` suitable for passing to ``run``.
+        """
+        ...
+
+    def run(
+        self,
+        launch: LaunchRequest,
+        device: DeviceHandle,
+    ) -> RunResult:
+        """Launch the kernel described by *launch* and return results.
+
+        Args:
+            launch: Pre-built launch plan from ``make_launch_request``.
+            device: Handle to the GPU device.
+
+        Returns:
+            ``RunResult`` with output tensors, wall-clock time, and any
+            backend-contributed metrics.
         """
         ...

@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kernel_pipeline_backend.autotuner.instrument import BaseInstrumentationPass
 from kernel_pipeline_backend.core.registry import registry as backend_registry
 from kernel_pipeline_backend.core.types import (
     CUDAArch,
@@ -119,28 +120,8 @@ class _FakeStrategy:
         return True
 
 
-class _FakeObserver:
-    """Minimal Observer stand-in."""
-
-    @property
-    def supported_backends(self) -> None:
-        return None
-
-    @property
-    def run_once(self) -> bool:
-        return False
-
-    def setup(self, device: Any) -> None:
-        pass
-
-    def before_run(self, device: Any, point: Any) -> None:
-        pass
-
-    def after_run(self, device: Any, point: Any) -> dict[str, float]:
-        return {}
-
-    def teardown(self, device: Any) -> None:
-        pass
+class _FakeObserver(BaseInstrumentationPass):
+    """Minimal InstrumentationPass stand-in."""
 
 
 class _FakePlugin:
@@ -202,7 +183,7 @@ class _PipelineCall:
     kernels: list[KernelSpec] = field(default_factory=list)
     problem: Any = None
     strategy: Any = None
-    observers: list[Any] = field(default_factory=list)
+    passes: list[Any] = field(default_factory=list)
     force: bool = False
     skip_verify: bool = False
     skip_autotune: bool = False
@@ -243,7 +224,7 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_PipelineCall]:
         kernels,
         problem,
         strategy,
-        observers=None,
+        passes=None,
         force=False,
         skip_verify=False,
         skip_autotune=False,
@@ -254,7 +235,7 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_PipelineCall]:
                 kernels=list(kernels),
                 problem=problem,
                 strategy=strategy,
-                observers=list(observers or []),
+                passes=list(passes or []),
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
@@ -538,20 +519,20 @@ class TestObserverResolution:
         _register_problem("p")
         _register_kernel("k", problem="p")
         custom = _FakeObserver()
-        await service.tune("k", observers=[custom])
-        assert captured_calls[0].observers == [custom]
+        await service.tune("k", passes=[custom])
+        assert captured_calls[0].passes == [custom]
 
     async def test_service_default(
         self, captured_calls: list[_PipelineCall],
     ) -> None:
         obs = _FakeObserver()
         svc = TuneService(
-            device=_FakeDevice(), store=_FakeStore(), observers=[obs],
+            device=_FakeDevice(), store=_FakeStore(), passes=[obs],
         )
         _register_problem("p")
         _register_kernel("k", problem="p")
         await svc.tune("k")
-        assert captured_calls[0].observers[0] is obs
+        assert captured_calls[0].passes[0] is obs
 
     async def test_fallback_to_timing_observer(
         self, service: TuneService, captured_calls: list[_PipelineCall],
@@ -560,7 +541,7 @@ class TestObserverResolution:
         _register_kernel("k", problem="p")
         await service.tune("k")
         from kernel_pipeline_backend.autotuner.observer import TimingObserver
-        assert isinstance(captured_calls[0].observers[0], TimingObserver)
+        assert isinstance(captured_calls[0].passes[0], TimingObserver)
 
 
 # ---------------------------------------------------------------------------

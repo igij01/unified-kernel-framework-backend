@@ -10,10 +10,12 @@ import pytest
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
     CUDAArch,
+    CompileIdentity,
     CompiledKernel,
     GridResult,
     KernelConfig,
     KernelSpec,
+    LaunchRequest,
     RunResult,
     SearchPoint,
     SearchSpace,
@@ -81,6 +83,19 @@ class FakeCompiler:
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         return list(self._configs)
 
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict | None = None,
+    ) -> CompileIdentity:
+        return CompileIdentity(
+            version_hash=spec.name,
+            config=config,
+            constexpr_sizes=frozenset((constexpr_sizes or {}).items()),
+            backend_keys=frozenset(),
+        )
+
     def compile(
         self,
         spec: KernelSpec,
@@ -119,17 +134,37 @@ class FakeRunner:
             self._time_fn = lambda compiled: 1.0
         self.call_count = 0
 
-    def run(
+    def make_launch_request(
         self,
         compiled: CompiledKernel,
         inputs: list[Any],
-        device: Any,
-        grid: GridResult,
+        sizes: dict[str, Any],
+        config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
+    ) -> LaunchRequest:
+        grid_result = compiled.spec.grid_generator(sizes, compiled.config)
+        # Return all inputs as outputs (fake: no real output buffers)
+        output_indices = list(range(len(inputs)))
+        return LaunchRequest(
+            compiled=compiled,
+            args=tuple(inputs) + extra_args,
+            grid=grid_result.grid,
+            block=grid_result.block,
+            shared_mem=0,
+            output_indices=output_indices,
+            metadata={"torch_inputs": list(inputs)},
+        )
+
+    def run(
+        self,
+        launch: LaunchRequest,
+        device: Any,
     ) -> RunResult:
         self.call_count += 1
-        time_ms = self._time_fn(compiled)
-        return RunResult(outputs=list(inputs), time_ms=time_ms)
+        time_ms = self._time_fn(launch.compiled)
+        torch_inputs: list[Any] = launch.metadata["torch_inputs"]
+        outputs = [torch_inputs[i] for i in launch.output_indices]
+        return RunResult(outputs=outputs, time_ms=time_ms)
 
 
 class FakeProblem:

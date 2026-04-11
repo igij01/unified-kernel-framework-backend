@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from kernel_pipeline_backend.autotuner.profiler import Profiler, IncompatibleObserverError
+from kernel_pipeline_backend.autotuner.instrument import BaseInstrumentationPass
 from kernel_pipeline_backend.autotuner.observer import MemoryObserver, NCUObserver, TimingObserver
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
@@ -51,8 +52,8 @@ def _compiled(
     return CompiledKernel(spec=spec, config=config)
 
 
-class _StubObserver:
-    """Minimal configurable observer for testing protocol properties."""
+class _StubObserver(BaseInstrumentationPass):
+    """Minimal configurable InstrumentationPass for testing profiler properties."""
 
     def __init__(
         self,
@@ -75,18 +76,12 @@ class _StubObserver:
     def run_once(self) -> bool:
         return self._run_once
 
-    def setup(self, device) -> None:
-        pass
-
-    def before_run(self, device, point) -> None:
+    def before_run(self, device, point, launch=None) -> None:
         self.before_count += 1
 
-    def after_run(self, device, point) -> dict[str, float]:
+    def after_run(self, device, point, launch=None) -> dict[str, float]:
         self.after_count += 1
         return {self._metric_name: float(self.after_count)}
-
-    def teardown(self, device) -> None:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +152,7 @@ class TestBackendCompatibility:
         obs = _StubObserver(supported_backends=("cuda", "triton"))
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         at.setup()  # should not raise
 
@@ -165,7 +160,7 @@ class TestBackendCompatibility:
         obs = _StubObserver(supported_backends=None)
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         at.setup()  # should not raise
 
@@ -173,7 +168,7 @@ class TestBackendCompatibility:
         obs = _StubObserver(supported_backends=("triton",))
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         with pytest.raises(IncompatibleObserverError, match="triton"):
             at.setup()
@@ -182,7 +177,7 @@ class TestBackendCompatibility:
         obs = _StubObserver(supported_backends=("triton",))
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         with pytest.raises(IncompatibleObserverError, match="_StubObserver"):
             at.setup()
@@ -191,7 +186,7 @@ class TestBackendCompatibility:
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
             backend="cuda",
-            observers=[TimingObserver(), NCUObserver(), MemoryObserver()],
+            passes=[TimingObserver(), NCUObserver(), MemoryObserver()],
         )
         at.setup()  # should not raise
 
@@ -209,7 +204,7 @@ class TestSetupTeardown:
         device = FakeDeviceHandle(memory_allocated=500)
         at = Profiler(
             runner=FakeRunner(), device=device,
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         at.setup()
         assert obs._before_bytes == 0
@@ -219,7 +214,7 @@ class TestSetupTeardown:
         device = FakeDeviceHandle(memory_allocated=500)
         at = Profiler(
             runner=FakeRunner(), device=device,
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
         )
         at.setup()
         obs._before_bytes = 999
@@ -376,7 +371,7 @@ class TestProfileObservers:
             runner=FakeRunner(),
             device=FakeDeviceHandle(memory_allocated=1024),
             backend="cuda",
-            observers=[MemoryObserver()],
+            passes=[MemoryObserver()],
             warmup_cycles=0, profiling_cycles=1,
         )
         at.setup()
@@ -389,7 +384,7 @@ class TestProfileObservers:
             runner=FakeRunner(),
             device=FakeDeviceHandle(memory_allocated=512),
             backend="cuda",
-            observers=[TimingObserver(), MemoryObserver()],
+            passes=[TimingObserver(), MemoryObserver()],
             warmup_cycles=0, profiling_cycles=1,
         )
         at.setup()
@@ -403,7 +398,7 @@ class TestProfileObservers:
             runner=FakeRunner(),
             device=FakeDeviceHandle(memory_allocated=0),
             backend="cuda",
-            observers=[MemoryObserver()],
+            passes=[MemoryObserver()],
             warmup_cycles=0, profiling_cycles=3,
         )
         at.setup()
@@ -415,7 +410,7 @@ class TestProfileObservers:
         obs = _StubObserver(run_once=False, metric_name="regular")
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
             warmup_cycles=3, profiling_cycles=2,
         )
         at.setup()
@@ -446,7 +441,7 @@ class TestProfileRunOnce:
         runner = FakeRunner()
         at = Profiler(
             runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
             warmup_cycles=0, profiling_cycles=3,
         )
         at.setup()
@@ -462,7 +457,7 @@ class TestProfileRunOnce:
         runner = FakeRunner()
         at = Profiler(
             runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
             warmup_cycles=1, profiling_cycles=2,
         )
         at.setup()
@@ -476,7 +471,7 @@ class TestProfileRunOnce:
         obs = _StubObserver(run_once=True, metric_name="ncu_metric")
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
             warmup_cycles=0, profiling_cycles=1,
         )
         at.setup()
@@ -489,7 +484,7 @@ class TestProfileRunOnce:
         obs = _StubObserver(run_once=True, metric_name="ncu_metric")
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),
-            backend="cuda", observers=[obs],
+            backend="cuda", passes=[obs],
             warmup_cycles=0, profiling_cycles=5,
         )
         at.setup()
@@ -506,7 +501,7 @@ class TestProfileRunOnce:
         runner = FakeRunner()
         at = Profiler(
             runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[regular, once],
+            backend="cuda", passes=[regular, once],
             warmup_cycles=0, profiling_cycles=3,
         )
         at.setup()
@@ -527,7 +522,7 @@ class TestProfileRunOnce:
         runner = FakeRunner()
         at = Profiler(
             runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[ncu],
+            backend="cuda", passes=[ncu],
             warmup_cycles=0, profiling_cycles=3,
         )
         at.setup()
@@ -545,7 +540,7 @@ class TestProfileRunOnce:
         runner = FakeRunner()
         at = Profiler(
             runner=runner, device=FakeDeviceHandle(),
-            backend="cuda", observers=[regular],
+            backend="cuda", passes=[regular],
             warmup_cycles=1, profiling_cycles=2,
         )
         at.setup()
@@ -580,6 +575,7 @@ class TestProfileInputsAndGrid:
         assert calls == [{"M": 128, "N": 256}]
 
     def test_uses_spec_grid_generator(self) -> None:
+        """Grid generator is called inside make_launch_request (once per profile call)."""
         grid_calls = []
 
         def tracking_grid(sizes, config):
@@ -600,6 +596,7 @@ class TestProfileInputsAndGrid:
             backend="cuda", warmup_cycles=0, profiling_cycles=1,
         )
         at.profile(compiled, FakeProblem(), {"M": 128})
+        # grid_generator called once inside FakeRunner.make_launch_request
         assert len(grid_calls) == 1
         assert grid_calls[0] == ({"M": 128}, config)
 

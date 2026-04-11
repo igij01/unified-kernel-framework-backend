@@ -31,18 +31,26 @@ def _noop_grid(sizes: dict[str, int], config: KernelConfig) -> GridResult:
     return GridResult(grid=(1,))
 
 
+def _n_grid(sizes: dict[str, int], config: KernelConfig) -> GridResult:
+    """Grid covering all N elements at the configured BLOCK_SIZE."""
+    N = sizes["N"]
+    block_size = config.params.get("BLOCK_SIZE", 256)
+    return GridResult(grid=((N + block_size - 1) // block_size,))
+
+
 def _make_spec(
     name: str = "add_kernel",
     source: object = lambda: None,
     target_archs: list[CUDAArch] | None = None,
     compile_flags: dict | None = None,
+    grid_generator=None,
 ) -> KernelSpec:
     return KernelSpec(
         name=name,
         source=source,
         backend="triton",
         target_archs=target_archs or [CUDAArch.SM_90],
-        grid_generator=_noop_grid,
+        grid_generator=grid_generator if grid_generator is not None else _n_grid,
         compile_flags=compile_flags if compile_flags is not None else {},
     )
 
@@ -538,11 +546,11 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
-        grid = self._grid_for(N, 256)
 
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
 
         assert isinstance(result, RunResult)
         assert len(result.outputs) == 1
@@ -563,11 +571,10 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
-        grid = self._grid_for(N, 256)
-
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], x + y)
 
     def test_timing_is_non_negative(
@@ -585,11 +592,10 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
-        grid = self._grid_for(N, 256)
-
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert result.time_ms >= 0.0
 
     def test_different_block_sizes_same_result(
@@ -609,11 +615,10 @@ class TestTritonRunnerGPU:
             compiled = compiler.compile(
                 spec, KernelConfig(params={"BLOCK_SIZE": bs})
             )
-            grid = self._grid_for(N, bs)
-
-            result = runner.run(
-                compiled, [x, y, out], device, grid, extra_args=(N,)
+            launch = runner.make_launch_request(
+                compiled, [x, y, out], {"N": N}, compiled.config, (N,)
             )
+            result = runner.run(launch, device)
             assert torch.allclose(
                 result.outputs[0], expected
             ), f"Failed with BLOCK_SIZE={bs}"
@@ -633,11 +638,10 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 1024})
         )
-        grid = self._grid_for(N, 1024)
-
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], x + y)
 
     def test_different_kernel(
@@ -655,11 +659,10 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
-        grid = self._grid_for(N, 256)
-
-        result = runner.run(
-            compiled, [x, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], x * 2)
 
     def test_num_outputs_zero(
@@ -678,11 +681,10 @@ class TestTritonRunnerGPU:
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
         compiled.compile_info["num_outputs"] = 0
-        grid = self._grid_for(N, 256)
-
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert result.outputs == []
 
     def test_no_extra_args_kernel(
@@ -691,11 +693,7 @@ class TestTritonRunnerGPU:
         runner: TritonRunner,
         device: _FakeDevice,
     ) -> None:
-        """Kernel where n_elements is passed as a regular tensor input."""
-        # Use _add_kernel but pass N as a positional arg via extra_args=()
-        # is invalid here, but we can test the default extra_args path
-        # by building a kernel that doesn't need them.
-        # For simplicity, just verify that extra_args defaults to empty tuple.
+        """Verify that extra_args are correctly forwarded through make_launch_request."""
         N = 256
         x = torch.randn(N, device="cuda")
         y = torch.randn(N, device="cuda")
@@ -705,12 +703,10 @@ class TestTritonRunnerGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_SIZE": 256})
         )
-        grid = self._grid_for(N, 256)
-
-        # Pass N via extra_args explicitly to show it's optional-style
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(N,)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,)
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], x + y)
 
 
@@ -796,12 +792,11 @@ class TestTritonAutotuneGPU:
         for config in configs:
             out = torch.zeros(N, device="cuda")
             compiled = compiler.compile(spec, config)
-            bs = config.params["BLOCK_SIZE"]
-            grid = self._grid_for(N, bs)
 
-            result = runner.run(
-                compiled, [x, y, out], device, grid, extra_args=(N,)
+            launch = runner.make_launch_request(
+                compiled, [x, y, out], {"N": N}, compiled.config, (N,)
             )
+            result = runner.run(launch, device)
 
             assert isinstance(result, RunResult)
             assert torch.allclose(
@@ -885,11 +880,11 @@ class TestTritonShapeAsArgsGPU:
 
         spec = _make_spec(source=_shape_add_kernel)
         compiled = compiler.compile(spec, KernelConfig(params={"BLOCK_SIZE": block_size}))
-        grid = GridResult(grid=((n_elements + block_size - 1) // block_size,))
 
-        result = runner.run(
-            compiled, [x, y, out], device, grid, extra_args=(M, N)
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": n_elements}, compiled.config, (M, N)
         )
+        result = runner.run(launch, device)
 
         assert torch.allclose(result.outputs[0], x + y)
 
@@ -908,11 +903,11 @@ class TestTritonShapeAsArgsGPU:
             x = torch.randn(n_elements, device="cuda")
             y = torch.randn(n_elements, device="cuda")
             out = torch.zeros(n_elements, device="cuda")
-            grid = GridResult(grid=((n_elements + 256 - 1) // 256,))
 
-            result = runner.run(
-                compiled, [x, y, out], device, grid, extra_args=(M, N)
+            launch = runner.make_launch_request(
+                compiled, [x, y, out], {"N": n_elements}, compiled.config, (M, N)
             )
+            result = runner.run(launch, device)
             assert torch.allclose(result.outputs[0], x + y), f"Failed at M={M}, N={N}"
 
     def test_constexpr_head_dim_from_constexpr_sizes(
@@ -935,9 +930,11 @@ class TestTritonShapeAsArgsGPU:
         compiled = compiler.compile(spec, config, constexpr_sizes={"HEAD_DIM": head_dim})
         # The compiled artifact's config should have HEAD_DIM merged in for runner kwargs
         assert compiled.config.params.get("HEAD_DIM") == head_dim
-        grid = GridResult(grid=((N + block_size - 1) // block_size,))
 
-        result = runner.run(compiled, [x, out], device, grid, extra_args=(N,))
+        launch = runner.make_launch_request(
+            compiled, [x, out], {"N": N}, compiled.config, (N,)
+        )
+        result = runner.run(launch, device)
 
         assert torch.allclose(result.outputs[0], x)
 
@@ -995,7 +992,10 @@ class TestTritonShapeAsArgsGPU:
             inputs = problem_obj.initialize({"M": M, "N": N})
             x, y, out = inputs
 
-            result = runner.run(compiled, inputs, device, grid, extra_args=extra_args)
+            launch = runner.make_launch_request(
+                compiled, inputs, {"N": n_elements}, compiled.config, extra_args=extra_args
+            )
+            result = runner.run(launch, device)
             assert torch.allclose(result.outputs[0], x + y)
         finally:
             Registry.clear()

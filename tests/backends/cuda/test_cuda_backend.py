@@ -468,12 +468,12 @@ class TestCUDARunnerMacroGPU:
         c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
         compiled = self._compile_vector_add(compiler)
-        grid = self._grid_for(N)
 
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
 
         assert isinstance(result, RunResult)
         assert len(result.outputs) == 1
@@ -491,12 +491,11 @@ class TestCUDARunnerMacroGPU:
         c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
         compiled = self._compile_vector_add(compiler)
-        grid = self._grid_for(N)
-
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], a + b)
 
     def test_timing_is_non_negative(
@@ -511,12 +510,11 @@ class TestCUDARunnerMacroGPU:
         c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
         compiled = self._compile_vector_add(compiler)
-        grid = self._grid_for(N)
-
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert result.time_ms >= 0.0
 
     def test_different_block_sizes_same_result(
@@ -533,12 +531,11 @@ class TestCUDARunnerMacroGPU:
         for bs in [64, 128, 256]:
             c = torch.zeros(N, device="cuda", dtype=torch.float32)
             compiled = self._compile_vector_add(compiler, block_size=bs)
-            grid = self._grid_for(N, block_size=bs)
-
-            result = runner.run(
-                compiled, [a, b, c], device, grid,
-                extra_args=(np.int32(N),),
+            launch = runner.make_launch_request(
+                compiled, [a, b, c], {"N": N}, compiled.config,
+                (np.int32(N),),
             )
+            result = runner.run(launch, device)
             assert torch.allclose(
                 result.outputs[0], expected
             ), f"Failed with BLOCK_SIZE={bs}"
@@ -555,12 +552,11 @@ class TestCUDARunnerMacroGPU:
         c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
         compiled = self._compile_vector_add(compiler)
-        grid = self._grid_for(N)
-
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], a + b)
 
     def test_no_extra_args(
@@ -582,12 +578,13 @@ class TestCUDARunnerMacroGPU:
         )
 
         compiled = CUDACompiler().compile(spec, KernelConfig())
-        grid = GridResult(grid=(N // 256,), block=(256,))
-
         src = torch.randn(N, device="cuda", dtype=torch.float32)
         dst = torch.zeros(N, device="cuda", dtype=torch.float32)
 
-        result = runner.run(compiled, [src, dst], device, grid)
+        launch = runner.make_launch_request(
+            compiled, [src, dst], {"N": N}, compiled.config,
+        )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], src)
 
     def test_num_outputs_zero(
@@ -603,12 +600,12 @@ class TestCUDARunnerMacroGPU:
 
         compiled = self._compile_vector_add(compiler)
         compiled.compile_info["num_outputs"] = 0
-        grid = self._grid_for(N)
 
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert result.outputs == []
 
     def test_num_outputs_two(
@@ -624,12 +621,12 @@ class TestCUDARunnerMacroGPU:
 
         compiled = self._compile_vector_add(compiler)
         compiled.compile_info["num_outputs"] = 2
-        grid = self._grid_for(N)
 
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert len(result.outputs) == 2
         assert result.outputs[0] is b
         assert result.outputs[1] is c
@@ -679,10 +676,11 @@ class TestCUDARunnerTemplateGPU:
         b = torch.randn(N, device="cuda", dtype=torch.float32)
         c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
-        result = runner.run(
-            compiled, [a, b, c], device, grid,
-            extra_args=(np.int32(N),),
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
         )
+        result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], a + b)
 
     def test_template_different_block_sizes(
@@ -709,14 +707,11 @@ class TestCUDARunnerTemplateGPU:
             compiled = compiler.compile(
                 spec, KernelConfig(params={"BLOCK_SIZE": bs})
             )
-            grid = GridResult(
-                grid=((N + bs - 1) // bs,), block=(bs,)
+            launch = runner.make_launch_request(
+                compiled, [a, b, c], {"N": N}, compiled.config,
+                (np.int32(N),),
             )
-
-            result = runner.run(
-                compiled, [a, b, c], device, grid,
-                extra_args=(np.int32(N),),
-            )
+            result = runner.run(launch, device)
             assert torch.allclose(
                 result.outputs[0], expected
             ), f"Failed with BLOCK_SIZE={bs}"
@@ -730,6 +725,7 @@ class TestCUDARunnerTemplateGPU:
         """Kernel with two template params compiles and runs."""
         spec = _make_spec(
             source=MULTI_TEMPLATE_SRC,
+            grid_generator=_noop_grid,
             compile_flags={
                 "entry_point": "multi_kernel",
                 "template_params": ["BLOCK_M", "BLOCK_N"],
@@ -738,9 +734,8 @@ class TestCUDARunnerTemplateGPU:
         compiled = compiler.compile(
             spec, KernelConfig(params={"BLOCK_M": 32, "BLOCK_N": 64})
         )
-        grid = GridResult(grid=(1,), block=(1,))
-
         out = torch.zeros(1, device="cuda", dtype=torch.float32)
-        result = runner.run(compiled, [out], device, grid)
+        launch = runner.make_launch_request(compiled, [out], {}, compiled.config)
+        result = runner.run(launch, device)
 
         assert result.outputs[0].item() == pytest.approx(32 + 64)

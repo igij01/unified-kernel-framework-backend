@@ -10,12 +10,14 @@ import pytest
 
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
+    CompileIdentity,
     CompiledKernel,
     CUDAArch,
     GridResult,
     KernelConfig,
     KernelHash,
     KernelSpec,
+    LaunchRequest,
     RunResult,
     SearchPoint,
     SearchSpace,
@@ -79,6 +81,19 @@ class FakeCompiler:
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         return list(self._configs)
 
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict | None = None,
+    ) -> CompileIdentity:
+        return CompileIdentity(
+            version_hash=spec.name,
+            config=config,
+            constexpr_sizes=frozenset((constexpr_sizes or {}).items()),
+            backend_keys=frozenset(),
+        )
+
     def compile(
         self,
         spec: KernelSpec,
@@ -116,19 +131,44 @@ class FakeRunner:
         self._output_fn = output_fn
         self.call_count = 0
 
-    def run(
+    def make_launch_request(
         self,
         compiled: CompiledKernel,
         inputs: list[Any],
-        device: Any,
-        grid: GridResult,
+        sizes: dict[str, Any],
+        config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
+    ) -> LaunchRequest:
+        grid_result = compiled.spec.grid_generator(sizes, compiled.config)
+        info = compiled.compile_info
+        num_outputs: int = info.get("num_outputs", 1)
+        n = len(inputs)
+        output_indices = list(range(n - num_outputs, n)) if num_outputs > 0 else []
+        return LaunchRequest(
+            compiled=compiled,
+            args=tuple(inputs) + extra_args,
+            grid=grid_result.grid,
+            block=grid_result.block,
+            shared_mem=0,
+            output_indices=output_indices,
+            metadata={
+                "torch_inputs": list(inputs),
+                "output_fn": self._output_fn,
+            },
+        )
+
+    def run(
+        self,
+        launch: LaunchRequest,
+        device: Any,
     ) -> RunResult:
         self.call_count += 1
-        if self._output_fn:
-            outputs = self._output_fn(compiled, inputs)
+        output_fn = launch.metadata["output_fn"]
+        torch_inputs: list[Any] = launch.metadata["torch_inputs"]
+        if output_fn:
+            outputs = output_fn(launch.compiled, torch_inputs)
         else:
-            outputs = list(inputs)
+            outputs = list(torch_inputs)
         return RunResult(outputs=outputs, time_ms=self._time_ms)
 
 
@@ -220,23 +260,6 @@ class FakeStrategy:
 
     def is_converged(self, results: list[AutotuneResult]) -> bool:
         return False  # loop exits when suggest() returns []
-
-
-class FakeInstrument:
-    """Identity instrument — passes source and flags through unchanged."""
-
-    def __init__(self, observer: Any = None) -> None:
-        self._observer = observer
-
-    @property
-    def observer(self) -> Any:
-        return self._observer
-
-    def transform_source(self, source: Any, spec: Any) -> Any:
-        return source
-
-    def transform_compile_flags(self, flags: dict[str, Any]) -> dict[str, Any]:
-        return dict(flags)
 
 
 class TrackingPlugin:

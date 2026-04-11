@@ -16,7 +16,7 @@ import itertools
 from typing import Any
 
 from kernel_pipeline_backend.core.compiler import CompilationError
-from kernel_pipeline_backend.core.types import CompiledKernel, KernelConfig, KernelSpec
+from kernel_pipeline_backend.core.types import CompileIdentity, CompiledKernel, KernelConfig, KernelSpec
 
 
 class CUDACompiler:
@@ -86,6 +86,39 @@ class CUDACompiler:
             KernelConfig(params=dict(zip(keys, combo)))
             for combo in itertools.product(*value_lists)
         ]
+
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompileIdentity:
+        """Return the compile identity for this CUDA kernel compilation.
+
+        Backend keys include NVRTC options and template params from
+        compile_flags so that changing compiler flags invalidates the cache.
+
+        Args:
+            spec: Kernel specification.
+            config: Kernel configuration.
+            constexpr_sizes: Problem-size values baked in at compile time.
+
+        Returns:
+            ``CompileIdentity`` for this (spec, config, constexpr_sizes).
+        """
+        nvrtc_options = tuple(sorted(spec.compile_flags.get("nvrtc_options", [])))
+        template_params = tuple(spec.compile_flags.get("template_params") or [])
+        backend_keys = frozenset({
+            "nvrtc_options": nvrtc_options,
+            "template_params": template_params,
+            "entry_point": spec.compile_flags.get("entry_point", spec.name),
+        }.items())
+        return CompileIdentity(
+            version_hash=str(spec.version_hash) if spec.version_hash else spec.name,
+            config=config,
+            constexpr_sizes=frozenset((constexpr_sizes or {}).items()),
+            backend_keys=backend_keys,
+        )
 
     def compile(
         self,

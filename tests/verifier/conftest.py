@@ -10,6 +10,7 @@ from kernel_pipeline_backend.core.types import (
     GridResult,
     KernelConfig,
     KernelSpec,
+    LaunchRequest,
     RunResult,
 )
 from kernel_pipeline_backend.device.device import DeviceInfo
@@ -50,17 +51,45 @@ class FakeRunner:
     def __init__(self, output_fn: Any = None) -> None:
         self._output_fn = output_fn or (lambda compiled, inputs: list(inputs))
         self.call_count = 0
+        self._last_extra_args: tuple = ()
 
-    def run(
+    def make_launch_request(
         self,
         compiled: CompiledKernel,
         inputs: list[Any],
-        device: Any,
-        grid: GridResult,
+        sizes: dict[str, Any],
+        config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
+    ) -> LaunchRequest:
+        self._last_extra_args = extra_args
+        grid_result = compiled.spec.grid_generator(sizes, compiled.config)
+        info = compiled.compile_info
+        num_outputs: int = info.get("num_outputs", 1)
+        n = len(inputs)
+        output_indices = list(range(n - num_outputs, n)) if num_outputs > 0 else []
+        return LaunchRequest(
+            compiled=compiled,
+            args=tuple(inputs) + extra_args,
+            grid=grid_result.grid,
+            block=grid_result.block,
+            shared_mem=0,
+            output_indices=output_indices,
+            metadata={
+                "torch_inputs": list(inputs),
+                "output_fn": self._output_fn,
+                "extra_args": extra_args,
+            },
+        )
+
+    def run(
+        self,
+        launch: LaunchRequest,
+        device: Any,
     ) -> RunResult:
         self.call_count += 1
-        outputs = self._output_fn(compiled, inputs)
+        output_fn = launch.metadata["output_fn"]
+        torch_inputs: list[Any] = launch.metadata["torch_inputs"]
+        outputs = output_fn(launch.compiled, torch_inputs)
         return RunResult(outputs=outputs, time_ms=1.0)
 
 

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from kernel_pipeline_backend.core.types import CompiledKernel, KernelHash
 from kernel_pipeline_backend.core.runner import Runner
+from kernel_pipeline_backend.autotuner.instrument.pass_ import InstrumentationPass
 from kernel_pipeline_backend.problem.problem import Problem
 
 if TYPE_CHECKING:
@@ -173,20 +174,29 @@ class Verifier:
 
         inputs   = problem.initialize(sizes)
         expected = problem.reference(inputs, sizes)
-        grid     = compiled.spec.grid_generator(sizes, compiled.config)
-        actual   = runner.run(compiled, inputs, device, grid).outputs
+        launch   = runner.make_launch_request(compiled, inputs, sizes, config, extra_args)
+        launch   = pass_.transform_launch_request(launch)  # for each regular pass
+        actual   = runner.run(launch, device).outputs
         compare(expected, actual, problem.atol, problem.rtol)
     """
 
-    def __init__(self, runner: Runner, device: DeviceHandle) -> None:
+    def __init__(
+        self,
+        runner: Runner,
+        device: DeviceHandle,
+        passes: list[InstrumentationPass] | None = None,
+    ) -> None:
         """Initialise the verifier.
 
         Args:
             runner: Backend runner to execute the compiled kernel.
             device: GPU device handle for kernel execution.
+            passes: Instrumentation passes whose ``transform_launch_request``
+                is applied (regular passes only) before running the kernel.
         """
         self._runner = runner
         self._device = device
+        self._passes: list[InstrumentationPass] = list(passes or [])
 
     def verify(
         self,
@@ -213,10 +223,13 @@ class Verifier:
         inputs = problem.initialize(sizes)
         expected = problem.reference(inputs, sizes)
 
-        grid = compiled.spec.grid_generator(sizes, compiled.config)
-        run_result = self._runner.run(
-            compiled, inputs, self._device, grid, extra_args,
+        launch = self._runner.make_launch_request(
+            compiled, inputs, sizes, compiled.config, extra_args,
         )
+        for p in self._passes:
+            if not p.run_once:
+                launch = p.transform_launch_request(launch)
+        run_result = self._runner.run(launch, self._device)
         actual = run_result.outputs
 
         if len(expected) != len(actual):

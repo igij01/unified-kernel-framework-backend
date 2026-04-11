@@ -623,18 +623,16 @@ class TestErrorHandling:
         """Runner failure during profiling is captured as an AutotuneError."""
         call_count = 0
 
-        class FailOnceRunner:
+        class FailOnceRunner(FakeRunner):
             """Fails on the second runner call (first is verification)."""
 
-            def run(self, compiled, inputs, device, grid, extra_args=()):
+            def run(self, launch, device):
                 nonlocal call_count
                 call_count += 1
                 # First call is verification, second is profiling warmup/run
                 if call_count == 2:
                     raise RuntimeError("GPU error")
-                return FakeRunner().run(
-                    compiled, inputs, device, grid, extra_args,
-                )
+                return super().run(launch, device)
 
         problem = FakeProblem(sizes={"M": [128]})
         configs = [KernelConfig(params={"BS": 64})]
@@ -650,15 +648,13 @@ class TestErrorHandling:
         """After an error, the loop still terminates cleanly."""
         call_count = 0
 
-        class FailAlwaysRunner:
-            def run(self, compiled, inputs, device, grid, extra_args=()):
+        class FailAlwaysRunner(FakeRunner):
+            def run(self, launch, device):
                 nonlocal call_count
                 call_count += 1
                 if call_count > 1:  # first call = verification
                     raise RuntimeError("boom")
-                return FakeRunner().run(
-                    compiled, inputs, device, grid, extra_args,
-                )
+                return super().run(launch, device)
 
         problem = FakeProblem(sizes={"M": [128]})
         configs = [KernelConfig(params={"BS": 64})]
@@ -900,9 +896,11 @@ class TestLinkBindings:
         received_extra: list[tuple] = []
 
         class CapturingRunner(FakeRunner):
-            def run(self, compiled, inputs, device, grid, extra_args=()):
-                received_extra.append(extra_args)
-                return super().run(compiled, inputs, device, grid, extra_args)
+            def run(self, launch, device):
+                torch_inputs = launch.metadata["torch_inputs"]
+                extra = launch.args[len(torch_inputs):]
+                received_extra.append(extra)
+                return super().run(launch, device)
 
         # Register kernel + problem with runtime_args binding
         Registry.clear()
@@ -1004,9 +1002,9 @@ class TestLinkBindings:
         seen_configs: list[dict] = []
 
         class CapturingRunner(FakeRunner):
-            def run(self, compiled, inputs, device, grid, extra_args=()):
-                seen_configs.append(dict(compiled.config.params))
-                return super().run(compiled, inputs, device, grid, extra_args)
+            def run(self, launch, device):
+                seen_configs.append(dict(launch.compiled.config.params))
+                return super().run(launch, device)
 
         Registry.clear()
         Registry.register_problem("p", FakeProblem(sizes={"HEAD": [64]}))
@@ -1052,9 +1050,11 @@ class TestLinkBindings:
         received_extra: list[tuple] = []
 
         class CapturingRunner(FakeRunner):
-            def run(self, compiled, inputs, device, grid, extra_args=()):
-                received_extra.append(extra_args)
-                return super().run(compiled, inputs, device, grid, extra_args)
+            def run(self, launch, device):
+                torch_inputs = launch.metadata["torch_inputs"]
+                extra = launch.args[len(torch_inputs):]
+                received_extra.append(extra)
+                return super().run(launch, device)
 
         runner = CapturingRunner()
         profiler = Profiler(runner=runner, device=FakeDeviceHandle(),

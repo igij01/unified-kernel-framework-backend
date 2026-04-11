@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from kernel_pipeline_backend.autotuner.instrument.pass_ import BaseInstrumentationPass
 from kernel_pipeline_backend.core.types import SearchPoint
 
 if TYPE_CHECKING:
+    from kernel_pipeline_backend.core.types import LaunchRequest
     from kernel_pipeline_backend.device.device import DeviceHandle
 
 
-class TimingObserver:
+class TimingObserver(BaseInstrumentationPass):
     """Wall-clock timing via CUDA events.
 
     Measures kernel execution time by synchronising the device before and
@@ -44,12 +46,22 @@ class TimingObserver:
         """Initialise timing state."""
         self._start_ns = 0
 
-    def before_run(self, device: DeviceHandle, point: SearchPoint) -> None:
+    def before_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> None:
         """Synchronise the device and record the start timestamp."""
         device.synchronize()
         self._start_ns = time.perf_counter_ns()
 
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, float]:
+    def after_run(
+        self,
+        device: DeviceHandle,
+        point: SearchPoint,
+        launch: LaunchRequest | None = None,
+    ) -> dict[str, float]:
         """Synchronise the device and compute elapsed time.
 
         Returns:

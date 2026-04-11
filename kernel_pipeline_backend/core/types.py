@@ -265,6 +265,39 @@ class CompiledKernel:
 
 
 # ---------------------------------------------------------------------------
+# Compile identity — backend-owned, replaces ad-hoc cache key helpers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CompileIdentity:
+    """First-class compile specialization identity.
+
+    Owned by the backend compiler; the autotuner uses it as a cache key
+    and emits it through the plugin system so plugins can inspect compile
+    events.
+
+    Attributes:
+        version_hash: Content hash of the kernel source + flags.
+        config: The kernel configuration for this compilation.
+        constexpr_sizes: Problem-size values baked in at compile time.
+        backend_keys: Backend-specific axes that affect the artifact
+            (e.g. NVRTC options, target arch flags).
+    """
+
+    version_hash: str
+    config: "KernelConfig"
+    constexpr_sizes: frozenset  # frozenset[tuple[str, int]]
+    backend_keys: frozenset     # frozenset[tuple[str, Any]]
+
+    @property
+    def cache_key(self) -> tuple:
+        """Stable hashable cache key for this compilation."""
+        import json
+        config_key = json.dumps(self.config.params, sort_keys=True)
+        return (self.version_hash, config_key, self.constexpr_sizes, self.backend_keys)
+
+
+# ---------------------------------------------------------------------------
 # Search space — used by Strategy and Autotuner
 # ---------------------------------------------------------------------------
 
@@ -302,6 +335,40 @@ class CompileOptions:
 
     extra_flags: dict[str, Any] = field(default_factory=dict)
     optimization_level: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Launch plan (backend-owned, opaque to the pipeline)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LaunchRequest:
+    """Backend-owned launch plan produced by ``Runner.make_launch_request``.
+
+    The pipeline and profiler treat this object as opaque — they pass it
+    directly to ``Runner.run`` without inspecting its contents.
+
+    Attributes:
+        compiled: The compiled kernel artifact.
+        args: Fully packed kernel arguments (backend-specific encoding,
+            e.g. CuPy arrays for CUDA, torch tensors for Triton).
+        grid: Grid dimensions (number of thread blocks per axis).
+        block: Block dimensions (threads per block).  ``None`` means the
+            backend manages block dimensions internally (e.g. Triton via
+            ``num_warps``).
+        shared_mem: Dynamic shared memory in bytes (CUDA only).
+        output_indices: Indices into ``args`` that are output buffers.
+        metadata: Backend-specific extras (e.g. ``config_params`` for
+            Triton keyword args, ``torch_inputs`` for output extraction).
+    """
+
+    compiled: "CompiledKernel"
+    args: tuple
+    grid: tuple[int, ...]
+    block: tuple[int, ...] | None
+    shared_mem: int
+    output_indices: list[int]
+    metadata: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------

@@ -32,10 +32,9 @@ kernel_pipeline_backend/
 │   ├── profiler.py          # Profiler — single-point benchmarker (warmup + profiling cycles)
 │   ├── autotuner.py         # Autotuner — strategy loop orchestrator
 │   ├── strategy.py          # Strategy protocol + built-in strategies
-│   ├── instrument/          # Instrument protocol (compile-time transform + paired observer)
-│   │   └── instrument.py    # Instrument protocol
-│   └── observer/            # Observer protocol + built-in observers
-│       ├── observer.py      # Observer protocol
+│   ├── instrument/          # InstrumentationPass protocol + base class
+│   │   └── pass_.py         # InstrumentationPass protocol, BaseInstrumentationPass
+│   └── observer/            # Built-in InstrumentationPass implementations
 │       ├── timing.py        # TimingObserver (wall-clock timing)
 │       ├── ncu.py           # NCUObserver (Nsight Compute, run_once)
 │       └── memory.py        # MemoryObserver (peak memory tracking)
@@ -230,10 +229,37 @@ class Compiler(Protocol):
         Config structure is backend-specific."""
         ...
 
-    def compile(self, spec: KernelSpec, config: KernelConfig) -> CompiledKernel:
+    def compile(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompiledKernel:
         """Compile source + config into a runnable artifact.
         Returns an opaque CompiledKernel the Runner knows how to invoke."""
         ...
+
+    def compile_identity(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None = None,
+    ) -> CompileIdentity:
+        """Return the first-class compile specialization identity for this
+        (spec, config, constexpr_sizes) triple.  Used as the compile cache
+        key and emitted in compile events."""
+        ...
+
+@dataclass(frozen=True)
+class CompileIdentity:
+    """First-class compile specialization identity (ADR-0015, Stage 2)."""
+    version_hash: str
+    config: KernelConfig
+    constexpr_sizes: frozenset[tuple[str, int]]
+    backend_keys: frozenset[tuple[str, Any]]  # backend-specific axes
+
+    @property
+    def cache_key(self) -> tuple: ...
 
 @dataclass
 class CompiledKernel:
@@ -250,27 +276,44 @@ class CompiledKernel:
 class Runner(Protocol):
     """Executes a compiled kernel on a device.
 
-    Grid computation is the caller's responsibility — typically the
-    autotuner calls spec.grid_generator(sizes, config) and passes
-    the resulting GridResult here.  This keeps runners free of
-    framework-agnostic grid logic.
+    The runner owns launch realization — grid computation, argument packing,
+    and output identification are all backend-internal (ADR-0015, Stage 1).
     """
 
-    def run(
+    def make_launch_request(
         self,
         compiled: CompiledKernel,
         inputs: list[torch.Tensor],
-        device: DeviceHandle,
-        grid: GridResult,
+        sizes: dict[str, int],
+        config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
-    ) -> RunResult:
-        """Launch the kernel and return outputs + timing.
+    ) -> LaunchRequest:
+        """Assemble the fully resolved backend launch plan.
 
-        grid:       Pre-computed launch dimensions from grid_generator.
-        extra_args: Additional scalar arguments (e.g. array lengths)
-                    appended after tensor inputs at launch time.
+        Handles grid computation, argument packing, shared_mem lookup,
+        and output index identification internally.  The caller treats
+        the result as opaque.
         """
         ...
+
+    def run(
+        self,
+        launch: LaunchRequest,
+        device: DeviceHandle,
+    ) -> RunResult:
+        """Execute the launch plan and return outputs + timing."""
+        ...
+
+@dataclass(frozen=True)
+class LaunchRequest:
+    """Backend-owned launch plan.  Opaque to the pipeline (ADR-0015, Stage 1)."""
+    compiled: CompiledKernel
+    args: tuple[Any, ...]           # fully packed kernel arguments
+    grid: tuple[int, ...]
+    block: tuple[int, ...] | None   # None = backend manages (Triton)
+    shared_mem: int
+    output_indices: list[int]       # which input positions are outputs
+    metadata: dict[str, Any]        # backend-specific (num_warps, etc.)
 ```
 
 ### `core/registry.py` — Backend Registry
@@ -362,9 +405,9 @@ autotuning.
 │  Flow (single point):                               │
 │    inputs   = problem.initialize(sizes)             │
 │    expected = problem.reference(inputs)             │
-│    grid     = spec.grid_generator(sizes, config)    │
-│    actual   = runner.run(compiled, inputs, device,  │
-│                          grid).outputs              │
+│    launch   = runner.make_launch_request(           │
+│                 compiled, inputs, sizes, config)    │
+│    actual   = runner.run(launch, device).outputs    │
 │    compare(expected, actual, atol, rtol)            │
 │                                                     │
 │  Output: VerificationResult (pass/fail + details)   │
@@ -462,7 +505,7 @@ class Profiler:
         runner: Runner,
         device: DeviceHandle,
         backend: str,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         warmup_cycles: int = 1,
         profiling_cycles: int = 5,
     ): ...
@@ -525,12 +568,15 @@ class Autotuner:
         self,
         spec: KernelSpec,
         space: SearchSpace,
-        compiled_map: dict[str, CompiledEntry],
+        compiler: Compiler,
+        configs: list[KernelConfig],
         problem: Problem,
         strategy: Strategy,
         *,
-        existing_results: list[AutotuneResult],
+        existing_results: list[AutotuneResult] | None = None,
         skip_verify: bool = False,
+        skip_autotune: bool = False,
+        problem_name: str | None = None,
     ) -> AutotuneRunResult:
         """Execute the full autotune loop for a single kernel.
 
@@ -575,15 +621,30 @@ class TwoPhase(Strategy):
     def __init__(self, explore: Strategy, exploit: Strategy, top_k: int = 5): ...
 ```
 
-### `autotuner/observer/observer.py` — Observer Protocol
+### `autotuner/instrument/pass_.py` — InstrumentationPass Protocol
+
+Unified compile-time transform + runtime observation (ADR-0015, Stage 3).
+Replaces the separate `Instrument` and `Observer` protocols.
 
 ```python
-class Observer(Protocol):
-    """Collects custom metrics during autotuning kernel invocations.
+@runtime_checkable
+class InstrumentationPass(Protocol):
+    """Unified compile-time transform + runtime observation.
 
-    Two properties govern when and where the observer is invoked:
-    - supported_backends: restrict to specific backends (None = all)
-    - run_once: True for expensive profilers that need only one execution
+    Two properties govern execution semantics:
+
+    ``supported_backends``
+        None = all backends.  A tuple of strings restricts the pass.
+
+    ``run_once``
+        False (default) — participates in every profiling cycle.
+        True — runs in a dedicated isolated execution fork.  Use for
+        expensive tools (e.g. NCU) that replay the kernel internally.
+
+    Scope: transform hooks are **run_point-only**.  The autotuner loop
+    only calls setup/before_run/after_run/teardown — it does not invoke
+    any transform_* methods and raises ValueError if a pass overrides
+    them (ADR-0015).
     """
 
     @property
@@ -591,121 +652,73 @@ class Observer(Protocol):
     @property
     def run_once(self) -> bool: ...
 
+    # Compile-time transforms (run_point only)
+    def transform_compile_request(
+        self, spec: KernelSpec, config: KernelConfig,
+        constexpr_sizes: dict[str, int] | None,
+    ) -> tuple[KernelSpec, KernelConfig, dict[str, int] | None]: ...
+
+    def transform_compiled(self, compiled: CompiledKernel) -> CompiledKernel: ...
+
+    # Launch-time transform (run_point only)
+    def transform_launch_request(self, launch: LaunchRequest) -> LaunchRequest: ...
+
+    # Runtime observation (both autotuner loop and run_point)
     def setup(self, device: DeviceHandle) -> None: ...
-    def before_run(self, device: DeviceHandle, point: SearchPoint) -> None: ...
-    def after_run(self, device: DeviceHandle, point: SearchPoint) -> dict[str, Any]:
-        """Returns metric_name → value.  Values are typically float
-        (timing, occupancy) but may be other types for instrument-owned
-        observers (file paths, structured diagnostics)."""
-        ...
+    def before_run(self, device: DeviceHandle, point: SearchPoint,
+                   launch: LaunchRequest | None = None) -> None: ...
+    def after_run(self, device: DeviceHandle, point: SearchPoint,
+                  launch: LaunchRequest | None = None) -> dict[str, Any]: ...
     def teardown(self, device: DeviceHandle) -> None: ...
-```
 
-### `autotuner/observer/timing.py`
 
-```python
-class TimingObserver:
-    """Wall-clock timing via device synchronisation.
-    supported_backends = None, run_once = False."""
+class BaseInstrumentationPass:
+    """Base class with no-op implementations of all InstrumentationPass methods.
+    Subclass and override only what you need."""
     ...
 ```
 
-### `autotuner/observer/ncu.py`
+### Built-in passes — `autotuner/observer/`
 
 ```python
-class NCUObserver:
+class TimingObserver(BaseInstrumentationPass):
+    """Wall-clock timing via device synchronisation.
+    supported_backends = None, run_once = False."""
+    ...
+
+class NCUObserver(BaseInstrumentationPass):
     """Collects NCU profiling metrics (registers, shared mem, occupancy).
     supported_backends = None, run_once = True."""
     def __init__(self, metrics: list[str] | None = None): ...
-```
 
-### `autotuner/observer/memory.py`
-
-```python
-class MemoryObserver:
+class MemoryObserver(BaseInstrumentationPass):
     """Tracks peak GPU memory allocation during kernel execution.
     supported_backends = None, run_once = False."""
     ...
 ```
 
-### `autotuner/instrument/instrument.py` — Instrument Protocol
+### Pass scope and responsibility boundaries
 
-Instruments are user-supplied pluggable classes that span both compilation
-and execution (see [ADR-0012](adr/0012-single-point-execution.md)).  Unlike
-Observers which only hook into execution, Instruments participate in
-compilation by transforming the kernel source and/or flags *before* the
-Compiler sees them.
-
-Each Instrument contains an optional Observer that is automatically
-registered with the Profiler — this ensures compile-time instrumentation
-and runtime artifact capture are always enabled together.
-
-```python
-class Instrument(Protocol):
-    """User-supplied instrumentation spanning compilation and execution.
-
-    Transforms the kernel at compile time (source wrapping, flag
-    overrides) and optionally provides a paired Observer for runtime
-    artifact capture.
-
-    The Pipeline applies instruments before calling compiler.compile():
-      1. source = instrument.transform_source(source, spec)
-      2. flags  = instrument.transform_compile_flags(flags)
-      3. instrument.observer is auto-added to the Profiler's observer list
-    """
-
-    @property
-    def observer(self) -> Observer | None:
-        """Paired Observer for runtime artifact capture.
-        Automatically registered with the Profiler alongside any
-        explicitly-provided observers.  Returns None if this instrument
-        does not need runtime observation (e.g., pure flag overrides)."""
-        ...
-
-    def transform_source(self, source: Any, spec: KernelSpec) -> Any:
-        """Transform the kernel source before compilation.
-
-        Receives the full spec for context (backend, flags, etc.)
-        but returns only the modified source.  The Pipeline handles
-        creating a new spec with the modified source.
-
-        Return the source unmodified if no transformation is needed."""
-        ...
-
-    def transform_compile_flags(
-        self, flags: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Modify compilation flags before passing to the Compiler.
-
-        Called after CompileOptions.extra_flags have been merged.
-        Return the flags dict (possibly modified)."""
-        ...
-```
-
-### Instrument vs Observer vs CompileOptions
-
-| Mechanism | When to use | Compile-time | Runtime |
-|-----------|------------|-------------|---------|
-| **Observer** | Collect metrics around execution | No | Yes |
-| **CompileOptions** | Quick flag overrides (`-G`, `-O0`) | Flags only | No |
-| **Instrument** | Source transformation + artifact capture | Source + flags | Via contained Observer |
-
-### Responsibility boundaries
+| Hook | autotuner loop | run_point |
+|------|---------------|-----------|
+| `setup` / `teardown` | ✓ | ✓ |
+| `before_run` / `after_run` | ✓ | ✓ |
+| `transform_compile_request` | ✗ (raises if overridden) | ✓ regular passes |
+| `transform_compiled` | ✗ (raises if overridden) | ✓ regular passes |
+| `transform_launch_request` | ✗ (raises if overridden) | ✓ regular passes |
 
 ```
 Pipeline.run_point()
       │
       │ 1. Merge CompileOptions.extra_flags
-      │ 2. For each Instrument:
-      │    a. transform_source()  → modified source
-      │    b. transform_compile_flags() → modified flags
-      │    c. collect instrument.observer
+      │ 2. For each regular (non-run_once) pass:
+      │    transform_compile_request() → (spec, config, constexpr_sizes)
       │
       ▼
-compiler.compile(modified_spec, config)   ◄── unchanged protocol
+compiler.compile(modified_spec, config)
       │
       ▼
-Profiler  with  observers = explicit + instrument-owned
+Profiler  with  passes = all InstrumentationPass instances
       │
       ▼
 PointResult

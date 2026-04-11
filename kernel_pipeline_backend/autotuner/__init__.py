@@ -27,12 +27,14 @@ from kernel_pipeline_backend.autotuner.strategy import (
     TwoPhase,
 )
 from kernel_pipeline_backend.autotuner.observer import (
-    Observer,
     TimingObserver,
     NCUObserver,
     MemoryObserver,
 )
-from kernel_pipeline_backend.autotuner.instrument import Instrument
+from kernel_pipeline_backend.autotuner.instrument import (
+    BaseInstrumentationPass,
+    InstrumentationPass,
+)
 
 __all__ = [
     "Autotuner",
@@ -46,9 +48,9 @@ __all__ = [
     "BayesianOptimization",
     "DualAnnealing",
     "TwoPhase",
-    "Observer",
     "TimingObserver",
     "NCUObserver",
     "MemoryObserver",
-    "Instrument",
+    "BaseInstrumentationPass",
+    "InstrumentationPass",
 ]

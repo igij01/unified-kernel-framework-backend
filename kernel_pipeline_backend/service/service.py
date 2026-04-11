@@ -33,8 +33,7 @@ from kernel_pipeline_backend.plugin.manager import PluginManager
 from kernel_pipeline_backend.registry import Registry
 
 if TYPE_CHECKING:
-    from kernel_pipeline_backend.autotuner.instrument import Instrument
-    from kernel_pipeline_backend.autotuner.observer import Observer
+    from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
     from kernel_pipeline_backend.autotuner.strategy import Strategy
     from kernel_pipeline_backend.core.types import SearchPoint
     from kernel_pipeline_backend.device.device import DeviceHandle
@@ -117,7 +116,7 @@ class TuneService:
         store: ResultStore,
         *,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
     ) -> None:
         """Initialise the service with shared resources and defaults.
@@ -127,7 +126,7 @@ class TuneService:
             store: Result store for persisting autotune results.
             strategy: Default search strategy.  Falls back to
                 ``Exhaustive()`` if not provided.
-            observers: Default observers.  Falls back to
+            passes: Default instrumentation passes.  Falls back to
                 ``[TimingObserver()]`` if not provided.
             plugins: Default plugins.  Falls back to ``[]`` if not
                 provided.
@@ -135,7 +134,7 @@ class TuneService:
         self._device = device
         self._store = store
         self._default_strategy = strategy
-        self._default_observers = observers
+        self._default_passes = passes
         self._default_plugins = plugins
 
     # ------------------------------------------------------------------
@@ -160,21 +159,21 @@ class TuneService:
         from kernel_pipeline_backend.autotuner.strategy import Exhaustive
         return Exhaustive()
 
-    def _resolve_observers(
-        self, override: list[Observer] | None,
-    ) -> list[Observer]:
-        """Return per-request observers, service default, or [TimingObserver].
+    def _resolve_passes(
+        self, override: list[InstrumentationPass] | None,
+    ) -> list[InstrumentationPass]:
+        """Return per-request passes, service default, or [TimingObserver].
 
         Args:
             override: Caller-supplied override, or ``None``.
 
         Returns:
-            The observer list to use for this request.
+            The instrumentation pass list to use for this request.
         """
         if override is not None:
             return override
-        if self._default_observers is not None:
-            return list(self._default_observers)
+        if self._default_passes is not None:
+            return list(self._default_passes)
         from kernel_pipeline_backend.autotuner.observer import TimingObserver
         return [TimingObserver()]
 
@@ -254,7 +253,7 @@ class TuneService:
         *,
         problem: str | None = None,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
         force: bool = False,
         skip_verify: bool = False,
@@ -280,7 +279,8 @@ class TuneService:
                 ``None``, uses the first linked problem or skips
                 verification.
             strategy: Override the service-level default strategy.
-            observers: Override the service-level default observers.
+            passes: Override the service-level default instrumentation
+                passes.
             plugins: Override the service-level default plugins.
             force: If ``True``, reprocess even if cached.
             skip_verify: If ``True``, skip verification.
@@ -311,7 +311,7 @@ class TuneService:
             skip_verify = True
 
         resolved_strategy = self._resolve_strategy(strategy)
-        resolved_observers = self._resolve_observers(observers)
+        resolved_passes = self._resolve_passes(passes)
         resolved_plugins = self._resolve_plugins(plugins)
 
         pm = await self._build_plugin_manager(resolved_plugins)
@@ -321,7 +321,7 @@ class TuneService:
                 kernels=[spec],
                 problem=problem_obj,
                 strategy=resolved_strategy,
-                observers=resolved_observers,
+                passes=resolved_passes,
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
@@ -341,7 +341,7 @@ class TuneService:
         problem_name: str,
         *,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
         force: bool = False,
         skip_verify: bool = False,
@@ -394,7 +394,7 @@ class TuneService:
             )
 
         resolved_strategy = self._resolve_strategy(strategy)
-        resolved_observers = self._resolve_observers(observers)
+        resolved_passes = self._resolve_passes(passes)
         resolved_plugins = self._resolve_plugins(plugins)
 
         pm = await self._build_plugin_manager(resolved_plugins)
@@ -404,7 +404,7 @@ class TuneService:
                 kernels=specs,
                 problem=problem_obj,
                 strategy=resolved_strategy,
-                observers=resolved_observers,
+                passes=resolved_passes,
                 force=force,
                 skip_verify=skip_verify,
                 skip_autotune=skip_autotune,
@@ -423,7 +423,7 @@ class TuneService:
         self,
         *,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
         force: bool = False,
         skip_verify: bool = False,
@@ -475,7 +475,7 @@ class TuneService:
                     result = await self.tune_problem(
                         problem_name,
                         strategy=strategy,
-                        observers=observers,
+                        passes=passes,
                         plugins=plugins,
                         force=force,
                         skip_verify=skip_verify,
@@ -490,7 +490,7 @@ class TuneService:
                             kname,
                             problem=problem_name,
                             strategy=strategy,
-                            observers=observers,
+                            passes=passes,
                             plugins=plugins,
                             force=force,
                             skip_verify=skip_verify,
@@ -506,8 +506,7 @@ class TuneService:
         point: SearchPoint,
         *,
         problem: str | None = None,
-        observers: list[Observer] | None = None,
-        instruments: list[Instrument] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         compile_options: CompileOptions | None = None,
         verify: bool = True,
         profile: bool = True,
@@ -533,8 +532,9 @@ class TuneService:
             point: The (sizes, config) pair to evaluate.
             problem: Override which problem to use.  If ``None``, uses
                 the first linked problem or skips verify/profile.
-            observers: Override the service-level default observers.
-            instruments: Instruments to apply before compilation.
+            passes: :class:`InstrumentationPass` instances.  Regular
+                passes have their compile-time transforms applied;
+                all passes observe the profiling run.
             compile_options: Extra flags / optimization level overrides.
             verify: Whether to run verification.
             profile: Whether to run profiling.
@@ -564,7 +564,6 @@ class TuneService:
         else:
             verify = False
 
-        resolved_observers = self._resolve_observers(observers)
         resolved_plugins = self._resolve_plugins(None)
 
         pm = await self._build_plugin_manager(resolved_plugins)
@@ -574,9 +573,8 @@ class TuneService:
                 spec,
                 point,
                 problem_obj,
-                resolved_observers,
                 problem_name=problem_name,
-                instruments=instruments,
+                passes=passes,
                 compile_options=compile_options,
                 verify=verify,
                 profile=profile,

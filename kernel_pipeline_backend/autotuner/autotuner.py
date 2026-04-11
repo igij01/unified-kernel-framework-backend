@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from kernel_pipeline_backend.autotuner.instrument.pass_ import BaseInstrumentationPass, InstrumentationPass
 from kernel_pipeline_backend.autotuner.profiler import Profiler
 from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import (
@@ -95,6 +96,22 @@ class AutotuneRunResult:
 # ---------------------------------------------------------------------------
 
 
+def _pass_has_transforms(p: object) -> bool:
+    """Return True if *p* overrides any transform method from BaseInstrumentationPass.
+
+    Only meaningful for subclasses of ``BaseInstrumentationPass``; other
+    objects are assumed transform-free (they cannot be introspected).
+    """
+    if not isinstance(p, BaseInstrumentationPass):
+        return False
+    base = BaseInstrumentationPass
+    return (
+        type(p).transform_compile_request is not base.transform_compile_request
+        or type(p).transform_compiled is not base.transform_compiled
+        or type(p).transform_launch_request is not base.transform_launch_request
+    )
+
+
 def _config_key(config: object) -> str:
     """Deterministic string key for a KernelConfig."""
     return json.dumps(config.params, sort_keys=True, default=str)  # type: ignore[attr-defined]
@@ -104,10 +121,6 @@ def _sizes_key(sizes: dict[str, int]) -> str:
     """Deterministic string key for a sizes dict."""
     return json.dumps(sizes, sort_keys=True)
 
-
-def _compile_cache_key(config: KernelConfig, constexpr_sizes: dict[str, int]) -> tuple:
-    """Cache key for a (config, constexpr_sizes) compilation."""
-    return (_config_key(config), frozenset(constexpr_sizes.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +230,19 @@ class Autotuner:
         """
         result = AutotuneRunResult()
         existing = list(existing_results) if existing_results else []
+
+        # Guard: transform hooks are run_point-only.  Raise early so the
+        # caller is notified rather than silently skipping transforms.
+        for p in self._profiler._observers:
+            if _pass_has_transforms(p):
+                raise ValueError(
+                    f"Pass {type(p).__name__!r} overrides one or more transform "
+                    "methods (transform_compile_request, transform_compiled, or "
+                    "transform_launch_request) but was registered on an autotuner "
+                    "session.  Transform hooks are run_point-only.  Use "
+                    "Pipeline.run_point() for passes that need to transform the "
+                    "compile or launch path."
+                )
 
         # Set up profiler (observer validation + initialisation)
         if not skip_autotune:
@@ -338,7 +364,10 @@ class Autotuner:
                 )
 
                 # -- JIT Compile (with cache) ----------------------------
-                cache_key = _compile_cache_key(point.config, constexpr_sizes)
+                identity = compiler.compile_identity(
+                    spec, point.config, constexpr_sizes or None
+                )
+                cache_key = identity.cache_key
                 if cache_key in failed_compile_keys:
                     continue  # already failed, skip silently
 
@@ -346,7 +375,7 @@ class Autotuner:
                 if compiled is None:
                     await self._emit(
                         EVENT_COMPILE_START,
-                        {"spec": spec, "config": point.config},
+                        {"spec": spec, "config": point.config, "identity": identity},
                     )
                     try:
                         compiled = compiler.compile(
@@ -357,7 +386,7 @@ class Autotuner:
                         compile_cache[cache_key] = compiled
                         await self._emit(
                             EVENT_COMPILE_COMPLETE,
-                            {"spec": spec, "compiled": compiled},
+                            {"spec": spec, "compiled": compiled, "identity": identity},
                         )
                     except CompilationError as exc:
                         failed_compile_keys.add(cache_key)

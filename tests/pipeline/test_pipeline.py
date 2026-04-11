@@ -361,16 +361,14 @@ class TestAutotuning:
         """Runner failure during autotune is recorded but doesn't crash."""
         call_count = 0
 
-        class FailOnceRunner:
-            def run(self, compiled, inputs, device, grid, extra_args=()):
+        class FailOnceRunner(FakeRunner):
+            def run(self, launch, device):
                 nonlocal call_count
                 call_count += 1
                 # Fail on first profiling run
                 if call_count == 2:  # warmup=1, first profile=2
                     raise RuntimeError("GPU error")
-                return FakeRunner().run(
-                    compiled, inputs, device, grid, extra_args,
-                )
+                return super().run(launch, device)
 
         problem = FakeProblem(sizes={"M": [128]})
         compiler = FakeCompiler(

@@ -22,10 +22,11 @@ from kernel_pipeline_backend.plugin.plugin import (
     EVENT_COMPILE_START,
 )
 
+from kernel_pipeline_backend.autotuner.instrument import BaseInstrumentationPass
+
 from .conftest import (
     FakeCompiler,
     FakeDeviceHandle,
-    FakeInstrument,
     FakeProblem,
     FakeResultStore,
     FakeRunner,
@@ -39,8 +40,8 @@ from .conftest import (
 # ---------------------------------------------------------------------------
 
 
-class _FakeObserver:
-    """Observer that records its lifecycle calls and returns a fixed metric."""
+class _FakeObserver(BaseInstrumentationPass):
+    """InstrumentationPass that records lifecycle calls and returns a fixed metric."""
 
     def __init__(self, metric_name: str = "custom", metric_value: Any = 42.0) -> None:
         self._metric_name = metric_name
@@ -49,21 +50,10 @@ class _FakeObserver:
         self.teardown_called = False
         self.after_run_calls = 0
 
-    @property
-    def supported_backends(self) -> None:
-        return None
-
-    @property
-    def run_once(self) -> bool:
-        return False
-
     def setup(self, device: Any) -> None:
         self.setup_called = True
 
-    def before_run(self, device: Any, point: Any) -> None:
-        pass
-
-    def after_run(self, device: Any, point: Any) -> dict[str, Any]:
+    def after_run(self, device: Any, point: Any, launch: Any = None) -> dict[str, Any]:
         self.after_run_calls += 1
         return {self._metric_name: self._metric_value}
 
@@ -281,49 +271,37 @@ class TestRunPointCompileOptions:
 # ---------------------------------------------------------------------------
 
 
-class TestRunPointInstrumentSourceTransform:
-    """Instruments transform the source before it reaches the compiler."""
+class TestRunPointPassCompileTransform:
+    """Regular passes transform the compile request before compilation."""
 
-    async def test_instrument_source_reaches_compiler(self) -> None:
+    async def test_pass_source_transform_reaches_compiler(self) -> None:
         compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
         pipeline = _make_pipeline(compiler=compiler)
+        from dataclasses import replace as dc_replace
 
-        class _PrefixInstrument:
-            @property
-            def observer(self) -> None:
-                return None
-
-            def transform_source(self, source: Any, spec: Any) -> str:
-                return f"/* prefixed */ {source}"
-
-            def transform_compile_flags(self, flags: dict) -> dict:
-                return flags
+        class _PrefixPass(BaseInstrumentationPass):
+            def transform_compile_request(self, spec, config, constexpr_sizes):
+                return dc_replace(spec, source=f"/* prefixed */ {spec.source}"), config, constexpr_sizes
 
         await pipeline.run_point(
             make_spec(), _make_point(), None,
-            instruments=[_PrefixInstrument()],
+            passes=[_PrefixPass()],
         )
 
         assert compiler.last_compiled_spec is not None
         assert "/* prefixed */" in str(compiler.last_compiled_spec.source)
 
-    async def test_multiple_instruments_applied_in_order(self) -> None:
+    async def test_multiple_passes_applied_in_order(self) -> None:
         compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
         pipeline = _make_pipeline(compiler=compiler)
+        from dataclasses import replace as dc_replace
 
-        class _AppendInstrument:
+        class _AppendPass(BaseInstrumentationPass):
             def __init__(self, suffix: str) -> None:
                 self._suffix = suffix
 
-            @property
-            def observer(self) -> None:
-                return None
-
-            def transform_source(self, source: Any, spec: Any) -> str:
-                return f"{source}_{self._suffix}"
-
-            def transform_compile_flags(self, flags: dict) -> dict:
-                return flags
+            def transform_compile_request(self, spec, config, constexpr_sizes):
+                return dc_replace(spec, source=f"{spec.source}_{self._suffix}"), config, constexpr_sizes
 
         spec = make_spec()
         from dataclasses import replace
@@ -331,42 +309,40 @@ class TestRunPointInstrumentSourceTransform:
 
         await pipeline.run_point(
             spec, _make_point(), None,
-            instruments=[_AppendInstrument("A"), _AppendInstrument("B")],
+            passes=[_AppendPass("A"), _AppendPass("B")],
         )
 
         assert compiler.last_compiled_spec.source == "base_A_B"
 
 
 # ---------------------------------------------------------------------------
-# Instrument observer auto-registration
+# Pass observation during profiling
 # ---------------------------------------------------------------------------
 
 
-class TestRunPointInstrumentObserver:
-    """Instrument-owned observers are appended and participate in profiling."""
+class TestRunPointPassObservation:
+    """Passes observe the profiling run via setup/before_run/after_run/teardown."""
 
-    async def test_instrument_observer_setup_and_teardown_called(self) -> None:
+    async def test_pass_setup_and_teardown_called(self) -> None:
         pipeline = _make_pipeline()
         obs = _FakeObserver(metric_name="inst_metric")
-        inst = FakeInstrument(observer=obs)
 
         await pipeline.run_point(
             make_spec(), _make_point(), FakeProblem(),
-            instruments=[inst],
+            passes=[obs],
             profile=True,
         )
 
         assert obs.setup_called
         assert obs.teardown_called
 
-    async def test_instrument_observer_metrics_in_profile_result(self) -> None:
+    async def test_pass_metrics_in_profile_result(self) -> None:
         pipeline = _make_pipeline()
         obs = _FakeObserver(metric_name="inst_metric", metric_value=7.0)
-        inst = FakeInstrument(observer=obs)
 
         result = await pipeline.run_point(
             make_spec(), _make_point(), FakeProblem(),
-            instruments=[inst],
+            passes=[obs],
             profile=True,
         )
 
@@ -418,19 +394,14 @@ class TestRunPointPluginEvents:
         pipeline = _make_pipeline(compiler=compiler, plugins=pm)
         spec = make_spec()
 
-        class _SourceMutator:
-            @property
-            def observer(self) -> None:
-                return None
+        from dataclasses import replace as dc_replace
 
-            def transform_source(self, source: Any, s: Any) -> str:
-                return "modified_source"
-
-            def transform_compile_flags(self, flags: dict) -> dict:
-                return flags
+        class _SourceMutator(BaseInstrumentationPass):
+            def transform_compile_request(self, s, config, constexpr_sizes):
+                return dc_replace(s, source="modified_source"), config, constexpr_sizes
 
         await pipeline.run_point(
-            spec, _make_point(), None, instruments=[_SourceMutator()]
+            spec, _make_point(), None, passes=[_SourceMutator()]
         )
 
         start_event = next(
@@ -472,10 +443,12 @@ class TestRunPointBindingResolution:
 
         received_extra_args: list = []
 
-        class CapturingRunner:
-            def run(self, compiled, inputs, device, grid, extra_args=()):
-                received_extra_args.append(tuple(extra_args))
-                return type("R", (), {"outputs": list(inputs), "time_ms": 1.0, "metrics": {}})()
+        class CapturingRunner(FakeRunner):
+            def run(self, launch, device):
+                torch_inputs = launch.metadata["torch_inputs"]
+                extra = launch.args[len(torch_inputs):]
+                received_extra_args.append(tuple(extra))
+                return super().run(launch, device)
 
         Registry.clear()
         try:
@@ -525,10 +498,7 @@ class TestRunPointBindingResolution:
 
         captured_constexpr: list[dict] = []
 
-        class CapturingCompiler:
-            backend_name = "fake"
-            def generate_configs(self, spec):
-                return [KernelConfig(params={"BS": 64})]
+        class CapturingCompiler(FakeCompiler):
             def compile(self, spec, config, constexpr_sizes=None):
                 captured_constexpr.append(dict(constexpr_sizes or {}))
                 from kernel_pipeline_backend.core.types import CompiledKernel
@@ -568,10 +538,12 @@ class TestRunPointBindingResolution:
         """When problem_name is not provided, no extra_args are passed."""
         received: list = []
 
-        class CapturingRunner:
-            def run(self, compiled, inputs, device, grid, extra_args=()):
-                received.append(extra_args)
-                return type("R", (), {"outputs": list(inputs), "time_ms": 1.0, "metrics": {}})()
+        class CapturingRunner(FakeRunner):
+            def run(self, launch, device):
+                torch_inputs = launch.metadata["torch_inputs"]
+                extra = launch.args[len(torch_inputs):]
+                received.append(extra)
+                return super().run(launch, device)
 
         pipeline = _make_pipeline(runner=CapturingRunner())
         await pipeline.run_point(
