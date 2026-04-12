@@ -32,6 +32,28 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WARMUP_CYCLES = 1
 _DEFAULT_PROFILING_CYCLES = 5
 
+_TRANSFORM_METHODS = (
+    "transform_compile_request",
+    "transform_compiled",
+    "transform_launch_request",
+)
+
+
+def _has_transform_overrides(obs: Any) -> bool:
+    """Return True if *obs* overrides any compile/launch transform method.
+
+    Only checks passes that subclass :class:`BaseInstrumentationPass` —
+    plain protocol implementors are not inspected (they should use
+    ``Pipeline.run_point`` directly).
+    """
+    if not isinstance(obs, BaseInstrumentationPass):
+        return False
+    cls = type(obs)
+    return any(
+        getattr(cls, m) is not getattr(BaseInstrumentationPass, m)
+        for m in _TRANSFORM_METHODS
+    )
+
 
 class IncompatibleObserverError(Exception):
     """Raised when an observer is not compatible with the profiler's backend."""
@@ -45,7 +67,9 @@ class Profiler:
     1. Initialises problem inputs for the requested sizes.
     2. Runs the kernel for :attr:`warmup_cycles` iterations (results
        discarded — lets caches and schedulers settle).
-    3. Runs ``run_once`` observers in a single dedicated kernel execution.
+    3. Runs each ``run_once`` observer in its own dedicated kernel execution
+       so that passes that capture hardware counters or modify device state
+       do not interfere with each other.
     4. Runs the kernel for :attr:`profiling_cycles` iterations, collecting
        wall-clock timing from the runner and metrics from regular observers.
     5. Averages the timings and regular-observer metrics across profiling
@@ -70,6 +94,8 @@ class Profiler:
         passes: list[InstrumentationPass] | None = None,
         warmup_cycles: int = _DEFAULT_WARMUP_CYCLES,
         profiling_cycles: int = _DEFAULT_PROFILING_CYCLES,
+        *,
+        validate_transforms: bool = True,
     ) -> None:
         """Initialise the profiler.
 
@@ -84,6 +110,12 @@ class Profiler:
             warmup_cycles: Number of untimed kernel runs before profiling.
             profiling_cycles: Number of timed kernel runs whose results
                 are averaged into the final ``AutotuneResult``.
+            validate_transforms: If ``True`` (the default), :meth:`setup`
+                raises :class:`IncompatibleObserverError` for any pass that
+                overrides transform methods.  Set to ``False`` when the
+                profiler is used by ``Pipeline.run_point``, which has
+                already applied transforms externally and forwards only
+                the observation surface to the profiler.
 
         Raises:
             ValueError: If ``warmup_cycles < 0`` or ``profiling_cycles < 1``.
@@ -99,6 +131,7 @@ class Profiler:
         self._observers: list[InstrumentationPass] = list(passes or [])
         self._warmup_cycles = warmup_cycles
         self._profiling_cycles = profiling_cycles
+        self._validate_transforms = validate_transforms
 
         # Partitioned at setup() time
         self._regular_observers: list[InstrumentationPass] = []
@@ -133,7 +166,10 @@ class Profiler:
         Raises:
             IncompatibleObserverError: If any observer's
                 ``supported_backends`` does not include this profiler's
-                backend.
+                backend, or if any observer overrides compile-time or
+                launch-time transform methods.  Transform hooks are
+                ``Pipeline.run_point``-only and must not be registered
+                on a profiler used by the autotuner loop.
         """
         for obs in self._observers:
             supported = obs.supported_backends
@@ -142,6 +178,15 @@ class Profiler:
                     f"{type(obs).__name__} supports backends "
                     f"{supported!r}, but profiler is configured "
                     f"for {self._backend!r}"
+                )
+            if self._validate_transforms and _has_transform_overrides(obs):
+                raise IncompatibleObserverError(
+                    f"{type(obs).__name__} overrides one or more transform "
+                    f"methods (transform_compile_request, transform_compiled, "
+                    f"transform_launch_request).  Transform hooks are "
+                    f"Pipeline.run_point-only and are never invoked in the "
+                    f"autotuner loop.  Use this pass via Pipeline.run_point "
+                    f"or remove the transform overrides."
                 )
 
         self._regular_observers = [o for o in self._observers if not o.run_once]
@@ -252,17 +297,16 @@ class Profiler:
         for _ in range(self._warmup_cycles):
             self._runner.run(launch, self._device)
 
-        # -- Run-once observers (single dedicated execution) -----------
+        # -- Run-once observers (each in its own isolated execution) ------
+        # Each run_once pass gets a dedicated kernel run so that passes
+        # that capture hardware counters (e.g. NCU) or modify device state
+        # do not interfere with each other or with the main profiling path.
         run_once_metrics: dict[str, Any] = {}
-        if self._run_once_observers:
-            for obs in self._run_once_observers:
-                obs.before_run(self._device, point, launch)
-
+        for obs in self._run_once_observers:
+            obs.before_run(self._device, point, launch)
             self._runner.run(launch, self._device)
-
-            run_once_metrics = self._collect_observer_metrics(
-                self._run_once_observers, point, launch=launch,
-            )
+            obs_metrics = self._collect_observer_metrics([obs], point, launch=launch)
+            run_once_metrics.update(obs_metrics)
 
         # -- Profiling (regular observers) -----------------------------
         timings: list[float] = []

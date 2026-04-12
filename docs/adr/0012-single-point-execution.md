@@ -4,6 +4,15 @@
 
 Proposed
 
+> **Partially superseded by ADR-0015 Stage 3.**  The separate `Instrument`
+> and `Observer` protocols defined here are unified into `InstrumentationPass`
+> in ADR-0015.  `Pipeline.run_point` and `TuneService.run_point` now accept
+> `passes: list[InstrumentationPass]` instead of separate `instruments` and
+> `observers` parameters.  The execution model also changed: `run_once` passes
+> each receive a fully isolated compile/launch fork rather than sharing a
+> single kernel execution.  The rest of the decision (the `run_point` entry
+> point, `PointResult` shape, `CompileOptions`) remains current.
+
 ## Context
 
 The current pipeline is designed for batch workflows: the user registers

@@ -62,7 +62,8 @@ class FakeRunner:
         extra_args: tuple[Any, ...] = (),
     ) -> LaunchRequest:
         self._last_extra_args = extra_args
-        grid_result = compiled.spec.grid_generator(sizes, compiled.config)
+        grid_fn = compiled.grid_generator or compiled.spec.grid_generator
+        grid_result = grid_fn(sizes, compiled.config)
         info = compiled.compile_info
         num_outputs: int = info.get("num_outputs", 1)
         n = len(inputs)
@@ -145,4 +146,4 @@ def make_compiled(
         version_hash=version_hash,
     )
     config = KernelConfig(params=params or {"BS": 64})
-    return CompiledKernel(spec=spec, config=config)
+    return CompiledKernel(spec=spec, config=config, grid_generator=noop_grid)

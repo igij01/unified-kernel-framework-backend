@@ -45,6 +45,8 @@ from .conftest import (
     make_spec,
 )
 
+pytestmark = pytest.mark.anyio
+
 
 # ---------------------------------------------------------------------------
 # Helpers

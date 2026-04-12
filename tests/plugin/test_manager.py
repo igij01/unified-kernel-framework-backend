@@ -9,6 +9,8 @@ import pytest
 from kernel_pipeline_backend.plugin.plugin import PipelineEvent, Plugin
 from kernel_pipeline_backend.plugin.manager import PluginManager
 
+pytestmark = pytest.mark.anyio
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,28 +81,28 @@ class _SlowPlugin(_TrackingPlugin):
 class TestRegister:
     """register() and unregister() manage the plugin registry."""
 
-    @pytest.mark.asyncio
+
     async def test_register_calls_startup(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin()
         await mgr.register(p)
         assert p.started is True
 
-    @pytest.mark.asyncio
+
     async def test_register_adds_to_plugins(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="my_plugin")
         await mgr.register(p)
         assert "my_plugin" in mgr.plugins
 
-    @pytest.mark.asyncio
+
     async def test_duplicate_name_raises(self) -> None:
         mgr = PluginManager()
         await mgr.register(_TrackingPlugin(name="dup"))
         with pytest.raises(ValueError, match="dup"):
             await mgr.register(_TrackingPlugin(name="dup"))
 
-    @pytest.mark.asyncio
+
     async def test_unregister_calls_shutdown(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="rm_me")
@@ -108,14 +110,14 @@ class TestRegister:
         await mgr.unregister("rm_me")
         assert p.shut_down is True
 
-    @pytest.mark.asyncio
+
     async def test_unregister_removes_from_plugins(self) -> None:
         mgr = PluginManager()
         await mgr.register(_TrackingPlugin(name="rm_me"))
         await mgr.unregister("rm_me")
         assert "rm_me" not in mgr.plugins
 
-    @pytest.mark.asyncio
+
     async def test_unregister_unknown_raises_key_error(self) -> None:
         mgr = PluginManager()
         with pytest.raises(KeyError):
@@ -130,7 +132,7 @@ class TestRegister:
 class TestEmitNonCritical:
     """Non-critical plugins receive events as background tasks."""
 
-    @pytest.mark.asyncio
+
     async def test_event_delivered(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="nc", critical=False)
@@ -142,7 +144,7 @@ class TestEmitNonCritical:
         assert len(p.events) == 1
         assert p.events[0].event_type == "hello"
 
-    @pytest.mark.asyncio
+
     async def test_multiple_events_delivered_in_order(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="nc")
@@ -154,7 +156,7 @@ class TestEmitNonCritical:
 
         assert [e.event_type for e in p.events] == [f"e{i}" for i in range(5)]
 
-    @pytest.mark.asyncio
+
     async def test_failure_does_not_propagate(self) -> None:
         mgr = PluginManager()
         p = _FailingPlugin(name="bad", critical=False)
@@ -163,7 +165,7 @@ class TestEmitNonCritical:
         await mgr.emit(_event("boom"))
         await mgr.await_plugins()  # should not raise
 
-    @pytest.mark.asyncio
+
     async def test_failure_does_not_block_other_plugins(self) -> None:
         mgr = PluginManager()
         bad = _FailingPlugin(name="bad", critical=False)
@@ -185,7 +187,7 @@ class TestEmitNonCritical:
 class TestEmitCritical:
     """Critical plugins are awaited inline."""
 
-    @pytest.mark.asyncio
+
     async def test_critical_event_delivered(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="crit", critical=True)
@@ -196,7 +198,7 @@ class TestEmitCritical:
         assert len(p.events) == 1
         assert p.events[0].event_type == "important"
 
-    @pytest.mark.asyncio
+
     async def test_critical_failure_propagates(self) -> None:
         mgr = PluginManager()
         p = _FailingPlugin(name="crit_bad", critical=True)
@@ -205,7 +207,7 @@ class TestEmitCritical:
         with pytest.raises(RuntimeError, match="crit_bad"):
             await mgr.emit(_event("boom"))
 
-    @pytest.mark.asyncio
+
     async def test_mixed_critical_and_non_critical(self) -> None:
         mgr = PluginManager()
         crit = _TrackingPlugin(name="crit", critical=True)
@@ -229,7 +231,7 @@ class TestEmitCritical:
 class TestEmitMultiplePlugins:
     """Events are dispatched to all registered plugins."""
 
-    @pytest.mark.asyncio
+
     async def test_all_plugins_receive_event(self) -> None:
         mgr = PluginManager()
         plugins = [_TrackingPlugin(name=f"p{i}") for i in range(3)]
@@ -242,7 +244,7 @@ class TestEmitMultiplePlugins:
         for p in plugins:
             assert len(p.events) == 1
 
-    @pytest.mark.asyncio
+
     async def test_unregistered_plugin_does_not_receive(self) -> None:
         mgr = PluginManager()
         p1 = _TrackingPlugin(name="stay")
@@ -266,7 +268,7 @@ class TestEmitMultiplePlugins:
 class TestAwaitPlugins:
     """await_plugins() waits for all background tasks."""
 
-    @pytest.mark.asyncio
+
     async def test_waits_for_slow_plugin(self) -> None:
         mgr = PluginManager()
         p = _SlowPlugin(delay=0.05, name="slow")
@@ -278,12 +280,12 @@ class TestAwaitPlugins:
         # Now it must be delivered
         assert len(p.events) == 1
 
-    @pytest.mark.asyncio
+
     async def test_noop_when_no_tasks(self) -> None:
         mgr = PluginManager()
         await mgr.await_plugins()  # should not raise
 
-    @pytest.mark.asyncio
+
     async def test_clears_task_list(self) -> None:
         mgr = PluginManager()
         p = _TrackingPlugin(name="t")
@@ -303,7 +305,7 @@ class TestAwaitPlugins:
 class TestShutdownAll:
     """shutdown_all() shuts down all plugins and clears the registry."""
 
-    @pytest.mark.asyncio
+
     async def test_shutdown_calls_shutdown_on_all(self) -> None:
         mgr = PluginManager()
         plugins = [_TrackingPlugin(name=f"p{i}") for i in range(3)]
@@ -315,14 +317,14 @@ class TestShutdownAll:
         for p in plugins:
             assert p.shut_down is True
 
-    @pytest.mark.asyncio
+
     async def test_shutdown_clears_registry(self) -> None:
         mgr = PluginManager()
         await mgr.register(_TrackingPlugin(name="p0"))
         await mgr.shutdown_all()
         assert mgr.plugins == {}
 
-    @pytest.mark.asyncio
+
     async def test_shutdown_waits_for_pending_tasks(self) -> None:
         mgr = PluginManager()
         p = _SlowPlugin(delay=0.05, name="slow")
@@ -335,7 +337,7 @@ class TestShutdownAll:
         assert len(p.events) == 1
         assert p.shut_down is True
 
-    @pytest.mark.asyncio
+
     async def test_shutdown_error_does_not_block_others(self) -> None:
         """One plugin failing shutdown doesn't prevent others."""
 

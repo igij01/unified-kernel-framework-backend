@@ -54,6 +54,8 @@ from .conftest import (
     make_spec,
 )
 
+pytestmark = pytest.mark.anyio
+
 
 # ---------------------------------------------------------------------------
 # Fakes local to autotuner orchestrator tests

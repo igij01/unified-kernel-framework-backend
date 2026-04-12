@@ -27,6 +27,8 @@ from kernel_pipeline_backend.device.device import DeviceInfo
 from kernel_pipeline_backend.registry import Registry
 from kernel_pipeline_backend.service import TuneService
 
+pytestmark = pytest.mark.anyio
+
 
 # ---------------------------------------------------------------------------
 # Fakes — reuse the same pattern as test_service.py

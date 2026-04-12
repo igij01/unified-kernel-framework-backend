@@ -217,4 +217,5 @@ class TritonCompiler:
             config=effective_config,
             artifact=kernel_fn,
             compile_info={},
+            grid_generator=spec.grid_generator,
         )

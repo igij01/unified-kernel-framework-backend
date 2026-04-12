@@ -232,9 +232,10 @@ Autotuning sessions only need the observation surface, which composes
 cleanly over the main profiling path without forking.
 
 A pass that defines `transform_compile_request`, `transform_compiled`,
-or `transform_launch_request` and is registered on an autotune run is
-not an error, but those methods are silently not invoked.  Passes that
-need the transform hooks should be used via `Pipeline.run_point`.
+or `transform_launch_request` (by overriding the no-op defaults in
+`BaseInstrumentationPass`) and is registered on an autotune run is an
+error: `Profiler.setup()` raises `IncompatibleObserverError`.  Passes
+that need the transform hooks must be used via `Pipeline.run_point`.
 
 #### Execution model: isolation by `run_once` (run_point only)
 
@@ -371,8 +372,12 @@ instrumentation pass.
 - Update `Profiler.profile`: replace `grid_generator` + `runner.run`
   calls with `make_launch_request` + `run`.
 - Update `Verifier.verify` similarly.
-- Move `grid_generator` from `KernelSpec` into backend-internal use
-  within `make_launch_request`.
+- Add `grid_generator: GridGenerator | None` to `CompiledKernel`.
+  Compilers copy `spec.grid_generator` into the returned artifact;
+  runners access it via `compiled.grid_generator` (falling back to
+  `compiled.spec.grid_generator` for backward compatibility during
+  migration).  `KernelSpec.grid_generator` is retained as the source
+  but is no longer the canonical access point for runners.
 - Update `Pipeline.run_point` to use new runner interface.
 
 ### Stage 2 (CompileIdentity)
@@ -400,20 +405,31 @@ instrumentation pass.
 - Update `Profiler` to accept `list[InstrumentationPass]` instead of
   `list[Observer]`.  Partition into regular and isolated passes at
   setup time.  The profiler calls `before_run`/`after_run` on each
-  iteration for regular passes, and once for `run_once` passes in a
-  dedicated execution against the same compiled artifact.  The
-  profiler does *not* call `transform_*` methods — those are reserved
-  for `Pipeline.run_point` (see the "Scope" section above).
+  iteration for regular passes, and runs each `run_once` pass in its
+  own dedicated kernel execution (separate `before_run` → `run` →
+  `after_run` cycle per pass).  The profiler does *not* call
+  `transform_*` methods — those are reserved for `Pipeline.run_point`
+  (see the "Scope" section above).  `Profiler` gains a
+  `validate_transforms: bool = True` init parameter; when `True`
+  (the default, used by the autotuner), `setup()` raises
+  `IncompatibleObserverError` for any pass that overrides a transform
+  method.  `Pipeline.run_point` creates its observation-only profiler
+  with `validate_transforms=False` because transforms are already
+  applied externally.
 - `Autotuner._run_strategy_loop` forwards passes to the profiler for
   observation.  It does not apply `transform_compile_request` /
   `transform_compiled` / `transform_launch_request` and does not run
   isolated compile forks — transforms and isolated forks are
-  `run_point`-only.
+  `run_point`-only.  `Profiler.setup()` raises `IncompatibleObserverError`
+  if any pass overrides a transform method, enforcing this boundary.
 - Update `Pipeline.run_point` to use `InstrumentationPass` instead of
   separate `Instrument` + `Observer` lists.  `run_point` is the
   entry point that applies the full transform pipeline (regular
   compile/launch transforms on the main path, plus isolated forks
-  for `run_once` passes with their own transforms).
+  for `run_once` passes with their own transforms).  Fork metrics are
+  returned in `PointResult.run_once_metrics`.
+- `PointResult` gains `run_once_metrics: dict[str, Any]` to carry
+  metrics collected from isolated fork executions.
 - Remove old `Instrument` and `Observer` protocols.
 
 ## Related Decisions

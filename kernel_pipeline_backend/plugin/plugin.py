@@ -33,17 +33,46 @@ class PipelineEvent:
         event_type: One of the EVENT_* constants above.
         timestamp: When the event was created.
         data: Event-specific payload. Contents depend on ``event_type``:
-            - kernel_discovered: {"spec": KernelSpec}
-            - compile_start: {"spec": KernelSpec, "config": KernelConfig}
-            - compile_complete: {"spec": KernelSpec, "config": KernelConfig, "compiled": CompiledKernel}
-            - compile_error: {"spec": KernelSpec, "config": KernelConfig, "error": Exception}
-            - verify_start: {"spec": KernelSpec}
-            - verify_complete: {"spec": KernelSpec, "result": VerificationResult}
-            - verify_fail: {"spec": KernelSpec, "result": VerificationResult}
-            - autotune_start: {"spec": KernelSpec, "space": SearchSpace}
-            - autotune_progress: {"spec": KernelSpec, "results": list[AutotuneResult]}
-            - autotune_complete: {"spec": KernelSpec, "results": list[AutotuneResult]}
-            - pipeline_complete: {"summary": PipelineResult}
+
+            ``kernel_discovered``
+                ``{"spec": KernelSpec}``
+
+            ``compile_start``
+                ``{"spec": KernelSpec, "config": KernelConfig,
+                   "identity": CompileIdentity}``
+                ``spec`` is the **original** (pre-transform) spec so
+                consumers always see the canonical kernel identity.
+                ``identity`` is the backend-owned compile specialization
+                key (config, constexpr_sizes, backend-specific axes).
+
+            ``compile_complete``
+                ``{"spec": KernelSpec, "config": KernelConfig,
+                   "compiled": CompiledKernel, "identity": CompileIdentity}``
+
+            ``compile_error``
+                ``{"spec": KernelSpec, "config": KernelConfig,
+                   "error": CompilationError}``
+
+            ``verify_start``
+                ``{"spec": KernelSpec}``
+
+            ``verify_complete``
+                ``{"spec": KernelSpec, "result": VerificationResult}``
+
+            ``verify_fail``
+                ``{"spec": KernelSpec, "result": VerificationResult}``
+
+            ``autotune_start``
+                ``{"spec": KernelSpec, "space": SearchSpace}``
+
+            ``autotune_progress``
+                ``{"spec": KernelSpec, "results": list[AutotuneResult]}``
+
+            ``autotune_complete``
+                ``{"spec": KernelSpec, "results": list[AutotuneResult]}``
+
+            ``pipeline_complete``
+                ``{"result": PipelineResult}``
     """
 
     event_type: str

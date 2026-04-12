@@ -204,6 +204,7 @@ class CUDACompiler:
             config=config,  # canonical tunable config, not merged
             artifact=kernel,
             compile_info=compile_info,
+            grid_generator=spec.grid_generator,
         )
 
     @staticmethod

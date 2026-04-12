@@ -115,7 +115,7 @@ class FakeCompiler:
             effective_config = KernelConfig(
                 params={**config.params, **constexpr_sizes}
             )
-        return CompiledKernel(spec=spec, config=effective_config)
+        return CompiledKernel(spec=spec, config=effective_config, grid_generator=spec.grid_generator)
 
 
 class FakeRunner:
@@ -139,7 +139,8 @@ class FakeRunner:
         config: KernelConfig,
         extra_args: tuple[Any, ...] = (),
     ) -> LaunchRequest:
-        grid_result = compiled.spec.grid_generator(sizes, compiled.config)
+        grid_fn = compiled.grid_generator or compiled.spec.grid_generator
+        grid_result = grid_fn(sizes, compiled.config)
         info = compiled.compile_info
         num_outputs: int = info.get("num_outputs", 1)
         n = len(inputs)

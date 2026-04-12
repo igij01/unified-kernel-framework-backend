@@ -256,12 +256,17 @@ class CompiledKernel:
         artifact: Backend-specific compiled object.
         compile_info: Metadata from compilation (register count, shared
             memory bytes, etc.).
+        grid_generator: Python callable that computes the launch grid from
+            problem sizes and config.  Copied from ``KernelSpec`` by the
+            compiler so that runners access it here rather than through
+            ``spec.grid_generator``.
     """
 
     spec: KernelSpec
     config: KernelConfig
     artifact: Any = None
     compile_info: dict[str, Any] = field(default_factory=dict)
+    grid_generator: GridGenerator | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +429,9 @@ class PointResult:
             no problem was provided.
         profile_result: Profiling result (AutotuneResult), or None if
             profile=False or no problem was provided.
+        run_once_metrics: Metrics collected from isolated forks executed
+            for each run_once pass.  Each pass compiles and runs its own
+            artifact independently; their metrics are merged here.
     """
 
     kernel_name: str = ""
@@ -432,3 +440,4 @@ class PointResult:
     compile_error: CompilationError | None = None
     verification: VerificationResult | None = None
     profile_result: AutotuneResult | None = None
+    run_once_metrics: dict[str, Any] = field(default_factory=dict)

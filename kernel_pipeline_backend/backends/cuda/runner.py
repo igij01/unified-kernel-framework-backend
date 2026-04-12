@@ -59,7 +59,8 @@ class CUDARunner:
         import cupy
 
         info = compiled.compile_info
-        grid_result = compiled.spec.grid_generator(sizes, config)
+        grid_fn = compiled.grid_generator or compiled.spec.grid_generator
+        grid_result = grid_fn(sizes, config)
         block = grid_result.block or (256,)
 
         # Convert tensors to CuPy arrays (zero-copy via DLPack) and

@@ -195,7 +195,7 @@ class CompileOptions:
 
     For flag-only adjustments that don't require source transformation
     or runtime artifact capture.  For more complex instrumentation
-    (source wrapping, artifact collection), use an Instrument instead.
+    (source wrapping, artifact collection), use an InstrumentationPass instead.
 
     Ephemeral — does not affect the kernel's identity (version hash).
     """
@@ -211,6 +211,7 @@ class PointResult:
     compile_error: CompilationError | None
     verification: VerificationResult | None  # None if verify=False
     profile_result: AutotuneResult | None    # None if profile=False
+    run_once_metrics: dict[str, Any]         # metrics from isolated run_once forks
 ```
 
 ### `core/compiler.py` — Compiler Protocol
@@ -486,7 +487,8 @@ Autotuner (strategy loop)                      Profiler (per-point)
 
 ```python
 class IncompatibleObserverError(Exception):
-    """Raised when an observer is not compatible with the profiler's backend."""
+    """Raised when a pass is not compatible with the profiler's backend,
+    or when a pass overrides transform methods in autotuner context."""
 
 class Profiler:
     """Benchmarks a single compiled kernel at a given size point.
@@ -494,7 +496,8 @@ class Profiler:
     For each profile() call the profiler:
     1. Initialises problem inputs for the requested sizes.
     2. Runs warmup cycles (results discarded).
-    3. Runs run_once observers in a single dedicated kernel execution.
+    3. Runs each run_once observer in its own dedicated kernel execution
+       (separate before_run → run → after_run per pass).
     4. Runs profiling cycles, collecting timing and regular observer metrics.
     5. Averages the timings and metrics, merges in run_once metrics.
     6. Returns a single AutotuneResult.
@@ -508,7 +511,13 @@ class Profiler:
         passes: list[InstrumentationPass] | None = None,
         warmup_cycles: int = 1,
         profiling_cycles: int = 5,
+        *,
+        validate_transforms: bool = True,
     ): ...
+    # validate_transforms=True (default, autotuner path): setup() raises
+    # IncompatibleObserverError for any pass that overrides transform methods.
+    # validate_transforms=False (Pipeline.run_point): transforms already
+    # applied externally; profiler only handles observation.
 
     @property
     def warmup_cycles(self) -> int: ...
@@ -520,7 +529,8 @@ class Profiler:
     def setup(self) -> None:
         """Validate observer-backend compatibility, initialise observers.
         Raises IncompatibleObserverError if any observer's
-        supported_backends does not include this backend."""
+        supported_backends does not include this backend, or if
+        validate_transforms=True and any pass overrides a transform method."""
         ...
 
     def teardown(self) -> None:
@@ -537,7 +547,7 @@ class Profiler:
 
         Execution order:
           1. Warmup cycles (untimed, no observer calls)
-          2. Single dedicated run for run_once observers (e.g. NCU)
+          2. Each run_once observer in its own isolated execution
           3. Profiling cycles with regular observers — timing averaged
           4. run_once metrics merged into result (not averaged)
         """
@@ -643,8 +653,9 @@ class InstrumentationPass(Protocol):
 
     Scope: transform hooks are **run_point-only**.  The autotuner loop
     only calls setup/before_run/after_run/teardown — it does not invoke
-    any transform_* methods and raises ValueError if a pass overrides
-    them (ADR-0015).
+    any transform_* methods.  Profiler.setup() raises
+    IncompatibleObserverError if a pass overrides any transform method
+    (ADR-0015).
     """
 
     @property
@@ -699,29 +710,34 @@ class MemoryObserver(BaseInstrumentationPass):
 
 ### Pass scope and responsibility boundaries
 
-| Hook | autotuner loop | run_point |
-|------|---------------|-----------|
-| `setup` / `teardown` | ✓ | ✓ |
-| `before_run` / `after_run` | ✓ | ✓ |
-| `transform_compile_request` | ✗ (raises if overridden) | ✓ regular passes |
-| `transform_compiled` | ✗ (raises if overridden) | ✓ regular passes |
-| `transform_launch_request` | ✗ (raises if overridden) | ✓ regular passes |
+| Hook | autotuner loop | run_point (regular passes) | run_point (run_once passes) |
+|------|---------------|---------------------------|------------------------------|
+| `setup` / `teardown` | ✓ | ✓ | ✓ |
+| `before_run` / `after_run` | ✓ (every cycle) | ✓ (every profiling cycle) | ✓ (once, in isolated fork) |
+| `transform_compile_request` | ✗ (raises `IncompatibleObserverError`) | ✓ (main path, in order) | ✓ (fork, from base) |
+| `transform_compiled` | ✗ | ✓ (main path) | ✓ (fork) |
+| `transform_launch_request` | ✗ | ✓ (inside profiler) | ✓ (fork) |
 
 ```
-Pipeline.run_point()
+Pipeline.run_point()  — simplified call graph
       │
       │ 1. Merge CompileOptions.extra_flags
-      │ 2. For each regular (non-run_once) pass:
-      │    transform_compile_request() → (spec, config, constexpr_sizes)
+      │ 2. Regular-pass transform_compile_request() in order
       │
       ▼
-compiler.compile(modified_spec, config)
+compiler.compile(modified_spec, config)   ← main path artifact
+      │
+      ├── For each run_once pass (isolated fork from BASE request):
+      │       transform_compile_request → compile → transform_compiled
+      │       → make_launch_request → transform_launch_request
+      │       → before_run / run / after_run
+      │       → PointResult.run_once_metrics
       │
       ▼
-Profiler  with  passes = all InstrumentationPass instances
+Profiler  (passes = regular only, validate_transforms=False)
       │
       ▼
-PointResult
+PointResult  (.profile_result + .run_once_metrics)
 ```
 
 ---
@@ -821,21 +837,23 @@ Depends on: `core`
 ```
 Pipeline Start
     │
-    ├── on_kernel_discovered(spec)
+    ├── kernel_discovered   {spec}
     │
-    ├── on_compile_start(spec, config)
-    ├── on_compile_complete(spec, config, compiled)
-    ├── on_compile_error(spec, config, error)
+    ├── compile_start       {spec, config, identity: CompileIdentity}
+    ├── compile_complete    {spec, config, compiled, identity: CompileIdentity}
+    ├── compile_error       {spec, config, error: CompilationError}
+    │     spec is always the original (pre-transform) spec so consumers
+    │     see the canonical kernel identity regardless of pass transforms.
     │
-    ├── on_verify_start(spec)
-    ├── on_verify_complete(spec, result: VerificationResult)
-    ├── on_verify_fail(spec, result: VerificationResult)
+    ├── verify_start        {spec}
+    ├── verify_complete     {spec, result: VerificationResult}
+    ├── verify_fail         {spec, result: VerificationResult}
     │
-    ├── on_autotune_start(spec, space: SearchSpace)
-    ├── on_autotune_progress(spec, results: list[AutotuneResult])
-    ├── on_autotune_complete(spec, results: list[AutotuneResult])
+    ├── autotune_start      {spec, space: SearchSpace}
+    ├── autotune_progress   {spec, results: list[AutotuneResult]}
+    ├── autotune_complete   {spec, results: list[AutotuneResult]}
     │
-    └── on_pipeline_complete(summary)
+    └── pipeline_complete   {result: PipelineResult}
 ```
 
 ### `plugin/plugin.py`
@@ -947,30 +965,32 @@ class Pipeline:
         kernels: list[KernelSpec],
         problem: Problem,
         strategy: Strategy,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         force: bool = False,              # reprocess even if cached
         skip_verify: bool = False,        # skip verification stage
         skip_autotune: bool = False,      # skip autotuning stage
     ) -> PipelineResult: ...
+    # passes: observation only in the autotuner loop (no transforms applied)
 
     async def run_point(
         self,
         spec: KernelSpec,
         point: SearchPoint,
         problem: Problem | None,
-        observers: list[Observer] | None = None,
         *,
-        instruments: list[Instrument] | None = None,
+        problem_name: str | None = None,
+        passes: list[InstrumentationPass] | None = None,
         compile_options: CompileOptions | None = None,
         verify: bool = True,
         profile: bool = True,
     ) -> PointResult:
         """Run a single search point through compile → verify → profile.
 
-        Bypasses the Autotuner strategy loop.  Applies CompileOptions
-        and Instruments to the spec before compilation.  Instrument-owned
-        observers are automatically combined with explicit observers.
-        Results are ephemeral (not stored) by default.
+        Bypasses the Autotuner strategy loop.  Regular passes have their
+        transforms applied on the main path; each run_once pass gets a
+        fully isolated compile/launch fork started from the base request.
+        Fork metrics land in PointResult.run_once_metrics.
+        Results are ephemeral (not stored).
         """
         ...
 
@@ -1006,48 +1026,66 @@ For each kernel in ``kernels``:
 ### Single-point orchestration (``run_point``)
 
 For a single ``(sizes, config)`` pair — used for debugging and
-investigation ([ADR-0012](adr/0012-single-point-execution.md)):
+investigation ([ADR-0012](adr/0012-single-point-execution.md),
+[ADR-0015](adr/0015-backend-contract-redesign.md)):
 
 1. **Merge CompileOptions** — apply ``extra_flags``, ``optimization_level``
-2. **Apply Instruments** — for each instrument:
-   ``transform_source()`` then ``transform_compile_flags()``
-3. **Compile** — ``compiler.compile(modified_spec, config)``
-4. **Collect observers** — explicit observers + ``instrument.observer``
-   for each instrument
-5. **Verify** (if enabled) — ``Verifier.verify()`` at the single size point
-6. **Profile** (if enabled) — ``Profiler.profile()`` with combined observers
-7. Return ``PointResult``
+2. **Regular-pass compile transforms** — for each non-``run_once`` pass:
+   ``transform_compile_request()`` applied in registration order
+3. **Compile** (main path) — ``compiler.compile(modified_spec, config)``
+4. **Regular-pass post-compile transforms** — ``transform_compiled()`` in order
+5. **Isolated forks** — for each ``run_once`` pass, independently:
+   a. ``transform_compile_request()`` on the **base** request (not main-path-transformed)
+   b. ``compiler.compile(fork_spec, ...)``
+   c. ``transform_compiled()`` + ``make_launch_request()`` + ``transform_launch_request()``
+   d. ``before_run()`` → ``runner.run()`` → ``after_run()``
+   e. metrics collected into ``PointResult.run_once_metrics``
+6. **Verify** (if enabled) — ``Verifier.verify()`` at the single size point
+7. **Profile** (if enabled) — ``Profiler.profile()`` with regular passes only
+   (``validate_transforms=False``; run_once passes already handled in step 5)
+8. Return ``PointResult``
 
 No version hashing, no strategy loop, no result storage (ephemeral).
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Pipeline.run_point()                      │
-│                                                              │
-│   CompileOptions ──┐                                         │
-│   Instruments ─────┤                                         │
-│                    ▼                                         │
-│            ┌───────────────┐                                 │
-│            │ Merge flags & │                                 │
-│            │ transform src │                                 │
-│            └───────┬───────┘                                 │
-│                    ▼                                         │
-│            ┌───────────────┐                                 │
-│            │   Compile     │  compiler.compile() ← unchanged │
-│            │  (one config) │                                 │
-│            └───────┬───────┘                                 │
-│                    ▼                                         │
-│            ┌───────────────┐                                 │
-│            │    Verify     │  optional                       │
-│            └───────┬───────┘                                 │
-│                    ▼                                         │
-│            ┌───────────────┐                                 │
-│            │   Profile     │  observers = explicit           │
-│            │               │            + instrument-owned   │
-│            └───────┬───────┘                                 │
-│                    ▼                                         │
-│              PointResult                                     │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      Pipeline.run_point()                        │
+│                                                                  │
+│  CompileOptions ───┐                                             │
+│  InstrumentPasses ─┤                                             │
+│                    ▼                                             │
+│          ┌─────────────────┐                                     │
+│          │  Merge flags &  │                                     │
+│          │  regular-pass   │  transform_compile_request (regular)│
+│          │  compile xforms │                                     │
+│          └────────┬────────┘                                     │
+│                   ▼                                              │
+│          ┌─────────────────┐                                     │
+│          │  Compile (main) │  compiler.compile(modified_spec)    │
+│          └────────┬────────┘                                     │
+│                   │            ┌───────────────────────────────┐ │
+│                   │            │  For each run_once pass:      │ │
+│                   │            │  transform_compile_request    │ │
+│                   │            │  → compile (fork artifact)    │ │
+│                   │            │  → transform_compiled         │ │
+│                   │            │  → make_launch_request        │ │
+│                   │            │  → transform_launch_request   │ │
+│                   │            │  → before_run/run/after_run   │ │
+│                   │            └──────────────┬────────────────┘ │
+│                   │                           ▼                  │
+│                   │               run_once_metrics               │
+│                   ▼                                              │
+│          ┌─────────────────┐                                     │
+│          │     Verify      │  optional                           │
+│          └────────┬────────┘                                     │
+│                   ▼                                              │
+│          ┌─────────────────┐                                     │
+│          │  Profile (main) │  passes = regular only              │
+│          │                 │  validate_transforms=False           │
+│          └────────┬────────┘                                     │
+│                   ▼                                              │
+│             PointResult                                          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1466,7 +1504,7 @@ class TuneService:
         problem_name: str,
         *,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
         force: bool = False,
         skip_verify: bool = False,
@@ -1483,7 +1521,7 @@ class TuneService:
         self,
         *,
         strategy: Strategy | None = None,
-        observers: list[Observer] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         plugins: list[Plugin] | None = None,
         force: bool = False,
         skip_verify: bool = False,
@@ -1503,8 +1541,7 @@ class TuneService:
         point: SearchPoint,
         *,
         problem: str | None = None,
-        observers: list[Observer] | None = None,
-        instruments: list[Instrument] | None = None,
+        passes: list[InstrumentationPass] | None = None,
         compile_options: CompileOptions | None = None,
         verify: bool = True,
         profile: bool = True,
@@ -1512,8 +1549,9 @@ class TuneService:
         """Run a single search point for debugging or investigation.
 
         Bypasses the Autotuner strategy loop.  Resolves kernel/problem
-        from Registry, applies CompileOptions and Instruments, then
-        delegates to Pipeline.run_point().
+        from Registry, applies CompileOptions and passes, then delegates
+        to Pipeline.run_point().  run_once passes receive isolated
+        compile/launch forks; their metrics are in PointResult.run_once_metrics.
 
         Results are ephemeral (not stored in ResultStore by default).
         """
@@ -1559,7 +1597,7 @@ service = TuneService(
     device=DeviceHandle(0),
     store=DatabaseStore("results.db"),
     strategy=BayesianOptimization(),
-    observers=[NCUObserver()],
+    passes=[NCUObserver()],
 )
 
 # Tune a single kernel (uses service defaults)
@@ -1590,21 +1628,24 @@ result = await service.run_point(
         config=KernelConfig(params={"BLOCK_M": 128, "BLOCK_N": 128, ...}),
     ),
     compile_options=CompileOptions(extra_flags={"-G": True}),
-    observers=[NCUObserver(), MemoryObserver()],
+    passes=[NCUObserver(), MemoryObserver()],
     verify=True,
     profile=True,
 )
+# NCUObserver has run_once=True: gets its own isolated fork execution
+# MemoryObserver has run_once=False: observes every profiling cycle
 
-# Triton-viz instrumentation (user-supplied instrument bundles observer)
-from my_project.instruments import TritonVizInstrument
+# Triton-viz instrumentation (InstrumentationPass with transforms + observation)
+from my_project.passes import TritonVizPass  # implements InstrumentationPass
 
 result = await service.run_point(
     "matmul_persistent",
     point,
-    instruments=[TritonVizInstrument(output_dir="/tmp/traces")],
+    passes=[TritonVizPass(output_dir="/tmp/traces")],
     profile=True,
 )
-trace_path = result.profile_result.metrics["triton_viz_trace_path"]
+# TritonVizPass is run_once=True → isolated fork with source injection
+trace_path = result.run_once_metrics.get("triton_viz_trace_path")
 ```
 
 ---

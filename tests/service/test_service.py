@@ -33,6 +33,8 @@ from kernel_pipeline_backend.pipeline.pipeline import PipelineResult
 from kernel_pipeline_backend.registry import Registry
 from kernel_pipeline_backend.service import TuneResult, TuneService
 
+pytestmark = pytest.mark.anyio
+
 
 # ---------------------------------------------------------------------------
 # Fakes

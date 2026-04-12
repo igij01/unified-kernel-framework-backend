@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from kernel_pipeline_backend.autotuner.autotuner import Autotuner
 from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
@@ -284,12 +284,24 @@ class Pipeline:
     ) -> PointResult:
         """Execute a single (spec, point) pair: compile, verify, profile.
 
-        Regular (non-``run_once``) passes have their
-        ``transform_compile_request`` applied in registration order before
-        compilation.  All passes participate in ``before_run`` /
-        ``after_run`` observation during profiling.  Plugin events use the
-        original ``spec`` so event consumers see the canonical kernel
-        identity.
+        Regular (non-``run_once``) passes have their transforms applied in
+        registration order on the main path: ``transform_compile_request``
+        before compilation, ``transform_compiled`` after, and
+        ``transform_launch_request`` inside the profiler.  They also
+        observe every profiling iteration via ``before_run`` /
+        ``after_run``.
+
+        Each ``run_once`` pass gets a fully isolated execution fork that
+        starts from the base compile request.  The fork applies that
+        pass's own ``transform_compile_request``, compiles a separate
+        artifact, applies ``transform_compiled`` and
+        ``transform_launch_request``, runs the kernel once, and collects
+        metrics via ``before_run`` / ``after_run``.  No fork affects any
+        other fork or the main path.  Fork metrics are returned in
+        ``PointResult.run_once_metrics``.
+
+        Plugin events use the original ``spec`` so event consumers see
+        the canonical kernel identity.
 
         Args:
             spec: Kernel specification (used as-is for plugin events;
@@ -303,8 +315,9 @@ class Pipeline:
                 ``KernelConfig`` before compilation and runtime bindings
                 are forwarded as ``extra_args`` to ``Runner.run()``.
             passes: :class:`InstrumentationPass` instances.  Regular
-                passes have their compile-time transforms applied here;
-                all passes observe the profiling run.
+                passes have their transforms applied on the main path and
+                observe every profiling iteration.  ``run_once`` passes
+                each run in an isolated compile/launch fork.
             compile_options: Extra flags / optimization level overrides.
             verify: Whether to run the verification stage.
             profile: Whether to run the profiling stage.
@@ -379,20 +392,58 @@ class Pipeline:
             if not p.run_once:
                 compiled = p.transform_compiled(compiled)
 
+        # 6c. Execute isolated forks for run_once passes.
+        #     Each fork starts from the *base* compile request (not the
+        #     regular-transformed one), applies the pass's own transforms,
+        #     compiles its own artifact, runs the kernel once, and collects
+        #     metrics.  No fork touches any other fork or the main path.
+        run_once_metrics: dict[str, Any] = {}
+        run_once_passes = [p for p in (passes or []) if p.run_once]
+        if run_once_passes and problem is not None:
+            fork_inputs = problem.initialize(point.sizes)
+            base_spec = replace(spec, compile_flags=flags)
+            for p in run_once_passes:
+                fork_spec, fork_config, fork_constexpr = p.transform_compile_request(
+                    base_spec, point.config, constexpr_sizes
+                )
+                try:
+                    fork_compiled = self._compiler.compile(
+                        fork_spec, fork_config, constexpr_sizes=fork_constexpr
+                    )
+                except CompilationError:
+                    logger.warning(
+                        "Isolated fork compilation failed for pass %s — skipping",
+                        type(p).__name__,
+                    )
+                    continue
+                fork_compiled = p.transform_compiled(fork_compiled)
+                fork_launch = self._runner.make_launch_request(
+                    fork_compiled, fork_inputs, point.sizes, fork_config, extra_args
+                )
+                fork_launch = p.transform_launch_request(fork_launch)
+                p.before_run(self._device, point, fork_launch)
+                self._runner.run(fork_launch, self._device)
+                fork_metrics = p.after_run(self._device, point, fork_launch)
+                run_once_metrics.update(fork_metrics)
+
         # 7. Verify (optional — requires a problem with a reference implementation)
         verification = None
         if verify and problem is not None and has_reference(problem):
             verifier = Verifier(runner=self._runner, device=self._device, passes=passes or [])
             verification = verifier.verify(compiled, problem, point.sizes, extra_args)
 
-        # 8. Profile (optional — requires a problem for input initialization)
+        # 8. Profile (optional — requires a problem for input initialization).
+        #    Only regular (non-run_once) passes are forwarded to the profiler;
+        #    run_once passes were already executed in isolated forks above.
         profile_result = None
         if profile and problem is not None:
+            regular_passes = [p for p in (passes or []) if not p.run_once]
             profiler = Profiler(
                 runner=self._runner,
                 device=self._device,
                 backend=self._compiler.backend_name,
-                passes=passes or [],
+                passes=regular_passes,
+                validate_transforms=False,
             )
             profiler.setup()
             try:
@@ -410,6 +461,7 @@ class Pipeline:
             compile_error=None,
             verification=verification,
             profile_result=profile_result,
+            run_once_metrics=run_once_metrics,
         )
         await self._plugins.await_plugins()
         return result

@@ -39,10 +39,11 @@ class Runner(Protocol):
     ) -> LaunchRequest:
         """Build a fully resolved launch plan.
 
-        The backend calls ``compiled.spec.grid_generator`` internally,
-        packs arguments in its own encoding (e.g. DLPack for CUDA, raw
-        tensors for Triton), resolves ``shared_mem`` and ``num_outputs``
-        from ``compile_info``, and returns an opaque ``LaunchRequest``.
+        The backend calls ``compiled.grid_generator`` internally (copied
+        from ``KernelSpec`` at compile time), packs arguments in its own
+        encoding (e.g. DLPack for CUDA, raw tensors for Triton), resolves
+        ``shared_mem`` and ``num_outputs`` from ``compile_info``, and
+        returns an opaque ``LaunchRequest``.
 
         Args:
             compiled: Pre-compiled kernel artifact.

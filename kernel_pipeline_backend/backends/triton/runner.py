@@ -64,7 +64,8 @@ class TritonRunner:
             A frozen ``LaunchRequest`` opaque to the pipeline.
         """
         info = compiled.compile_info
-        grid_result = compiled.spec.grid_generator(sizes, config)
+        grid_fn = compiled.grid_generator or compiled.spec.grid_generator
+        grid_result = grid_fn(sizes, config)
 
         # Inputs + extra_args packed as positional arguments.
         packed_args = tuple(inputs) + extra_args
