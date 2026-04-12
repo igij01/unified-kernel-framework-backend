@@ -228,7 +228,7 @@ class Pipeline:
             backend=self._compiler.backend_name,
             passes=passes,
         )
-        verifier = Verifier(runner=self._runner, device=self._device)
+        verifier = Verifier(runner=self._runner, device=self._device, passes=passes)
         autotuner = Autotuner(
             profiler=profiler,
             verifier=verifier,

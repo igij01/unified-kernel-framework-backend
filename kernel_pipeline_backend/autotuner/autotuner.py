@@ -392,7 +392,7 @@ class Autotuner:
                         failed_compile_keys.add(cache_key)
                         await self._emit(
                             EVENT_COMPILE_ERROR,
-                            {"spec": spec, "config": point.config, "error": str(exc)},
+                            {"spec": spec, "config": point.config, "error": exc, "identity": identity},
                         )
                         result.errors.append(
                             AutotuneError(

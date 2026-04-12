@@ -290,9 +290,6 @@ class Profiler:
         launch = self._runner.make_launch_request(
             compiled, inputs, sizes, compiled.config, extra_args,
         )
-        for p in self._regular_observers:
-            launch = p.transform_launch_request(launch)
-
         # -- Warmup (untimed, no observer calls) -----------------------
         for _ in range(self._warmup_cycles):
             self._runner.run(launch, self._device)
