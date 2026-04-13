@@ -215,6 +215,114 @@ class TestCallableSource:
 
 
 # ---------------------------------------------------------------------------
+# hash() — Triton JITFunction / Autotuner unwrapping (issue #001)
+# ---------------------------------------------------------------------------
+
+
+class TestTritonJITFunctionUnwrapping:
+    """Regression tests for issue #001: KernelHasher crashes on Triton @triton.jit.
+
+    Real Triton is not imported here.  We simulate the wrapper objects using
+    plain Python classes that reproduce the duck-typing contract:
+      - JITFunction: callable, has ``.fn`` pointing to the inner function.
+      - Autotuner:   callable, has ``.fn`` pointing to the JITFunction.
+    """
+
+    def _make_jit_function(self, inner_fn: object) -> object:
+        """Minimal stand-in for triton.runtime.jit.JITFunction."""
+
+        class FakeJITFunction:
+            def __init__(self, fn: object) -> None:
+                self.fn = fn
+
+            def __call__(self, *args, **kwargs):  # pragma: no cover
+                return self.fn(*args, **kwargs)
+
+        return FakeJITFunction(inner_fn)
+
+    def _make_autotuner(self, jit_fn: object) -> object:
+        """Minimal stand-in for triton.runtime.autotuner.Autotuner."""
+
+        class FakeAutotuner:
+            def __init__(self, fn: object) -> None:
+                self.fn = fn
+
+            def __call__(self, *args, **kwargs):  # pragma: no cover
+                return self.fn(*args, **kwargs)
+
+        return FakeAutotuner(jit_fn)
+
+    def test_jit_function_does_not_raise(self, hasher: KernelHasher) -> None:
+        """hash() must not raise TypeError for a JITFunction wrapper."""
+
+        def my_kernel(x, n):
+            return x
+
+        jit_fn = self._make_jit_function(my_kernel)
+        spec = _make_spec(source=jit_fn, backend="triton")
+        # Before the fix this raised TypeError from inspect.getsource()
+        result = hasher.hash(spec)
+        assert isinstance(result, KernelHash)
+
+    def test_autotuner_does_not_raise(self, hasher: KernelHasher) -> None:
+        """hash() must not raise TypeError for an Autotuner(JITFunction) wrapper."""
+
+        def my_kernel(x, n):
+            return x
+
+        jit_fn = self._make_jit_function(my_kernel)
+        autotuner = self._make_autotuner(jit_fn)
+        spec = _make_spec(source=autotuner, backend="triton")
+        result = hasher.hash(spec)
+        assert isinstance(result, KernelHash)
+
+    def test_jit_function_hash_matches_plain_function(
+        self, hasher: KernelHasher
+    ) -> None:
+        """JITFunction wrapper and plain inner function must yield the same hash.
+
+        The hash captures kernel *source*, not its wrapper, so both
+        representations of the same kernel must be content-equal.
+        """
+
+        def my_kernel(x, n):
+            return x
+
+        jit_fn = self._make_jit_function(my_kernel)
+        h_plain = hasher.hash(_make_spec(source=my_kernel, backend="triton"))
+        h_jit = hasher.hash(_make_spec(source=jit_fn, backend="triton"))
+        assert h_plain == h_jit
+
+    def test_autotuner_hash_matches_plain_function(
+        self, hasher: KernelHasher
+    ) -> None:
+        """Autotuner-wrapped kernel must hash to the same value as the plain function."""
+
+        def my_kernel(x, n):
+            return x
+
+        autotuner = self._make_autotuner(self._make_jit_function(my_kernel))
+        h_plain = hasher.hash(_make_spec(source=my_kernel, backend="triton"))
+        h_auto = hasher.hash(_make_spec(source=autotuner, backend="triton"))
+        assert h_plain == h_auto
+
+    def test_different_jit_functions_different_hash(
+        self, hasher: KernelHasher
+    ) -> None:
+        """Two JITFunction wrappers around different kernels must not collide."""
+
+        def kernel_a(x, n):
+            return x + 1
+
+        def kernel_b(x, n):
+            return x * 2
+
+        h_a = hasher.hash(_make_spec(source=self._make_jit_function(kernel_a), backend="triton"))
+        h_b = hasher.hash(_make_spec(source=self._make_jit_function(kernel_b), backend="triton"))
+        assert h_a != h_b
+
+
+# ---------------------------------------------------------------------------
 # has_changed() — with real DatabaseStore
 # ---------------------------------------------------------------------------
 

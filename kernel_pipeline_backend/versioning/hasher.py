@@ -62,8 +62,14 @@ class KernelHasher:
         # --- source ---
         h.update(b"source:")
         if callable(spec.source):
+            source_obj = spec.source
+            # Triton @triton.jit → JITFunction, @triton.autotune → Autotuner(JITFunction);
+            # both expose the inner function via .fn. Walk the chain until we reach a plain
+            # callable (duck-typing, no triton import needed).
+            while hasattr(source_obj, "fn"):
+                source_obj = source_obj.fn
             # Unwrap functools.wraps / decorator chains
-            source_obj = inspect.unwrap(spec.source)
+            source_obj = inspect.unwrap(source_obj)
             source_text = inspect.getsource(source_obj)
         else:
             source_text = str(spec.source)
