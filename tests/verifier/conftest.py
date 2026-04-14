@@ -116,7 +116,7 @@ class FakeProblem:
         self._init_fn = init_fn or (lambda sizes: [[1.0, 2.0, 3.0]])
         self._ref_fn = ref_fn or (lambda inputs, sizes: list(inputs))
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtype: Any = None) -> list[Any]:
         return self._init_fn(sizes)
 
     def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:

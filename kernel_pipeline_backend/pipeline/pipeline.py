@@ -329,10 +329,18 @@ class Pipeline:
         # 1. Resolve link bindings for this (kernel, problem) pair
         extra_args: tuple = ()
         constexpr_sizes: dict | None = None
+        type_args: dict[str, str] | None = None
         if problem_name is not None:
             binding = Registry.get_link_binding(spec.name, problem_name)
-            extra_args, constexpr_kwargs = _resolve_link_binding(binding, point.sizes)
+            extra_args, constexpr_kwargs, type_map = _resolve_link_binding(
+                binding, point.sizes, dtype=point.dtype,
+            )
             constexpr_sizes = constexpr_kwargs or None
+            if type_map:
+                type_args = {
+                    param: self._compiler.dtype_to_str(dt)
+                    for param, dt in type_map.items()
+                }
 
         # 2. Merge CompileOptions into a working flags dict
         flags: dict = dict(spec.compile_flags)
@@ -358,14 +366,17 @@ class Pipeline:
         # 5. Compile — pass constexpr_sizes so the backend can bake them in
         try:
             identity = self._compiler.compile_identity(
-                modified_spec, effective_config, constexpr_sizes or None
+                modified_spec, effective_config, constexpr_sizes or None,
+                type_args=type_args,
             )
             await self._emit(
                 EVENT_COMPILE_START,
                 {"spec": spec, "config": effective_config, "identity": identity},
             )
             compiled = self._compiler.compile(
-                modified_spec, effective_config, constexpr_sizes=constexpr_sizes
+                modified_spec, effective_config,
+                constexpr_sizes=constexpr_sizes,
+                type_args=type_args,
             )
             await self._emit(
                 EVENT_COMPILE_COMPLETE,
@@ -400,7 +411,7 @@ class Pipeline:
         run_once_metrics: dict[str, Any] = {}
         run_once_passes = [p for p in (passes or []) if p.run_once]
         if run_once_passes and problem is not None:
-            fork_inputs = problem.initialize(point.sizes)
+            fork_inputs = problem.initialize(point.sizes, dtype=point.dtype)
             base_spec = replace(spec, compile_flags=flags)
             for p in run_once_passes:
                 fork_spec, fork_config, fork_constexpr = p.transform_compile_request(
@@ -430,7 +441,9 @@ class Pipeline:
         verification = None
         if verify and problem is not None and has_reference(problem):
             verifier = Verifier(runner=self._runner, device=self._device, passes=passes or [])
-            verification = verifier.verify(compiled, problem, point.sizes, extra_args)
+            verification = verifier.verify(
+                compiled, problem, point.sizes, extra_args, dtype=point.dtype,
+            )
 
         # 8. Profile (optional — requires a problem for input initialization).
         #    Only regular (non-run_once) passes are forwarded to the profiler;
@@ -450,6 +463,7 @@ class Pipeline:
                 profile_result = profiler.profile(
                     compiled, problem, point.sizes, extra_args,
                     original_config=point.config,
+                    dtype=point.dtype,
                 )
             finally:
                 profiler.teardown()

@@ -954,7 +954,7 @@ class TestTritonShapeAsArgsGPU:
         class ShapeProblem:
             sizes = {"M": [M], "N": [N]}
             atol = rtol = 1e-5
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 m, n = sizes["M"], sizes["N"]
                 ne = m * n
                 x = torch.randn(ne, device="cuda")
@@ -976,7 +976,7 @@ class TestTritonShapeAsArgsGPU:
             )
 
             binding = Registry.get_link_binding("shape_add_k", "shape_add")
-            extra_args, constexpr = _resolve_link_binding(binding, {"M": M, "N": N})
+            extra_args, constexpr, _type_map = _resolve_link_binding(binding, {"M": M, "N": N})
 
             assert extra_args == (M, N)
             assert constexpr == {}

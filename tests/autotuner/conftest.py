@@ -80,6 +80,9 @@ class FakeCompiler:
     def backend_name(self) -> str:
         return "fake"
 
+    def dtype_to_str(self, dtype: Any) -> str:
+        return str(dtype)
+
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         return list(self._configs)
 
@@ -88,6 +91,7 @@ class FakeCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompileIdentity:
         return CompileIdentity(
             version_hash=spec.name,
@@ -101,6 +105,7 @@ class FakeCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompiledKernel:
         import json
         key = json.dumps(config.params, sort_keys=True)
@@ -182,7 +187,7 @@ class FakeProblem:
         self.rtol = 1e-3
         self._filter_fn = filter_fn
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtype: Any = None) -> list[Any]:
         return [f"tensor_{k}={v}" for k, v in sizes.items()]
 
     def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:

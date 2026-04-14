@@ -15,14 +15,14 @@ Example::
             "N": range(128, 4097, 128),
             "K": [128, 256, 512],
         }
-        dtypes = [torch.float16, torch.float16]
+        dtypes = [torch.float16, torch.bfloat16, torch.float32]
         atol = 1e-3
         rtol = 1e-3
 
-        def initialize(self, sizes):
+        def initialize(self, sizes, dtype):
             M, N, K = sizes["M"], sizes["N"], sizes["K"]
-            return [rand_tensor(M, K, dtype=self.dtypes[0]),
-                    rand_tensor(K, N, dtype=self.dtypes[1])]
+            return [rand_tensor(M, K, dtype=dtype),
+                    rand_tensor(K, N, dtype=dtype)]
 
         def reference(self, inputs, sizes):
             A, B = inputs
@@ -58,7 +58,13 @@ class Problem(Protocol):
     """Size parameter axes and their domains for autotuning sweeps."""
 
     dtypes: list[torch.dtype]
-    """Dtypes for input tensors, passed to ``initialize`` to generate inputs."""
+    """Dtype sweep domain — the set of dtypes to benchmark the kernel at.
+
+    The pipeline iterates over each dtype in this list as an outer axis
+    alongside ``sizes``, passing the current dtype to ``initialize``.
+    A single-dtype problem simply uses a one-element list (e.g.
+    ``[torch.float32]``).
+    """
 
     atol: float
     """Absolute tolerance for output comparison."""
@@ -66,13 +72,20 @@ class Problem(Protocol):
     rtol: float
     """Relative tolerance for output comparison."""
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(
+        self,
+        sizes: dict[str, int],
+        dtype: torch.dtype | None = None,
+    ) -> list[torch.Tensor]:
         """Create input tensors for a specific size point.
 
         Args:
             sizes: A dict mapping each size parameter name to a concrete
                 integer value (one point from the cartesian product of
                 ``self.sizes``).
+            dtype: The current dtype from the ``dtypes`` sweep.  When the
+                pipeline drives the call, this is always set.  Defaults
+                to ``None`` for backward compatibility.
 
         Returns:
             List of input tensors on the appropriate device and dtype.

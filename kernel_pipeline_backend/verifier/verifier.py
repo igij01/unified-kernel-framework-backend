@@ -172,7 +172,7 @@ class Verifier:
 
     Flow::
 
-        inputs   = problem.initialize(sizes)
+        inputs   = problem.initialize(sizes, dtype=dtype)
         expected = problem.reference(inputs, sizes)
         launch   = runner.make_launch_request(compiled, inputs, sizes, config, extra_args)
         launch   = pass_.transform_launch_request(launch)  # for each regular pass
@@ -204,6 +204,7 @@ class Verifier:
         problem: Problem,
         sizes: dict[str, int],
         extra_args: tuple[Any, ...] = (),
+        dtype: Any = None,
     ) -> VerificationResult:
         """Verify a compiled kernel at a single size point.
 
@@ -215,12 +216,15 @@ class Verifier:
             extra_args: Additional scalar arguments forwarded to
                 ``Runner.run()``.  Resolved from link bindings by the
                 caller.  Defaults to an empty tuple.
+            dtype: The current ``torch.dtype`` from the problem's
+                ``dtypes`` sweep.  Forwarded to
+                ``problem.initialize(sizes, dtype=dtype)``.
 
         Returns:
             :class:`VerificationResult` with pass/fail and failure
             details if applicable.
         """
-        inputs = problem.initialize(sizes)
+        inputs = problem.initialize(sizes, dtype=dtype)
         expected = problem.reference(inputs, sizes)
 
         launch = self._runner.make_launch_request(

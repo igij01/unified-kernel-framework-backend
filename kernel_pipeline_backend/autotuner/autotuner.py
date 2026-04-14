@@ -41,13 +41,12 @@ from kernel_pipeline_backend.plugin.plugin import (
     EVENT_VERIFY_START,
     PipelineEvent,
 )
-from kernel_pipeline_backend.verifier.verifier import VerificationResult
-
 if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.strategy import Strategy
     from kernel_pipeline_backend.core.compiler import Compiler
     from kernel_pipeline_backend.plugin.manager import PluginManager
     from kernel_pipeline_backend.problem.problem import Problem
+    from kernel_pipeline_backend.verifier.verifier import VerificationResult
     from kernel_pipeline_backend.storage.store import ResultStore
     from kernel_pipeline_backend.verifier.verifier import Verifier
 
@@ -359,13 +358,22 @@ class Autotuner:
                     continue  # config not in the candidate set
 
                 # Resolve size bindings for this point.
-                extra_args, constexpr_sizes = _resolve_link_binding(
-                    binding, point.sizes,  # type: ignore[arg-type]
+                extra_args, constexpr_sizes, type_map = _resolve_link_binding(
+                    binding, point.sizes, dtype=point.dtype,  # type: ignore[arg-type]
                 )
+
+                # Resolve type_map (torch.dtype values) → backend type strings
+                type_args: dict[str, str] | None = None
+                if type_map:
+                    type_args = {
+                        param: compiler.dtype_to_str(dt)
+                        for param, dt in type_map.items()
+                    }
 
                 # -- JIT Compile (with cache) ----------------------------
                 identity = compiler.compile_identity(
-                    spec, point.config, constexpr_sizes or None
+                    spec, point.config, constexpr_sizes or None,
+                    type_args=type_args,
                 )
                 cache_key = identity.cache_key
                 if cache_key in failed_compile_keys:
@@ -382,6 +390,7 @@ class Autotuner:
                             spec,
                             point.config,
                             constexpr_sizes=constexpr_sizes or None,
+                            type_args=type_args,
                         )
                         compile_cache[cache_key] = compiled
                         await self._emit(
@@ -417,6 +426,7 @@ class Autotuner:
                         )
                         vr = self._verifier.verify(
                             compiled, problem, point.sizes, extra_args,  # type: ignore[arg-type]
+                            dtype=point.dtype,
                         )
                         result.verified.append(vr)
                         verified_cache[cache_key_v] = vr.passed
@@ -444,6 +454,7 @@ class Autotuner:
                             point.sizes,
                             extra_args,
                             original_config=point.config,
+                            dtype=point.dtype,
                         )
                         result.tuned.append(ar)
                         self._store.store([ar])

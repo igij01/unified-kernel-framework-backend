@@ -8,6 +8,10 @@ Supports two modes for injecting kernel configuration:
   present, the listed config params are passed as C++ template
   arguments via CuPy's ``name_expressions`` API.  Remaining config
   params (if any) still become ``-D`` defines.
+
+Type-parameterized kernels (``template<typename T, ...>``) are
+supported via ``compile_flags["type_params"]`` and the ``type_args``
+parameter on ``compile()`` / ``compile_identity()``.
 """
 
 from __future__ import annotations
@@ -15,8 +19,27 @@ from __future__ import annotations
 import itertools
 from typing import Any
 
+import torch
+
 from kernel_pipeline_backend.core.compiler import CompilationError
 from kernel_pipeline_backend.core.types import CompileIdentity, CompiledKernel, KernelConfig, KernelSpec
+
+
+# ---------------------------------------------------------------------------
+# torch.dtype → CUDA C++ type string mapping
+# ---------------------------------------------------------------------------
+
+_CUDA_DTYPE_MAP: dict[torch.dtype, str] = {
+    torch.float16: "half",
+    torch.bfloat16: "nv_bfloat16",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.int8: "int8_t",
+    torch.int16: "int16_t",
+    torch.int32: "int32_t",
+    torch.int64: "int64_t",
+    torch.uint8: "uint8_t",
+}
 
 
 class CUDACompiler:
@@ -60,6 +83,23 @@ class CUDACompiler:
         """Returns ``'cuda'``."""
         return "cuda"
 
+    def dtype_to_str(self, dtype: torch.dtype) -> str:
+        """Map a ``torch.dtype`` to the corresponding CUDA C++ type string.
+
+        Args:
+            dtype: A ``torch.dtype`` value.
+
+        Returns:
+            CUDA type string (e.g. ``"half"``, ``"float"``).
+
+        Raises:
+            ValueError: If the dtype has no known CUDA mapping.
+        """
+        try:
+            return _CUDA_DTYPE_MAP[dtype]
+        except KeyError:
+            raise ValueError(f"No CUDA type mapping for {dtype}") from None
+
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         """Generate CUDA-specific configurations.
 
@@ -92,27 +132,35 @@ class CUDACompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompileIdentity:
         """Return the compile identity for this CUDA kernel compilation.
 
-        Backend keys include NVRTC options and template params from
-        compile_flags so that changing compiler flags invalidates the cache.
+        Backend keys include NVRTC options, template params, and type args
+        from compile_flags so that changing compiler flags or type
+        specialization invalidates the cache.
 
         Args:
             spec: Kernel specification.
             config: Kernel configuration.
             constexpr_sizes: Problem-size values baked in at compile time.
+            type_args: Resolved type template arguments (e.g.
+                ``{"T": "half"}``).
 
         Returns:
-            ``CompileIdentity`` for this (spec, config, constexpr_sizes).
+            ``CompileIdentity`` for this (spec, config, constexpr_sizes,
+            type_args).
         """
         nvrtc_options = tuple(sorted(spec.compile_flags.get("nvrtc_options", [])))
         template_params = tuple(spec.compile_flags.get("template_params") or [])
-        backend_keys = frozenset({
+        backend_keys_dict: dict[str, Any] = {
             "nvrtc_options": nvrtc_options,
             "template_params": template_params,
             "entry_point": spec.compile_flags.get("entry_point", spec.name),
-        }.items())
+        }
+        if type_args:
+            backend_keys_dict["type_args"] = tuple(sorted(type_args.items()))
+        backend_keys = frozenset(backend_keys_dict.items())
         return CompileIdentity(
             version_hash=str(spec.version_hash) if spec.version_hash else spec.name,
             config=config,
@@ -125,6 +173,7 @@ class CUDACompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompiledKernel:
         """Compile CUDA source with the given configuration.
 
@@ -135,11 +184,17 @@ class CUDACompiler:
         optionally into template arguments) so that problem sizes
         baked in at compile time receive actual values.
 
+        ``type_args`` are resolved type-string mappings (e.g.
+        ``{"T": "half"}``) that are emitted as bare type names in
+        template arguments.
+
         Args:
             spec: CUDA kernel source and metadata.
             config: Configuration (tile sizes, stages, etc.).
             constexpr_sizes: Problem size values to bake in as
                 preprocessor defines (e.g. ``{"HEAD_DIM": 64}``).
+            type_args: Resolved type template arguments (e.g.
+                ``{"T": "half"}``).
 
         Returns:
             ``CompiledKernel`` whose ``artifact`` is a CuPy kernel
@@ -204,7 +259,8 @@ class CUDACompiler:
         try:
             if template_params:
                 name_expr = self._build_name_expression(
-                    entry_point, effective_params, template_params
+                    entry_point, effective_params, template_params,
+                    type_args=type_args,
                 )
                 module = cupy.RawModule(
                     code=str(spec.source),
@@ -243,23 +299,36 @@ class CUDACompiler:
         entry_point: str,
         params: dict[str, Any],
         template_params: list[str],
+        type_args: dict[str, str] | None = None,
     ) -> str:
         """Build a C++ name expression for a template specialization.
 
         Concatenates the entry point with template arguments in the
-        order declared by ``template_params``.
+        order declared by ``template_params``.  Type parameters (listed
+        in ``type_args``) are emitted as bare type names; integer
+        parameters are emitted as their string representation.
 
         Args:
             entry_point: Kernel function name.
             params: Merged params dict (config + constexpr_sizes).
             template_params: Ordered list of param names matching
                 the kernel's C++ template parameter order.
+            type_args: Mapping of type parameter names to resolved
+                CUDA type strings (e.g. ``{"T": "half"}``).
 
         Returns:
-            Name expression string, e.g. ``"matmul<128, 64>"``.
+            Name expression string, e.g. ``"matmul<half, 128, 64>"``.
 
         Raises:
-            KeyError: If a template param name is missing from ``params``.
+            KeyError: If a template param name is missing from both
+                ``params`` and ``type_args``.
         """
-        args = ", ".join(str(params[p]) for p in template_params)
+        type_args = type_args or {}
+        parts: list[str] = []
+        for p in template_params:
+            if p in type_args:
+                parts.append(type_args[p])
+            else:
+                parts.append(str(params[p]))
+        args = ", ".join(parts)
         return f"{entry_point}<{args}>"

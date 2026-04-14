@@ -308,10 +308,18 @@ class CompileIdentity:
 
 @dataclass(frozen=True)
 class SearchPoint:
-    """A single point in the (problem_size x config) search space."""
+    """A single point in the (problem_size x config x dtype) search space.
+
+    Attributes:
+        sizes: Concrete problem-size values for this point.
+        config: Kernel configuration (tile sizes, warps, etc.).
+        dtype: The current dtype from the problem's ``dtypes`` sweep.
+            ``None`` for problems that do not sweep over dtypes.
+    """
 
     sizes: dict[str, int] = field(default_factory=dict)
     config: KernelConfig = field(default_factory=KernelConfig)
+    dtype: Any = None  # torch.dtype | None — Any to avoid torch import
 
 
 @dataclass

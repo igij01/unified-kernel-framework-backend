@@ -57,10 +57,14 @@ class _LinkBinding:
             Resolved into compile-time kwargs merged into KernelConfig.
         runtime_args: Ordered problem size keys whose values are passed
             as extra positional args to Runner.run(extra_args=...).
+        type_args: List of kernel template parameter names that should
+            be bound to the current dtype from the problem's ``dtypes``
+            sweep.  All listed params receive the same dtype value.
     """
 
     constexpr_args: dict[str, str]
     runtime_args: tuple[str, ...]
+    type_args: tuple[str, ...] = ()
 
 
 _EMPTY_BINDING = _LinkBinding(constexpr_args={}, runtime_args=())
@@ -69,7 +73,8 @@ _EMPTY_BINDING = _LinkBinding(constexpr_args={}, runtime_args=())
 def _resolve_link_binding(
     binding: _LinkBinding,
     sizes: dict[str, int],
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    dtype: Any = None,
+) -> tuple[tuple[Any, ...], dict[str, Any], dict[str, Any]]:
     """Resolve a link binding against a concrete size point.
 
     Args:
@@ -78,17 +83,24 @@ def _resolve_link_binding(
             contain all keys referenced in the binding — callers are
             expected to run ``Registry.validate()`` upfront to ensure
             this invariant.
+        dtype: The current ``torch.dtype`` from the problem's ``dtypes``
+            sweep.  When provided and ``binding.type_args`` is non-empty,
+            the returned ``type_map`` maps each type-arg name to this
+            dtype value.
 
     Returns:
-        ``(extra_args_tuple, constexpr_kwargs)`` where:
+        ``(extra_args_tuple, constexpr_kwargs, type_map)`` where:
 
         - ``extra_args_tuple`` is passed as ``Runner.run(extra_args=...)``
         - ``constexpr_kwargs`` is merged into ``KernelConfig.params``
           before compilation.
+        - ``type_map`` maps kernel template parameter names to the
+          current ``torch.dtype`` (e.g. ``{"T": torch.float16}``).
     """
     extra = tuple(sizes[k] for k in binding.runtime_args)
     constexpr = {param: sizes[key] for param, key in binding.constexpr_args.items()}
-    return extra, constexpr
+    type_map: dict[str, Any] = {p: dtype for p in binding.type_args} if dtype and binding.type_args else {}
+    return extra, constexpr, type_map
 
 
 @dataclass
@@ -218,6 +230,7 @@ class Registry:
         problem: str | None = None,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
+        type_args: list[str] | None = None,
     ) -> None:
         """Register a kernel imperatively.
 
@@ -239,11 +252,14 @@ class Registry:
                 compile-time specialisation.  Requires ``problem`` to be set.
             runtime_args: Ordered problem size keys forwarded as scalar
                 ``extra_args`` to ``Runner.run()``.  Requires ``problem``.
+            type_args: List of kernel template parameter names that should
+                be bound to the current dtype from the problem's ``dtypes``
+                sweep.  Requires ``problem`` to be set.
 
         Raises:
             ValueError: If ``name`` is already registered as a kernel.
-            ValueError: If ``constexpr_args`` or ``runtime_args`` is
-                provided without ``problem``.
+            ValueError: If ``constexpr_args``, ``runtime_args``, or
+                ``type_args`` is provided without ``problem``.
 
         Example::
 
@@ -255,11 +271,11 @@ class Registry:
                 grid_generator=my_grid_fn,
             )
         """
-        if constexpr_args is not None or runtime_args is not None:
+        if constexpr_args is not None or runtime_args is not None or type_args is not None:
             if problem is None:
                 raise ValueError(
-                    "constexpr_args and runtime_args require a linked problem. "
-                    "Pass problem= when specifying bindings."
+                    "constexpr_args, runtime_args, and type_args require a linked "
+                    "problem. Pass problem= when specifying bindings."
                 )
         if name in Registry._kernels:
             raise ValueError(
@@ -280,6 +296,7 @@ class Registry:
                 name, problem,
                 constexpr_args=constexpr_args,
                 runtime_args=runtime_args,
+                type_args=type_args,
             )
 
     @staticmethod
@@ -293,6 +310,7 @@ class Registry:
         problem: str | None = None,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
+        type_args: list[str] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator that registers the decorated callable as a kernel source.
 
@@ -307,6 +325,8 @@ class Registry:
             grid_generator: Grid dimension callable.
             compile_flags: Backend-specific flags.
             problem: If given, links this kernel to the named problem.
+            type_args: List of kernel template parameter names bound to
+                the current dtype from the problem's ``dtypes`` sweep.
 
         Returns:
             A decorator that registers and returns the decorated callable.
@@ -333,6 +353,7 @@ class Registry:
                 problem=problem,
                 constexpr_args=constexpr_args,
                 runtime_args=runtime_args,
+                type_args=type_args,
             )
             return fn
         return decorator
@@ -348,6 +369,7 @@ class Registry:
         *,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
+        type_args: list[str] | None = None,
     ) -> None:
         """Create a many-to-many link between a kernel and a problem.
 
@@ -355,10 +377,11 @@ class Registry:
         validation is deferred to ``validate()`` or pipeline entry.
         Duplicate links are silently ignored.
 
-        If either ``constexpr_args`` or ``runtime_args`` is provided, the
-        binding is stored (or replaced) under ``(kernel_name, problem_name)``.
-        Calling ``link()`` with both as ``None`` on an already-bound pair does
-        **not** erase the existing binding.
+        If any of ``constexpr_args``, ``runtime_args``, or ``type_args``
+        is provided, the binding is stored (or replaced) under
+        ``(kernel_name, problem_name)``.  Calling ``link()`` with all
+        as ``None`` on an already-bound pair does **not** erase the
+        existing binding.
 
         Args:
             kernel_name: Registered (or future) kernel name.
@@ -367,6 +390,8 @@ class Registry:
                 compile-time specialisation.
             runtime_args: Ordered problem size keys passed as scalar
                 ``extra_args`` to ``Runner.run()``.
+            type_args: List of kernel template parameter names bound to
+                the current dtype from the problem's ``dtypes`` sweep.
 
         Example::
 
@@ -376,10 +401,11 @@ class Registry:
         Registry._kernel_to_problems.setdefault(kernel_name, set()).add(problem_name)
         Registry._problem_to_kernels.setdefault(problem_name, set()).add(kernel_name)
 
-        if constexpr_args is not None or runtime_args is not None:
+        if constexpr_args is not None or runtime_args is not None or type_args is not None:
             Registry._link_bindings[(kernel_name, problem_name)] = _LinkBinding(
                 constexpr_args=dict(constexpr_args or {}),
                 runtime_args=tuple(runtime_args or []),
+                type_args=tuple(type_args or []),
             )
 
     @staticmethod
@@ -708,6 +734,38 @@ class Registry:
                         f" references unknown size key '{size_key}'"
                         f" in problem '{prob_name}'"
                     )
+
+            # Validate type_args: require non-empty dtypes on the problem
+            if binding.type_args:
+                prob_dtypes = getattr(problem, "dtypes", None)
+                if not prob_dtypes:
+                    messages.append(
+                        f"error: kernel '{kernel_name}' has type_args but "
+                        f"problem '{prob_name}' has no dtypes defined"
+                    )
+                # type_args must not overlap with constexpr_args keys
+                overlap = set(binding.type_args) & set(binding.constexpr_args.keys())
+                if overlap:
+                    messages.append(
+                        f"error: kernel '{kernel_name}' type_args "
+                        f"{sorted(overlap)} overlap with constexpr_args"
+                    )
+                # type_args must be in template_params if defined
+                kernel_entry = Registry._kernels.get(kernel_name)
+                if kernel_entry is not None:
+                    template_params = kernel_entry.compile_flags.get("template_params", [])
+                    type_params = kernel_entry.compile_flags.get("type_params", [])
+                    for ta in binding.type_args:
+                        if template_params and ta not in template_params:
+                            messages.append(
+                                f"error: kernel '{kernel_name}' type_arg "
+                                f"'{ta}' not in template_params"
+                            )
+                        if type_params and ta not in type_params:
+                            messages.append(
+                                f"error: kernel '{kernel_name}' type_arg "
+                                f"'{ta}' not in type_params"
+                            )
 
         return messages
 

@@ -205,7 +205,7 @@ class TestIsolatedForks:
         compiled_spec_names: list[str] = []
 
         class TrackingCompiler(FakeCompiler):
-            def compile(self, spec, config, constexpr_sizes=None):
+            def compile(self, spec, config, constexpr_sizes=None, type_args=None):
                 compiled_spec_names.append(spec.name)
                 return super().compile(spec, config, constexpr_sizes)
 

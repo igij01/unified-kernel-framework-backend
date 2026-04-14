@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from kernel_pipeline_backend.core.types import CompileIdentity, CompiledKernel, KernelConfig, KernelSpec
 
@@ -40,8 +40,9 @@ class Compiler(Protocol):
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompileIdentity:
-        """Return the compile identity for this (spec, config, constexpr_sizes) triple.
+        """Return the compile identity for this (spec, config, constexpr_sizes, type_args) tuple.
 
         The identity is used by the autotuner as a cache key and emitted
         through the plugin system so plugins can inspect compile events.
@@ -52,6 +53,10 @@ class Compiler(Protocol):
             spec: Kernel specification.
             config: Kernel configuration.
             constexpr_sizes: Problem-size values baked in at compile time.
+            type_args: Mapping of template parameter name to resolved
+                backend type string (e.g. ``{"T": "half"}``).  Only
+                relevant for backends that support type-parameterized
+                kernels.  Defaults to ``None``.
 
         Returns:
             A ``CompileIdentity`` uniquely identifying this compilation.
@@ -63,6 +68,7 @@ class Compiler(Protocol):
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompiledKernel:
         """Compile a kernel with a specific configuration.
 
@@ -75,6 +81,10 @@ class Compiler(Protocol):
                 The backend decides how to encode them; the autotuner only
                 resolves which values to forward.  Defaults to ``None``
                 (no compile-time size specialization).
+            type_args: Mapping of template parameter name to resolved
+                backend type string (e.g. ``{"T": "half"}``).  Only
+                relevant for backends that support type-parameterized
+                kernels.  Defaults to ``None``.
 
         Returns:
             A CompiledKernel whose ``artifact`` the corresponding Runner
@@ -82,6 +92,25 @@ class Compiler(Protocol):
 
         Raises:
             CompilationError: If compilation fails.
+        """
+        ...
+
+    def dtype_to_str(self, dtype: Any) -> str:
+        """Map a torch dtype to this backend's native type string.
+
+        For example, the CUDA backend maps ``torch.float16`` to ``"half"``.
+
+        Args:
+            dtype: A ``torch.dtype`` value.
+
+        Returns:
+            The backend-specific type string for use in template
+            instantiation or code generation.
+
+        Raises:
+            NotImplementedError: If this backend does not support
+                type-parameterized kernels.
+            ValueError: If the dtype has no known mapping.
         """
         ...
 

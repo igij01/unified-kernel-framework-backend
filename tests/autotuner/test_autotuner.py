@@ -293,7 +293,7 @@ class TestVerification:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 return [[0.0]]
 
             def reference(self, inputs, sizes):
@@ -355,7 +355,7 @@ class TestVerification:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 return [[1.0, 2.0, 3.0]]
 
             def reference(self, inputs, sizes):
@@ -479,7 +479,7 @@ class TestPluginEvents:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 return [[0.0]]
 
             def reference(self, inputs, sizes):
@@ -952,7 +952,7 @@ class TestLinkBindings:
         seen_constexpr: list[dict] = []
 
         class CapturingCompiler(FakeCompiler):
-            def compile(self, spec, config, constexpr_sizes=None):
+            def compile(self, spec, config, constexpr_sizes=None, type_args=None):
                 seen_constexpr.append(dict(constexpr_sizes or {}))
                 return super().compile(spec, config, constexpr_sizes)
 

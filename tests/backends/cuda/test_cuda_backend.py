@@ -760,6 +760,7 @@ void wmma_dummy(float* out) {
 """
 
 # Unit-level test: verify torch include paths are prepended in options.
+@requires_gpu
 class TestMmaHeaderIncludePathFix:
     """Regression for issue #002: crt/mma.h missing from pip-installed headers.
 

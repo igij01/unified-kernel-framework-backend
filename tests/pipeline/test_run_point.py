@@ -457,7 +457,7 @@ class TestRunPointBindingResolution:
             class _P:
                 sizes = {"M": [128], "N": [64]}
                 atol = rtol = 1e-3
-                def initialize(self, s): return [[1.0]]
+                def initialize(self, s, dtype=None): return [[1.0]]
                 def reference(self, i, s): return list(i)
 
             Registry.register_problem("p", _P())
@@ -501,7 +501,7 @@ class TestRunPointBindingResolution:
         captured_constexpr: list[dict] = []
 
         class CapturingCompiler(FakeCompiler):
-            def compile(self, spec, config, constexpr_sizes=None):
+            def compile(self, spec, config, constexpr_sizes=None, type_args=None):
                 captured_constexpr.append(dict(constexpr_sizes or {}))
                 from kernel_pipeline_backend.core.types import CompiledKernel
                 return CompiledKernel(spec=spec, config=config)
@@ -514,7 +514,7 @@ class TestRunPointBindingResolution:
             class _P:
                 sizes = {"M": [128], "HEAD_DIM": [64]}
                 atol = rtol = 1e-3
-                def initialize(self, s): return [[1.0]]
+                def initialize(self, s, dtype=None): return [[1.0]]
                 def reference(self, i, s): return list(i)
 
             Registry.register_problem("p", _P())
@@ -559,7 +559,7 @@ class TestRunPointBindingResolution:
         class NoRefProblem:
             sizes = {"M": [128]}
             atol = rtol = 1e-3
-            def initialize(self, s): return [[1.0]]
+            def initialize(self, s, dtype=None): return [[1.0]]
             # No reference method
 
         pipeline = _make_pipeline()

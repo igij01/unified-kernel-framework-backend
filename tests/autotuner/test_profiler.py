@@ -563,9 +563,9 @@ class TestProfileInputsAndGrid:
         calls = []
 
         class TrackingProblem(FakeProblem):
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 calls.append(dict(sizes))
-                return super().initialize(sizes)
+                return super().initialize(sizes, dtype=dtype)
 
         at = Profiler(
             runner=FakeRunner(), device=FakeDeviceHandle(),

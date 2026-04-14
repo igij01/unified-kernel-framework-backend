@@ -140,6 +140,7 @@ class TritonCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompileIdentity:
         """Return the compile identity for this Triton kernel compilation.
 

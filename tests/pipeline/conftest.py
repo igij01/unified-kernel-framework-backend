@@ -78,6 +78,9 @@ class FakeCompiler:
     def backend_name(self) -> str:
         return "fake"
 
+    def dtype_to_str(self, dtype: Any) -> str:
+        return str(dtype)
+
     def generate_configs(self, spec: KernelSpec) -> list[KernelConfig]:
         return list(self._configs)
 
@@ -86,6 +89,7 @@ class FakeCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompileIdentity:
         return CompileIdentity(
             version_hash=spec.name,
@@ -99,6 +103,7 @@ class FakeCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompiledKernel:
         import json
 
@@ -193,7 +198,7 @@ class FakeProblem:
         self._filter_fn = filter_fn
         self._fail_sizes = fail_sizes or set()
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtype: Any = None) -> list[Any]:
         return self._init_fn(sizes)
 
     def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:

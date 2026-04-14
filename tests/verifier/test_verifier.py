@@ -230,9 +230,9 @@ class TestVerifyPlumbing:
         calls = []
 
         class TrackingProblem(FakeProblem):
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtype=None):
                 calls.append(dict(sizes))
-                return super().initialize(sizes)
+                return super().initialize(sizes, dtype=dtype)
 
         v = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
         v.verify(make_compiled(), TrackingProblem(), {"M": 128, "N": 256})

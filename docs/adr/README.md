@@ -21,6 +21,7 @@ This directory contains Architecture Decision Records (ADRs) for kernel-pipeline
 | [0013](0013-link-time-size-bindings.md) | Link-Time Size Bindings for Kernel Specialization and Runtime Shape Arguments | Proposed | 2026-04-08 |
 | [0014](0014-jit-compilation-with-constexpr-sizes.md) | JIT Compilation with Per-Point Constexpr-Size Resolution | Proposed | 2026-04-09 |
 | [0015](0015-backend-contract-redesign.md) | Backend Contract Redesign — Launch Ownership, Compile Identity, Unified Instrumentation | Proposed | 2026-04-10 |
+| [0016](0016-dtype-template-mapping.md) | Input Dtype to C++ Template Type Mapping | Proposed | 2026-04-13 |
 
 ## Creating a New ADR
 
