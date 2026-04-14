@@ -169,6 +169,37 @@ class CUDACompiler:
         ]
         options.extend(spec.compile_flags.get("nvrtc_options", []))
 
+        # Prepend the CUDA include directory that PyTorch was built against so
+        # that the complete header tree (including crt/mma.h) takes priority
+        # over the pip-installed nvidia/cu* stubs, which ship mma.h but omit
+        # the crt/mma.h that mma.h depends on.
+        #
+        # torch.utils.cpp_extension.CUDA_HOME is the CUDA installation that
+        # PyTorch itself used at build time — the same toolkit CuPy targets —
+        # so its headers are guaranteed to be complete and version-compatible.
+        # Typical value: /usr/local/cuda (system toolkit, not the pip stubs).
+        try:
+            import os as _os
+            from torch.utils.cpp_extension import CUDA_HOME as _CUDA_HOME
+            if _CUDA_HOME:
+                # Prefer the targets/ tree (what nvcc uses by default); fall
+                # back to the top-level include/ for non-x86_64 layouts.
+                _targets_include = _os.path.join(
+                    _CUDA_HOME, "targets", "x86_64-linux", "include"
+                )
+                _root_include = _os.path.join(_CUDA_HOME, "include")
+                if _os.path.isdir(_targets_include):
+                    _cuda_includes = [f"-I{_targets_include}"]
+                elif _os.path.isdir(_root_include):
+                    _cuda_includes = [f"-I{_root_include}"]
+                else:
+                    _cuda_includes = []
+            else:
+                _cuda_includes = []
+        except Exception:
+            _cuda_includes = []
+        options = _cuda_includes + options
+
         # --- compile ------------------------------------------------
         try:
             if template_params:

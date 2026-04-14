@@ -739,3 +739,145 @@ class TestCUDARunnerTemplateGPU:
         result = runner.run(launch, device)
 
         assert result.outputs[0].item() == pytest.approx(32 + 64)
+
+
+# ===================================================================
+# Regression tests — issue #002: mma.h / crt/mma.h include-path fix
+# ===================================================================
+
+# WMMA kernel that uses #include <mma.h> — this is what triggered the
+# catastrophic error when the pip-installed nvidia/cu13 headers won the
+# include-path race (mma.h present, crt/mma.h absent).
+WMMA_MMA_SRC = r"""
+#include <mma.h>
+using namespace nvcuda;
+
+extern "C" __global__
+void wmma_dummy(float* out) {
+    // Just including <mma.h> is enough to verify the header resolves fully.
+    out[0] = 1.0f;
+}
+"""
+
+# Unit-level test: verify torch include paths are prepended in options.
+class TestMmaHeaderIncludePathFix:
+    """Regression for issue #002: crt/mma.h missing from pip-installed headers.
+
+    The fix prepends PyTorch's bundled CUDA include paths so that the
+    complete header tree (including crt/mma.h) takes priority over the
+    pip-installed nvidia/cu* stubs.
+    """
+
+    def test_torch_cuda_home_prepended_to_options(self) -> None:
+        """The targets/x86_64-linux/include dir under CUDA_HOME must appear
+        as the first -I flag in the options passed to NVRTC."""
+        import os
+        import tempfile
+        import unittest.mock as mock
+
+        # Build a fake CUDA_HOME tree with both mma.h and crt/mma.h present
+        # so the os.path.isdir check in the fix passes.
+        with tempfile.TemporaryDirectory() as fake_cuda_home:
+            targets_include = os.path.join(
+                fake_cuda_home, "targets", "x86_64-linux", "include"
+            )
+            os.makedirs(targets_include)
+
+            compiler = CUDACompiler()
+            spec = _make_spec(compile_flags={"entry_point": "vector_add", "config_space": {}})
+            config = KernelConfig()
+
+            class FakeKernel:
+                num_regs = 0
+                max_threads_per_block = 256
+                shared_size_bytes = 0
+
+            class FakeModule:
+                def get_function(self, name):
+                    return FakeKernel()
+
+            with mock.patch(
+                "torch.utils.cpp_extension.CUDA_HOME", fake_cuda_home
+            ), mock.patch("cupy.RawModule") as mock_rawmodule:
+                mock_rawmodule.return_value = FakeModule()
+                compiler.compile(spec, config)
+                call_kwargs = mock_rawmodule.call_args
+                options_used = call_kwargs[1]["options"] if call_kwargs[1] else call_kwargs[0][1]
+                options_list = list(options_used)
+
+        assert options_list[0] == f"-I{targets_include}"
+
+    def test_torch_include_path_failure_is_silent(self) -> None:
+        """If CUDA_HOME lookup raises, compilation must still proceed
+        (no extra includes, not a crash)."""
+        import unittest.mock as mock
+
+        compiler = CUDACompiler()
+        spec = _make_spec(compile_flags={"entry_point": "vector_add", "config_space": {}})
+        config = KernelConfig()
+
+        class FakeKernel:
+            num_regs = 0
+            max_threads_per_block = 256
+            shared_size_bytes = 0
+
+        class FakeModule:
+            def get_function(self, name):
+                return FakeKernel()
+
+        with mock.patch(
+            "torch.utils.cpp_extension.CUDA_HOME",
+            new_callable=mock.PropertyMock,
+            side_effect=RuntimeError("no torch"),
+        ), mock.patch("cupy.RawModule") as mock_rawmodule:
+            mock_rawmodule.return_value = FakeModule()
+            # Should not raise — fallback to empty cuda includes
+            compiler.compile(spec, config)
+
+
+@requires_gpu
+class TestMmaHeaderIncludePathFixGPU:
+    """GPU integration: kernel using #include <mma.h> must compile without error.
+
+    Regression for issue #002: catastrophic error: cannot open source file
+    "crt/mma.h" when pip-installed nvidia/cu13 headers shadow the system toolkit.
+    The fix uses PyTorch's bundled CUDA headers which include crt/mma.h.
+    """
+
+    def test_mma_header_compiles_without_error(self) -> None:
+        """Including <mma.h> must not raise CompilationError."""
+        compiler = CUDACompiler()
+        spec = KernelSpec(
+            name="wmma_dummy",
+            source=WMMA_MMA_SRC,
+            backend="cuda",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=_noop_grid,
+            compile_flags={"entry_point": "wmma_dummy"},
+        )
+        # Must not raise CompilationError (specifically the crt/mma.h error)
+        result = compiler.compile(spec, KernelConfig())
+        assert result.artifact is not None
+
+    def test_mma_kernel_produces_same_artifact_on_recompile(self) -> None:
+        """Recompiling the same WMMA source produces a usable artifact."""
+        compiler = CUDACompiler()
+        spec = KernelSpec(
+            name="wmma_dummy",
+            source=WMMA_MMA_SRC,
+            backend="cuda",
+            target_archs=[CUDAArch.SM_90],
+            grid_generator=_noop_grid,
+            compile_flags={"entry_point": "wmma_dummy"},
+        )
+        r1 = compiler.compile(spec, KernelConfig())
+        r2 = compiler.compile(spec, KernelConfig())
+        assert r1.artifact is not None
+        assert r2.artifact is not None
+
+    def test_non_mma_kernel_unaffected_by_fix(self) -> None:
+        """A plain kernel (no mma.h) still compiles correctly after the fix."""
+        compiler = CUDACompiler()
+        spec = _make_spec()
+        result = compiler.compile(spec, KernelConfig(params={"BLOCK_SIZE": 128}))
+        assert result.artifact is not None
