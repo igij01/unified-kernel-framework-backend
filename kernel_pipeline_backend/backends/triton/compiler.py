@@ -164,6 +164,7 @@ class TritonCompiler:
         spec: KernelSpec,
         config: KernelConfig,
         constexpr_sizes: dict[str, int] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> CompiledKernel:
         """Bind a Triton kernel with the given configuration.
 

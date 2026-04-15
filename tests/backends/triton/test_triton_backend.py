@@ -359,6 +359,74 @@ class TestTritonAutotuneGenerateConfigs:
         assert configs[0].params == {"BLOCK_SIZE": 256}
 
 
+class TestTritonCompileTypeArgs:
+    """Issue #003: TritonCompiler.compile() missing type_args parameter.
+
+    The autotuner passes type_args= unconditionally to every backend's
+    compile(). TritonCompiler.compile() was missing this parameter,
+    causing a TypeError for any Triton kernel.
+    """
+
+    @pytest.fixture()
+    def compiler(self) -> TritonCompiler:
+        return TritonCompiler()
+
+    @pytest.fixture()
+    def spec(self) -> KernelSpec:
+        def dummy():
+            pass
+        return _make_spec(source=dummy)
+
+    def test_compile_accepts_type_args_kwarg(
+        self, compiler: TritonCompiler, spec: KernelSpec
+    ) -> None:
+        """Reproduces the TypeError from issue #003."""
+        result = compiler.compile(
+            spec, KernelConfig(), type_args={"T": "float"}
+        )
+        assert isinstance(result, CompiledKernel)
+
+    def test_compile_accepts_none_type_args(
+        self, compiler: TritonCompiler, spec: KernelSpec
+    ) -> None:
+        """Pipeline often passes type_args=None."""
+        result = compiler.compile(spec, KernelConfig(), type_args=None)
+        assert isinstance(result, CompiledKernel)
+
+    def test_compile_accepts_empty_type_args(
+        self, compiler: TritonCompiler, spec: KernelSpec
+    ) -> None:
+        result = compiler.compile(spec, KernelConfig(), type_args={})
+        assert isinstance(result, CompiledKernel)
+
+    def test_type_args_does_not_affect_output(
+        self, compiler: TritonCompiler, spec: KernelSpec
+    ) -> None:
+        """type_args is ignored — output should be identical with or without it."""
+        config = KernelConfig(params={"BLOCK_SIZE": 128})
+        result_without = compiler.compile(spec, config)
+        result_with = compiler.compile(
+            spec, config, type_args={"T": "float", "U": "half"}
+        )
+        assert result_without.artifact is result_with.artifact
+        assert result_without.config == result_with.config
+
+    def test_different_sources_still_differ_with_type_args(
+        self, compiler: TritonCompiler
+    ) -> None:
+        """type_args doesn't mask actual kernel differences."""
+        def kernel_a():
+            pass
+        def kernel_b():
+            pass
+
+        spec_a = _make_spec(source=kernel_a)
+        spec_b = _make_spec(source=kernel_b)
+        result_a = compiler.compile(spec_a, KernelConfig(), type_args={"T": "float"})
+        result_b = compiler.compile(spec_b, KernelConfig(), type_args={"T": "float"})
+        assert result_a.artifact is not result_b.artifact
+
+
 class TestTritonAutotuneCompileUnit:
     @pytest.fixture()
     def compiler(self) -> TritonCompiler:
