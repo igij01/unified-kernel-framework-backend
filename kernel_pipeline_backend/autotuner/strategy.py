@@ -21,14 +21,15 @@ from kernel_pipeline_backend.core.types import (
 
 
 def _enumerate_all_points(space: SearchSpace) -> list[SearchPoint]:
-    """Generate every (size_combination, config) point in the search space.
+    """Generate every (size_combination, config, dtype) point in the search space.
 
     Args:
         space: The search space to enumerate.
 
     Returns:
         List of all SearchPoints from the cartesian product of size
-        domains crossed with all configs. Empty if either axis is empty.
+        domains crossed with all configs crossed with all dtypes.
+        Empty if size_specs or configs is empty.
     """
     if not space.size_specs or not space.configs:
         return []
@@ -37,10 +38,11 @@ def _enumerate_all_points(space: SearchSpace) -> list[SearchPoint]:
     domains = [list(space.size_specs[n]) for n in names]
 
     points: list[SearchPoint] = []
-    for size_combo in itertools.product(*domains):
-        sizes = dict(zip(names, size_combo))
-        for config in space.configs:
-            points.append(SearchPoint(sizes=sizes, config=config))
+    for dtype in space.dtypes:
+        for size_combo in itertools.product(*domains):
+            sizes = dict(zip(names, size_combo))
+            for config in space.configs:
+                points.append(SearchPoint(sizes=sizes, config=config, dtype=dtype))
     return points
 
 
@@ -48,10 +50,10 @@ def _point_key(point: SearchPoint) -> str:
     """Create a hashable string key for a SearchPoint.
 
     Uses deterministic JSON serialization so that two SearchPoints with
-    identical sizes and config params produce the same key.
+    identical sizes, config params, and dtype produce the same key.
     """
     return json.dumps(
-        {"s": point.sizes, "c": point.config.params},
+        {"s": point.sizes, "c": point.config.params, "d": point.dtype},
         sort_keys=True,
         default=str,
     )
@@ -462,7 +464,7 @@ class TwoPhase:
         if not top_configs:
             top_configs = space.configs[: self._top_k]
 
-        return SearchSpace(size_specs=space.size_specs, configs=top_configs)
+        return SearchSpace(size_specs=space.size_specs, configs=top_configs, dtypes=space.dtypes)
 
     def is_converged(self, results: list[AutotuneResult]) -> bool:
         """Converged when the exploit phase is converged."""

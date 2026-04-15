@@ -216,9 +216,11 @@ class Pipeline:
         configs = self._compiler.generate_configs(spec)
 
         # -- 3. Build search space ----------------------------------------
+        problem_dtypes = getattr(problem, "dtypes", None) or [None]
         space = SearchSpace(
             size_specs=dict(problem.sizes),
             configs=configs,
+            dtypes=list(problem_dtypes),
         )
 
         # -- 4. Autotuner: JIT compile, strategy loop, verify, profile ----

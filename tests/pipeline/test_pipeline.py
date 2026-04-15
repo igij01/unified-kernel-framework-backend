@@ -627,3 +627,62 @@ class TestResultTypes:
         spec = make_spec()
         err = PipelineError(spec, "verify", "bad output")
         assert err.exception is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #004 — Pipeline must pass problem.dtypes into SearchSpace
+# ---------------------------------------------------------------------------
+
+
+class TestSearchSpaceDtypeAxisPipeline:
+    """Issue #004: Pipeline._process_kernel must propagate problem.dtypes to SearchSpace.
+
+    When a problem declares dtypes, the pipeline must construct a SearchSpace
+    with those dtypes so the strategy loop visits one SearchPoint per
+    (size, config, dtype) combination.
+    """
+
+    async def test_dtype_axis_multiplies_result_count(self) -> None:
+        """Pipeline produces one result per (size, config, dtype) combination."""
+
+        class TwoDtypeProblem(FakeProblem):
+            dtypes = ["float16", "float32"]
+
+        problem = TwoDtypeProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        result = await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        # 1 size × 1 config × 2 dtypes = 2 results
+        assert len(result.autotuned) == 2
+
+    async def test_result_point_dtype_matches_problem_dtype(self) -> None:
+        """Each AutotuneResult.point.dtype reflects the problem's dtype."""
+
+        class SingleDtypeProblem(FakeProblem):
+            dtypes = ["bfloat16"]
+
+        problem = SingleDtypeProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        result = await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        assert len(result.autotuned) == 1
+        assert result.autotuned[0].point.dtype == "bfloat16"
+
+    async def test_problem_without_dtypes_defaults_to_none(self) -> None:
+        """Problems with no dtypes attribute produce dtype=None search points."""
+        # FakeProblem has no dtypes — should silently default to [None]
+        problem = FakeProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        result = await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        assert len(result.autotuned) == 1
+        assert result.autotuned[0].point.dtype is None

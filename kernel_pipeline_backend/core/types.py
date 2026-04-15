@@ -329,10 +329,14 @@ class SearchSpace:
     Attributes:
         size_specs: Problem-size axes and their domains (from Problem.sizes).
         configs: Candidate kernel configurations (from Compiler.generate_configs).
+        dtypes: Dtype sweep domain. Defaults to ``[None]`` for problems that do
+            not declare a ``dtypes`` attribute (single-dtype or dtype-agnostic
+            problems). The pipeline sets this from ``Problem.dtypes``.
     """
 
     size_specs: dict[str, SizeSpec] = field(default_factory=dict)
     configs: list[KernelConfig] = field(default_factory=list)
+    dtypes: list[Any] = field(default_factory=lambda: [None])
 
 
 @dataclass(frozen=True)

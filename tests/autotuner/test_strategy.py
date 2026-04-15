@@ -564,3 +564,112 @@ class TestTwoPhase:
         # That point is already in results, so exploit sees 0 unevaluated
         # The exploit Exhaustive has _total_points set, and len(results) >= _total_points
         assert strategy.is_converged(results) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #004 — SearchSpace / Strategy does not expand dtype axis
+# ---------------------------------------------------------------------------
+
+
+class TestSearchSpaceDtypeAxis:
+    """Issue #004: SearchSpace missing dtypes field and strategy missing dtype expansion.
+
+    Verifies that SearchSpace.dtypes is included in point enumeration and
+    that _point_key distinguishes points that differ only by dtype.
+    """
+
+    def test_enumerate_expands_dtype_axis(self) -> None:
+        """_enumerate_all_points produces sizes × configs × dtypes points."""
+        space = SearchSpace(
+            size_specs={"M": [128, 256]},
+            configs=[KernelConfig(params={"BS": 64})],
+            dtypes=["float16", "float32"],
+        )
+        points = _enumerate_all_points(space)
+        assert len(points) == 4  # 2 sizes × 1 config × 2 dtypes
+        dtypes_seen = {p.dtype for p in points}
+        assert dtypes_seen == {"float16", "float32"}
+
+    def test_enumerate_default_dtypes_yields_none(self) -> None:
+        """SearchSpace with default dtypes=[None] sets dtype=None on every point."""
+        space = SearchSpace(
+            size_specs={"M": [128]},
+            configs=[KernelConfig(params={"BS": 64})],
+        )
+        points = _enumerate_all_points(space)
+        assert len(points) == 1
+        assert points[0].dtype is None
+
+    def test_point_key_distinguishes_dtype(self) -> None:
+        """_point_key produces distinct keys for points differing only by dtype."""
+        p_f16 = SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float16")
+        p_f32 = SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float32")
+        assert _point_key(p_f16) != _point_key(p_f32)
+
+    def test_point_key_same_dtype_same_key(self) -> None:
+        """_point_key is deterministic: identical points with same dtype give the same key."""
+        p1 = SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float16")
+        p2 = SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float16")
+        assert _point_key(p1) == _point_key(p2)
+
+    def test_unevaluated_points_respects_dtype(self) -> None:
+        """_unevaluated_points treats same (sizes, config) with different dtypes as distinct."""
+        space = SearchSpace(
+            size_specs={"M": [128]},
+            configs=[KernelConfig(params={"BS": 64})],
+            dtypes=["float16", "float32"],
+        )
+        # Only float16 has been evaluated
+        evaluated = [
+            AutotuneResult(
+                point=SearchPoint(
+                    sizes={"M": 128},
+                    config=KernelConfig(params={"BS": 64}),
+                    dtype="float16",
+                ),
+                time_ms=1.0,
+            )
+        ]
+        remaining = _unevaluated_points(space, evaluated)
+        assert len(remaining) == 1
+        assert remaining[0].dtype == "float32"
+
+    def test_two_phase_narrow_space_preserves_dtypes(self) -> None:
+        """TwoPhase._narrow_space carries dtypes into the narrowed SearchSpace."""
+        space = SearchSpace(
+            size_specs={"M": [128]},
+            configs=[
+                KernelConfig(params={"BS": 64}),
+                KernelConfig(params={"BS": 128}),
+            ],
+            dtypes=["float16", "float32"],
+        )
+        explore = Exhaustive()
+        exploit = Exhaustive()
+        strategy = TwoPhase(explore=explore, exploit=exploit, top_k=1)
+
+        # Exhaust the explore phase
+        strategy.suggest(space, [])
+        results = [
+            AutotuneResult(
+                point=SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float16"),
+                time_ms=2.0,
+            ),
+            AutotuneResult(
+                point=SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 128}), dtype="float16"),
+                time_ms=1.0,
+            ),
+            AutotuneResult(
+                point=SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 64}), dtype="float32"),
+                time_ms=2.0,
+            ),
+            AutotuneResult(
+                point=SearchPoint(sizes={"M": 128}, config=KernelConfig(params={"BS": 128}), dtype="float32"),
+                time_ms=1.0,
+            ),
+        ]
+        strategy.suggest(space, results)
+
+        assert strategy.in_exploit_phase is True
+        assert strategy._exploit_space is not None
+        assert strategy._exploit_space.dtypes == ["float16", "float32"]
