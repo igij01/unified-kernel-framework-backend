@@ -22,6 +22,8 @@ This directory contains Architecture Decision Records (ADRs) for kernel-pipeline
 | [0014](0014-jit-compilation-with-constexpr-sizes.md) | JIT Compilation with Per-Point Constexpr-Size Resolution | Proposed | 2026-04-09 |
 | [0015](0015-backend-contract-redesign.md) | Backend Contract Redesign — Launch Ownership, Compile Identity, Unified Instrumentation | Proposed | 2026-04-10 |
 | [0016](0016-dtype-template-mapping.md) | Input Dtype to C++ Template Type Mapping | Proposed | 2026-04-13 |
+| [0017](0017-problem-versioning.md) | Problem Versioning | Proposed | 2026-04-26 |
+| [0018](0018-binary-artifact-exposure.md) | Binary Artifact Exposure on `CompiledKernel` | Proposed | 2026-04-26 |
 
 ## Creating a New ADR
 
