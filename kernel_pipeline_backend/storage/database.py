@@ -16,6 +16,7 @@ from kernel_pipeline_backend.core.types import (
     CUDAArch,
     KernelConfig,
     KernelHash,
+    ReferenceHash,
     SearchPoint,
 )
 
@@ -70,6 +71,7 @@ class DatabaseStore:
                 config_json TEXT NOT NULL,
                 time_ms     REAL NOT NULL,
                 metrics_json TEXT NOT NULL DEFAULT '{}',
+                reference_hash TEXT DEFAULT NULL,
                 timestamp   TEXT NOT NULL,
                 UNIQUE(kernel_hash, arch, sizes_json, config_json)
             )
@@ -102,7 +104,7 @@ class DatabaseStore:
 
         Column order matches the table definition:
         ``(id, kernel_hash, arch, sizes_json, config_json, time_ms,
-        metrics_json, timestamp)``.
+        metrics_json, reference_hash, timestamp)``.
         """
         (
             _id,
@@ -112,6 +114,7 @@ class DatabaseStore:
             config_json,
             time_ms,
             metrics_json,
+            reference_hash_str,
             timestamp_str,
         ) = row
 
@@ -124,6 +127,7 @@ class DatabaseStore:
             ),
             time_ms=time_ms,
             metrics=json.loads(metrics_json),
+            reference_hash=ReferenceHash(reference_hash_str) if reference_hash_str else None,
             timestamp=datetime.fromisoformat(timestamp_str),
         )
 
@@ -152,6 +156,7 @@ class DatabaseStore:
                 self._serialize_config(r.point.config),
                 r.time_ms,
                 json.dumps(r.metrics),
+                str(r.reference_hash) if r.reference_hash is not None else None,
                 r.timestamp.isoformat(),
             )
             for r in results
@@ -161,8 +166,8 @@ class DatabaseStore:
             """
             INSERT OR REPLACE INTO autotune_results
                 (kernel_hash, arch, sizes_json, config_json,
-                 time_ms, metrics_json, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 time_ms, metrics_json, reference_hash, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

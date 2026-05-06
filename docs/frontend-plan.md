@@ -14,11 +14,20 @@ ADR-0001).  What's missing is the **packaging** half: turning the
 backend's outputs (autotune results + compiled kernels) into a library
 that PyTorch users can `import` and call.
 
-This document captures the planned frontend architecture and the two
+This document captures the planned frontend architecture and the
 backend ADRs it depends on:
 
-- [ADR-0017 — Problem Versioning](adr/0017-problem-versioning.md)
 - [ADR-0018 — Binary Artifact Exposure on `CompiledKernel`](adr/0018-binary-artifact-exposure.md)
+- [ADR-0019 — Problem Versioning Belongs to the Frontend](adr/0019-problem-versioning-belongs-to-frontend.md)
+  (supersedes the withdrawn ADR-0017)
+
+**Note on versioning ownership:** Earlier drafts of this plan assumed
+the backend would host a `problem_versions` table (ADR-0017).  That
+proposal has been superseded by ADR-0019: versioning is a
+**frontend-owned** concern.  The backend exposes the primitives
+(`KernelHasher`, `Registry.kernels_for_problem`,
+`DatabaseStore.best_config`) and a narrower `ReferenceHash` for
+verification provenance; the frontend assembles the release manifest.
 
 **Scope of v1:** PyTorch only.  TensorFlow is a non-goal for v1; the
 manifest format will be designed to be target-agnostic so a TF target
@@ -42,13 +51,22 @@ custom ops, dual-framework C++ codegen.
 1. Resolve  →  2. AOT Compile  →  3. Codegen  →  4. Build & Package
 ```
 
-**Stage 1 — Resolve.** User selects `(problem_name, problem_version)`.
-Frontend queries the backend's `Registry`
-([kernel_pipeline_backend/registry/registry.py](../kernel_pipeline_backend/registry/registry.py))
-to enumerate kernels for that problem (`kernels_for_problem`), pulls
-each `KernelSpec` and `_LinkBinding`, and queries
+**Stage 1 — Resolve.** User selects `(problem_name, version_label)`.
+Resolution is **frontend-owned** (per ADR-0019):
+
+- If `version_label` matches an entry in the frontend's local manifest
+  index, load the pinned `kernel_hashes` from that manifest.
+- Otherwise (a fresh build against current backend state), enumerate
+  kernels via `Registry.kernels_for_problem`
+  ([kernel_pipeline_backend/registry/registry.py](../kernel_pipeline_backend/registry/registry.py)),
+  hash each `KernelSpec` with the backend's `KernelHasher`, and treat
+  that set as the new manifest about to be sealed.
+
+In both cases, the frontend then queries
 `DatabaseStore.best_config(kernel_hash, arch, sizes)` for tuned
-configs across the full size sweep.
+configs across the size sweep.  The backend has no notion of
+"problem version" — the version concept lives entirely in the
+frontend's manifest store.
 
 **Stage 2 — AOT Compile.** For each resolved kernel, obtain a
 serialized binary (cubin) on disk:
@@ -92,9 +110,17 @@ containing:
 - The generated Python registration modules.
 - The shared C++ launcher `.so` (built once, not per-kernel).
 - A `manifest.json` describing
-  `(problem, version, kernels, archs, sizes_covered)`.
-- Meta info for traceability: backend repo SHA, problem version hash,
-  autotune timestamp range.
+  `(problem_name, label, kernel_hashes, archs, sizes_covered,
+  reference_hash)`.  This manifest *is* the version record (per
+  ADR-0019); there is no corresponding backend table.
+- Meta info for traceability: backend repo SHA, autotune timestamp
+  range, `reference_hash` from the backend's verification record.
+
+In addition to embedding the manifest in the wheel, the frontend
+maintains a local index (filesystem or small SQLite under e.g.
+`~/.kpf/manifests/`) keyed by `(problem_name, label)` so future
+`kpf-build` invocations can resolve labels without rebuilding from
+scratch.
 
 ### Repo layout (new repo: `kernel-pipeline-frontend`)
 
@@ -110,7 +136,9 @@ kernel_pipeline_frontend/
     templates/    — Jinja templates for generated modules
   launcher/       — shared C++ cuLaunchKernel shim
   package/        — wheel assembly, manifest writer
-  cli.py          — `kpf-build --problem matmul --version v3 --target torch`
+  manifests/      — local index of (problem, label) → manifest.json
+                    (frontend-owned versioning, per ADR-0019)
+  cli.py          — `kpf-build --problem matmul --label v3 --target torch`
 ```
 
 ### Critical files the frontend will read (not modify) in this backend
@@ -120,7 +148,7 @@ kernel_pipeline_frontend/
 - [kernel_pipeline_backend/registry/registry.py](../kernel_pipeline_backend/registry/registry.py) — `Registry` singleton
 - [kernel_pipeline_backend/core/types.py](../kernel_pipeline_backend/core/types.py) — `KernelSpec`, `CompiledKernel`
 - [kernel_pipeline_backend/problem/problem.py](../kernel_pipeline_backend/problem/problem.py) — `Problem` protocol, `enumerate_sizes`, `filter_size_points`
-- [kernel_pipeline_backend/versioning/hasher.py](../kernel_pipeline_backend/versioning/hasher.py) — `KernelHasher` (and forthcoming `ProblemHasher` per ADR-0017)
+- [kernel_pipeline_backend/versioning/hasher.py](../kernel_pipeline_backend/versioning/hasher.py) — `KernelHasher` (and forthcoming `ReferenceHasher` per ADR-0019; the `ProblemHasher` originally proposed in ADR-0017 is *not* being implemented)
 
 ---
 
@@ -129,16 +157,16 @@ kernel_pipeline_frontend/
 The frontend depends on two backend changes captured as separate ADRs.
 Both are Proposed as of 2026-04-26.
 
-### ADR-0017 — Problem Versioning
+### ADR-0019 — Problem Versioning Belongs to the Frontend
 
-Adds a content-based `ProblemHash` and a `problem_versions` snapshot
-table so consumers can pin to an immutable
-`(problem_hash, kernel_hashes)` bundle and recover the corresponding
-autotune data deterministically.  Optional human-readable labels
-(`v3`, `release-2026Q2`) supported.  Snapshotting is explicit
-(`Pipeline.snapshot_version(...)`).
+Withdraws ADR-0017.  The backend does **not** gain a `problem_versions`
+table or `snapshot_version` API.  Instead it adds a narrow
+`ReferenceHash` (covering `reference` + `initialize` + tolerances +
+dtypes + sizes domain) recorded on each verification record so
+reference drift triggers re-verification.  All release/version
+semantics — labels, manifests, "list versions" — live in the frontend.
 
-See [adr/0017-problem-versioning.md](adr/0017-problem-versioning.md).
+See [adr/0019-problem-versioning-belongs-to-frontend.md](adr/0019-problem-versioning-belongs-to-frontend.md).
 
 ### ADR-0018 — Binary Artifact Exposure on `CompiledKernel`
 
@@ -157,10 +185,12 @@ See [adr/0018-binary-artifact-exposure.md](adr/0018-binary-artifact-exposure.md)
 
 1. Pick `matmul` (a problem with multiple registered backends in this
    repo) as the v1 driver.
-2. Run the existing backend pipeline to populate `autotune_results`.
-3. Snapshot a problem version (per ADR-0017).
-4. Run `kpf-build --problem matmul --version v1 --target torch` →
-   produces a wheel.
+2. Run the existing backend pipeline to populate `autotune_results`
+   (verification records now carry a `reference_hash` per ADR-0019).
+3. Run `kpf-build --problem matmul --label v1 --target torch` →
+   frontend enumerates kernels, hashes them, queries `best_config`,
+   writes `manifest.json` into the wheel, and records the manifest in
+   its local label index.
 5. In a clean venv: `pip install <wheel>`, then in Python:
    ```python
    import kernel_pipeline_matmul   # the generated package
@@ -181,13 +211,18 @@ This order keeps the backend work in this repo unblocked from the
 external frontend repo:
 
 1. Write ADR-0017 and ADR-0018.  ✅ *Done 2026-04-26.*
-2. Implement backend changes for ADR-0018 — CUDA first, Triton second.
-3. Implement backend changes for ADR-0017 — schema + snapshot API.
-4. Stand up `kernel-pipeline-frontend` repo with stages 1 (Resolve)
+2. Withdraw ADR-0017; write ADR-0019 (versioning belongs to the
+   frontend).  ✅ *Done 2026-05-05.*
+3. Implement backend changes for ADR-0018 — CUDA first, Triton second.
+4. Implement backend changes for ADR-0019 — `ReferenceHasher` +
+   `reference_hash` column on verification records + re-verify on
+   mismatch.
+5. Stand up `kernel-pipeline-frontend` repo with stages 1 (Resolve)
    and 2 (Compile) only; verify cubins land on disk for `matmul`.
-5. Stage 3 (Codegen) for the simplest problem; iterate on the launcher
+6. Stage 3 (Codegen) for the simplest problem; iterate on the launcher
    shim.
-6. Stage 4 (Package) and the end-to-end verification flow above.
+7. Stage 4 (Package) — including manifest writer and local label
+   index — and the end-to-end verification flow above.
 
 ---
 
@@ -196,7 +231,8 @@ external frontend repo:
 | Decision | Choice | Reasoning |
 | --- | --- | --- |
 | Target framework for v1 | PyTorch only | Lean on `torch.export` / AOTInductor where possible; defer TF until the manifest format is proven. |
-| Problem-version semantics | Content-pinned snapshot manifest, optional label | Cheap, immutable, no benchmark-data duplication; labels are UX sugar. |
+| Problem-version ownership | Frontend-owned `manifest.json` per wheel + local label index; backend has no version table (ADR-0019, supersedes 0017) | Versioning is a release/packaging concern, not a verify/autotune concern; keeps backend layered per ADR-0001. |
+| Reference-drift detection | `ReferenceHash` on verification records (ADR-0019) | The actual backend correctness invariant; narrower than a full problem hash. |
 | Triton AOT path | Use `torch.export` / AOTInductor when target=torch; roll own only when adding TF | Avoid duplicating launch glue torch already provides. |
 | Codegen language | Python (with shared C++ `cuLaunchKernel` shim) | Dispatch overhead is negligible vs. kernel runtime; avoids C++ build in install path; `torch.library.custom_op` is the supported surface. |
 | Packaging substrate | Native per-target codegen | TVM evaluated and rejected: built for compilation orchestration, not pre-compiled binary dispatch; `torch_tvm` unmaintained; no TVM→TF export. |

@@ -18,6 +18,38 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Binary artifact — produced by ArtifactExporter, never by the autotune path
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BinaryArtifact:
+    """Exported kernel artifact for redistribution or packaging.
+
+    Produced exclusively by ArtifactExporter.export() — never populated
+    during autotuning (ADR-0020).
+
+    The ``format`` field determines how ``data`` should be interpreted:
+    - ``"cubin"`` / ``"ptx"`` / ``"hsaco"``: ``data`` holds raw binary bytes.
+    - ``"triton_jit"``: ``data`` holds a Python callable (the @triton.jit
+      function bound with config). This is the default Triton export format
+      since the framework targets PyTorch-only deployment. Pass
+      ``force_binary=True`` to TritonExporter to get cubin bytes instead.
+
+    Attributes:
+        format: Artifact format identifier.
+        data: Raw binary bytes (for binary formats) or a Python callable
+            (for "triton_jit").
+        entry_point: Kernel function name.
+        metadata: Backend-specific metadata (arch, register count, etc.).
+    """
+
+    format: str
+    data: Any  # bytes for binary formats; callable for "triton_jit"
+    entry_point: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # GPU architecture
 # ---------------------------------------------------------------------------
 
@@ -77,6 +109,11 @@ class CUDAArch(Enum):
     def sm_name(self) -> str:
         """Architecture string as used by nvcc (e.g. ``"sm_90"``, ``"sm_90a"``)."""
         return f"sm_{self.name.removeprefix('SM_').lower()}"
+    
+    @property
+    def arch_name(self) -> str:
+        """Virtual-architecture string as used by nvcc (e.g. ``"compute_90"``, ``"compute_90a"``)."""
+        return f"compute_{self.name.removeprefix('SM_').lower()}"
 
     @classmethod
     def from_capability(cls, major: int, minor: int) -> CUDAArch:
@@ -161,6 +198,36 @@ class KernelHash:
 
     def __repr__(self) -> str:
         return f"KernelHash({self._digest[:12]}...)"
+
+    def __str__(self) -> str:
+        return self._digest
+
+
+class ReferenceHash:
+    """Opaque content-based hash of a Problem's verification inputs.
+
+    Covers the reference source, tolerance, dtype sweep, and sizes
+    domain — everything that determines whether a prior verification is
+    still valid for the current problem definition.
+
+    Constructed only by ``ReferenceHasher`` in the versioning module.
+    """
+
+    __slots__ = ("_digest",)
+
+    def __init__(self, digest: str) -> None:
+        self._digest = digest
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ReferenceHash):
+            return NotImplemented
+        return self._digest == other._digest
+
+    def __hash__(self) -> int:
+        return hash(self._digest)
+
+    def __repr__(self) -> str:
+        return f"ReferenceHash({self._digest[:12]}...)"
 
     def __str__(self) -> str:
         return self._digest
@@ -425,6 +492,7 @@ class AutotuneResult:
     point: SearchPoint = field(default_factory=SearchPoint)
     time_ms: float = 0.0
     metrics: dict[str, Any] = field(default_factory=dict)
+    reference_hash: ReferenceHash | None = None
     timestamp: datetime = field(default_factory=datetime.now)
 
 

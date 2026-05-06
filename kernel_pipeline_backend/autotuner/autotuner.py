@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from kernel_pipeline_backend.plugin.manager import PluginManager
     from kernel_pipeline_backend.problem.problem import Problem
     from kernel_pipeline_backend.verifier.verifier import VerificationResult
-    from kernel_pipeline_backend.storage.store import ResultStore
     from kernel_pipeline_backend.verifier.verifier import Verifier
 
 logger = logging.getLogger(__name__)
@@ -142,7 +141,7 @@ class Autotuner:
     Typical usage by the Pipeline::
 
         profiler = Profiler(runner, device, backend, observers)
-        autotuner = Autotuner(profiler, verifier, store, plugin_manager)
+        autotuner = Autotuner(profiler, verifier, plugin_manager)
         result = await autotuner.run(
             spec, space, compiler, configs, problem, strategy,
         )
@@ -169,7 +168,6 @@ class Autotuner:
         self,
         profiler: Profiler,
         verifier: Verifier,
-        store: ResultStore,
         plugin_manager: PluginManager,
     ) -> None:
         """Initialise the autotuner.
@@ -177,12 +175,10 @@ class Autotuner:
         Args:
             profiler: Single-point benchmarker for warmup + profiling.
             verifier: Correctness checker against reference implementation.
-            store: Persistent result store for incremental storage.
             plugin_manager: Async event dispatcher for plugin notifications.
         """
         self._profiler = profiler
         self._verifier = verifier
-        self._store = store
         self._plugins = plugin_manager
 
     async def run(
@@ -457,7 +453,6 @@ class Autotuner:
                             dtype=point.dtype,
                         )
                         result.tuned.append(ar)
-                        self._store.store([ar])
 
                         await self._emit(
                             EVENT_AUTOTUNE_PROGRESS,

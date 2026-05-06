@@ -31,7 +31,7 @@ from kernel_pipeline_backend.registry.registry import (
     _resolve_link_binding,
 )
 from kernel_pipeline_backend.verifier.verifier import Verifier, VerificationResult
-from kernel_pipeline_backend.versioning.hasher import KernelHasher
+from kernel_pipeline_backend.versioning.hasher import KernelHasher, ReferenceHasher
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.strategy import Strategy
@@ -133,6 +133,7 @@ class Pipeline:
         self._plugins = plugin_manager
         self._device = device
         self._hasher = KernelHasher()
+        self._ref_hasher = ReferenceHasher()
 
     async def run(
         self,
@@ -215,7 +216,10 @@ class Pipeline:
         # -- 2. Generate configs (shape-independent) ----------------------
         configs = self._compiler.generate_configs(spec)
 
-        # -- 3. Build search space ----------------------------------------
+        # -- 3. Compute reference hash for verification provenance -------
+        reference_hash = self._ref_hasher.hash(problem)
+
+        # -- 4. Build search space ----------------------------------------
         problem_dtypes = getattr(problem, "dtypes", None) or [None]
         space = SearchSpace(
             size_specs=dict(problem.sizes),
@@ -223,7 +227,7 @@ class Pipeline:
             dtypes=list(problem_dtypes),
         )
 
-        # -- 4. Autotuner: JIT compile, strategy loop, verify, profile ----
+        # -- 5. Autotuner: JIT compile, strategy loop, verify, profile ----
         profiler = Profiler(
             runner=self._runner,
             device=self._device,
@@ -234,7 +238,6 @@ class Pipeline:
         autotuner = Autotuner(
             profiler=profiler,
             verifier=verifier,
-            store=self._store,
             plugin_manager=self._plugins,
         )
 
@@ -261,6 +264,10 @@ class Pipeline:
 
         # Merge autotuner results into pipeline result
         result.verified.extend(autotune_result.verified)
+        # Stamp each tuned result with the reference hash and persist
+        for ar in autotune_result.tuned:
+            ar.reference_hash = reference_hash
+        self._store.store(autotune_result.tuned)
         result.autotuned.extend(autotune_result.tuned)
         for err in autotune_result.errors:
             stage = "compile" if isinstance(err.exception, CompilationError) else "autotune"

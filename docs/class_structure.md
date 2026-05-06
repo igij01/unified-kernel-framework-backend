@@ -16,9 +16,10 @@ First draft of the module and class design for kernel-pipeline-backend.
 ```
 kernel_pipeline_backend/
 ├── core/                    # Protocols, data types, zero external deps
-│   ├── types.py             # Shared data types (SearchPoint, AutotuneResult, etc.)
+│   ├── types.py             # Shared data types (SearchPoint, AutotuneResult, BinaryArtifact, etc.)
 │   ├── compiler.py          # Compiler protocol
 │   ├── runner.py            # Runner protocol
+│   ├── exporter.py          # ArtifactExporter protocol (packaging frontends only)
 │   └── registry.py          # Backend registry
 │
 ├── problem/                 # Problem specification (depends on torch)
@@ -65,10 +66,12 @@ kernel_pipeline_backend/
 └── backends/                # Backend implementations (isolated deps)
     ├── cuda/      
     │   ├── compiler.py      # CUDACompiler (CuPy/NVRTC)
-    │   └── runner.py        # CUDARunner
+    │   ├── runner.py        # CUDARunner
+    │   └── exporter.py      # CUDAExporter — harvests cubin via RawModule/NVRTC fallback
     ├── triton/
     │   ├── compiler.py      # TritonCompiler
-    │   └── runner.py        # TritonRunner
+    │   ├── runner.py        # TritonRunner
+    │   └── exporter.py      # TritonExporter — drives triton.compile(), reads asm["cubin"]
     ├── cute_dsl/
     │   ├── compiler.py      # CuteDSLCompiler
     │   └── runner.py        # CuteDSLRunner
@@ -147,6 +150,17 @@ Zero external dependencies. Defines the contracts everything else implements.
 
 ```python
 @dataclass(frozen=True)
+class BinaryArtifact:
+    """Serialized binary form of a compiled kernel for redistribution.
+
+    Produced by ArtifactExporter.export() — never populated during autotuning.
+    """
+    format: str                           # "cubin", "ptx", "hsaco", etc.
+    bytes: bytes                          # raw binary content
+    entry_point: str                      # kernel function name
+    metadata: dict[str, Any]             # arch, registers, shared_mem, etc.
+
+@dataclass(frozen=True)
 class KernelSpec:
     """Identifies a kernel by its source and metadata."""
     name: str
@@ -182,11 +196,12 @@ class RunResult:
 @dataclass
 class AutotuneResult:
     """One row of autotuning data."""
-    kernel_hash: str
+    kernel_hash: KernelHash
     arch: str
     point: SearchPoint
     time_ms: float
     metrics: dict[str, Any]              # merged observer metrics (widened for artifact refs)
+    reference_hash: ReferenceHash | None  # which Problem reference was used for verification
     timestamp: datetime
 
 @dataclass(frozen=True)
@@ -271,6 +286,41 @@ class CompiledKernel:
     compile_info: dict[str, Any]         # registers used, shared mem, etc.
 ```
 
+### `core/exporter.py` — ArtifactExporter Protocol
+
+Defined in `core/` alongside `Compiler` and `Runner`. Backends that support
+packaging implement this protocol **in addition to** `Compiler`; those that
+don't simply omit it. The autotuning path (Pipeline, Autotuner, Profiler)
+**must never** import or call `ArtifactExporter` — this separation is the
+structural enforcement of ADR-0020's invariant.
+
+```python
+class ArtifactExporter(Protocol):
+    """Produce a serialized binary form of an already-compiled kernel.
+
+    Invoked by packaging frontends post-tuning, never by the autotune loop.
+    May run on a different machine from where autotuning occurred, provided
+    the backend toolchain (NVRTC, Triton, etc.) is installed.
+    """
+
+    def export(
+        self,
+        spec: KernelSpec,
+        config: KernelConfig,
+        compile_options: CompileOptions | None = None,
+    ) -> BinaryArtifact:
+        """Re-derive and serialize the kernel binary from (spec, config).
+
+        Takes identity arguments rather than a live CompiledKernel so that
+        export can run cross-machine against the same (spec, config) that
+        was tuned, without needing the runtime artifact handed across process
+        or machine boundaries.
+        """
+        ...
+```
+
+---
+
 ### `core/runner.py` — Runner Protocol
 
 ```python
@@ -323,9 +373,19 @@ class LaunchRequest:
 class BackendRegistry:
     """Discovers and registers backend implementations."""
 
-    def register(self, name: str, compiler: Compiler, runner: Runner) -> None: ...
+    def register(
+        self,
+        name: str,
+        compiler: Compiler,
+        runner: Runner,
+        exporter: ArtifactExporter | None = None,  # opt-in; None for backends without export
+    ) -> None: ...
     def get_compiler(self, name: str) -> Compiler: ...
     def get_runner(self, name: str) -> Runner: ...
+    def get_exporter(self, name: str) -> ArtifactExporter | None:
+        """Return the registered ArtifactExporter, or None if the backend
+        does not support binary export."""
+        ...
     def list_backends(self) -> list[str]: ...
 
 # Global singleton — backends call register() at import time
@@ -570,7 +630,6 @@ class Autotuner:
         self,
         profiler: Profiler,
         verifier: Verifier,
-        store: ResultStore,
         plugin_manager: PluginManager,
     ): ...
 
@@ -596,9 +655,11 @@ class Autotuner:
            b. For each point:
               - Verify (if enabled, with caching)
               - profiler.profile() → AutotuneResult
-              - store.store([result])
               - Emit AUTOTUNE_PROGRESS event
         3. Emit AUTOTUNE_COMPLETE event
+
+        Storage is the caller's responsibility — results are returned
+        in AutotuneRunResult.tuned but not persisted by the autotuner.
         """
         ...
 ```
@@ -785,25 +846,30 @@ class ResultStore(Protocol):
 
     def query(
         self,
-        kernel_hash: str | None = None,
-        arch: str | None = None,
+        kernel_hash: KernelHash | None = None,
+        arch: CUDAArch | None = None,
         sizes: dict[str, int] | None = None,
     ) -> list[AutotuneResult]: ...
 
     def best_config(
         self,
-        kernel_hash: str,
-        arch: str,
+        kernel_hash: KernelHash,
+        arch: CUDAArch,
         sizes: dict[str, int],
     ) -> KernelConfig | None:
         """Return the config with the lowest time_ms for this point."""
         ...
 
-    def has_results(self, kernel_hash: str, arch: str) -> bool: ...
+    def has_results(self, kernel_hash: KernelHash, arch: str) -> bool: ...
 
 class DatabaseStore(ResultStore):
     """SQLite/PostgreSQL implementation."""
     def __init__(self, connection_string: str): ...
+
+    # autotune_results table includes a nullable reference_hash column
+    # (TEXT) recording which Problem reference was used for verification.
+    # The frontend queries this column directly via SQL to verify that
+    # stored results were verified against the current reference.
 ```
 
 ---
@@ -816,7 +882,7 @@ Depends on: `core`
 class KernelHasher:
     """Computes content-based version hashes for change detection."""
 
-    def hash(self, spec: KernelSpec) -> str:
+    def hash(self, spec: KernelSpec) -> KernelHash:
         """Hash source + compile_flags + backend name.
         Deterministic — same input always produces same hash."""
         ...
@@ -824,6 +890,24 @@ class KernelHasher:
     def has_changed(self, spec: KernelSpec, store: ResultStore) -> bool:
         """Check if this kernel needs re-verification/re-autotuning."""
         ...
+
+class ReferenceHash: ...
+    """Opaque content-based hash of a Problem's verification inputs.
+    Constructed only by ``ReferenceHasher``."""
+
+class ReferenceHasher:
+    """Hash the verification-relevant inputs of a Problem.
+
+    The resulting ``ReferenceHash`` answers exactly one question:
+    "is a previously-recorded verification still valid for the current
+    problem definition?"  Used to detect reference drift (ADR-0019).
+
+    Hashes: ``reference`` source, ``initialize`` source, ``atol``,
+    ``rtol``, ``dtypes`` (sorted by repr), ``sizes`` keys + domains.
+    Does NOT hash: problem name, kernel set membership, grid generators.
+    """
+
+    def hash(self, problem: Problem) -> ReferenceHash: ...
 ```
 
 ---
@@ -971,6 +1055,8 @@ class Pipeline:
         skip_autotune: bool = False,      # skip autotuning stage
     ) -> PipelineResult: ...
     # passes: observation only in the autotuner loop (no transforms applied)
+    # Per kernel: computes ReferenceHash for verification provenance,
+    # stamps each AutotuneResult with it, and stores the batch.
 
     async def run_point(
         self,
@@ -1015,12 +1101,17 @@ For each kernel in ``kernels``:
 
 1. **Version hash** — ``KernelHasher.hash(spec)`` stamps the spec
 2. **Change detection** — ``has_changed()`` checks store; skip if cached
-3. **Compile** — ``compiler.generate_configs()`` + ``compiler.compile()`` for each config
-4. **Autotune** — construct ``Profiler`` + ``Autotuner``, call ``autotuner.run()``:
+3. **Compute reference hash** — ``ReferenceHasher.hash(problem)`` for
+   verification provenance
+4. **Compile** — ``compiler.generate_configs()`` + ``compiler.compile()`` for each config
+5. **Autotune** — construct ``Profiler`` + ``Autotuner`` (no store), call
+   ``autotuner.run()``:
    - The Autotuner internally drives the strategy loop, per-point
-     verification, profiling via the Profiler, incremental storage,
-     and autotune plugin events (``AUTOTUNE_START``, ``AUTOTUNE_PROGRESS``,
-     ``AUTOTUNE_COMPLETE``).
+     verification, profiling via the Profiler, and emits autotune plugin
+     events.
+   - Storage is the caller's responsibility: after ``autotuner.run()``
+     returns, the pipeline stamps each tuned result with ``reference_hash``
+     and calls ``store.store()`` with the full batch.
    - Profiler teardown is handled in a ``finally`` block.
 
 ### Single-point orchestration (``run_point``)
@@ -1660,18 +1751,27 @@ A new backend only needs to:
 
 1. Create `backends/<name>/compiler.py` implementing `Compiler`
 2. Create `backends/<name>/runner.py` implementing `Runner`
-3. Register in `backends/<name>/__init__.py`:
+3. Optionally, create `backends/<name>/exporter.py` implementing `ArtifactExporter`
+   for backends that support binary export (packaging frontends).
+4. Register in `backends/<name>/__init__.py`:
 
 ```python
 # backends/my_new_lang/__init__.py
 from kernel_pipeline_backend.core.registry import registry
 from .compiler import MyNewLangCompiler
 from .runner import MyNewLangRunner
+# from .exporter import MyNewLangExporter  # omit if export not supported
 
 registry.register("my_new_lang", MyNewLangCompiler(), MyNewLangRunner())
+# With export:
+# registry.register("my_new_lang", MyNewLangCompiler(), MyNewLangRunner(),
+#                   exporter=MyNewLangExporter())
 ```
 
 No changes to core, verifier, autotuner, or pipeline are needed.
+
+**Important:** `ArtifactExporter` must never be called from the autotune path.
+It is a packaging-frontend concern only (ADR-0020).
 
 ### CUDA Backend — `backends/cuda/`
 
@@ -1751,6 +1851,12 @@ compile_flags = {
           │                 │            │  CuteDSLRunner           │
           │                 │            │  TileIRRunner            │
           │                 │            │                         │
+          │ ArtifactEx-◄────┼────────────┤  CUDAExporter  (opt-in) │
+          │ porter          │            │  TritonExporter (opt-in) │
+          │  [packaging     │            │                         │
+          │   frontends     │            │  (CuteDSL/TileIR: TBD)  │
+          │   only; never   │            │                         │
+          │   autotune path]│            │                         │
           └─────────────────┘            └─────────────────────────┘
 
           No CuPy, Triton,                 All framework-specific
@@ -1858,3 +1964,5 @@ User calls TuneService:
 | `pipeline/` `run_point()` | [ADR-0012](adr/0012-single-point-execution.md) | Single-point execution for debugging and investigation |
 | `backends/` | [ADR-0006](adr/0006-source-as-ir-native-compilation.md) | Isolated backend implementations |
 | `registry/` link bindings, `problem/` optional `reference` | [ADR-0013](adr/0013-link-time-size-bindings.md) | Link-time `constexpr_args` / `runtime_args`, optional reference, no tuning of unlinked kernels |
+| `versioning/` `ReferenceHasher` | [ADR-0019](adr/0019-problem-versioning-belongs-to-frontend.md) | `ReferenceHash` for verification provenance; frontend owns manifests |
+| `core/exporter.py`, `backends/cuda/exporter.py`, `backends/triton/exporter.py` | [ADR-0020](adr/0020-artifact-export-separated-from-autotuning.md) | `ArtifactExporter` protocol — binary export separated from autotuning; never called on autotune path |

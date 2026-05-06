@@ -355,9 +355,10 @@ class TestAutotuning:
         await _run_pipeline(
             store=store, problem=problem, compiler=compiler,
         )
-        # Each result stored in its own batch (one at a time)
-        assert len(store.store_calls) == len(store.results)
-        assert all(len(batch) == 1 for batch in store.store_calls)
+        # Pipeline stores all results as one batch after autotuner completes
+        assert len(store.store_calls) == 1
+        assert len(store.store_calls[0]) == len(store.results)
+        assert len(store.results) == 2
 
     async def test_autotune_error_recorded_and_continues(self) -> None:
         """Runner failure during autotune is recorded but doesn't crash."""

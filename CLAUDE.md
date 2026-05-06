@@ -77,6 +77,14 @@ Unified compile-time transform + runtime observation protocol. Replaces the earl
 - `Pipeline.run()` — full batch workflow: hash, compile, verify, autotune, store.
 - `Pipeline.run_point()` — single `(sizes, config)` point for debugging/investigation (ADR-0012). Supports CompileOptions, InstrumentationPasses with isolated forks for run_once passes. Results are ephemeral (not stored).
 
+## Stability & Breaking Changes
+
+This project is **pre-publication**. Breaking changes — including
+schema changes to the local SQLite store — are acceptable and do not
+require migration shims. When a stored-data shape changes, drop and
+recreate any in-progress dev database rather than writing a migration.
+This policy will tighten once the project ships.
+
 ## Build & Test
 
 - Python >= 3.11, build system: scikit-build-core with CMake

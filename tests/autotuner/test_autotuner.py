@@ -164,11 +164,10 @@ async def _run_autotuner(
     autotuner = Autotuner(
         profiler=profiler,
         verifier=verifier,
-        store=_store,
         plugin_manager=_plugins,
     )
 
-    return await autotuner.run(
+    result = await autotuner.run(
         spec=_spec,
         space=_space,
         compiler=_compiler,
@@ -179,6 +178,8 @@ async def _run_autotuner(
         skip_verify=skip_verify,
         skip_autotune=skip_autotune,
     )
+    _store.store(result.tuned)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -389,23 +390,24 @@ class TestVerification:
 
 
 class TestResultStorage:
-    """Autotuner stores results incrementally via the ResultStore."""
+    """Autotuner returns results; storage is the caller's responsibility."""
 
-    async def test_results_stored(self) -> None:
-        """Profiled results are stored in the ResultStore."""
+    async def test_results_returned(self) -> None:
+        """Profiled results are returned in the AutotuneRunResult."""
         store = FakeResultStore()
-        await _run_autotuner(store=store)
-        assert len(store.results) > 0
+        result = await _run_autotuner(store=store)
+        assert len(result.tuned) > 0
 
-    async def test_each_result_stored_incrementally(self) -> None:
-        """Each result is stored in its own individual batch."""
+    async def test_results_stored_by_caller(self) -> None:
+        """Caller stores results after autotuner completes."""
         store = FakeResultStore()
         problem = FakeProblem(sizes={"M": [128, 256]})
         configs = [KernelConfig(params={"BS": 64})]
-        await _run_autotuner(store=store, problem=problem, configs=configs)
-        # Each result stored in its own batch (one at a time)
-        assert len(store.store_calls) == len(store.results)
-        assert all(len(batch) == 1 for batch in store.store_calls)
+        result = await _run_autotuner(store=store, problem=problem, configs=configs)
+        # Store stores the full batch at once (pipeline responsibility)
+        assert len(store.results) > 0
+        assert len(store.store_calls) == 1
+        assert len(store.store_calls[0]) == len(result.tuned)
 
     async def test_existing_results_fed_to_strategy(self) -> None:
         """Previously cached results are passed to the strategy so it
@@ -711,7 +713,7 @@ class TestProfilerLifecycle:
         plugins = PluginManager()
         configs = [KernelConfig(params={"BS": 64})]
 
-        autotuner = Autotuner(profiler, verifier, store, plugins)
+        autotuner = Autotuner(profiler, verifier, plugins)
         await autotuner.run(
             spec=make_spec(),
             space=SearchSpace(
@@ -752,7 +754,7 @@ class TestProfilerLifecycle:
         plugins = PluginManager()
         configs = [KernelConfig(params={"BS": 64})]
 
-        autotuner = Autotuner(profiler, verifier, store, plugins)
+        autotuner = Autotuner(profiler, verifier, plugins)
         with pytest.raises(RuntimeError, match="strategy exploded"):
             await autotuner.run(
                 spec=make_spec(),
@@ -791,7 +793,7 @@ class TestProfilerLifecycle:
         plugins = PluginManager()
         configs = [KernelConfig(params={"BS": 64})]
 
-        autotuner = Autotuner(profiler, verifier, store, plugins)
+        autotuner = Autotuner(profiler, verifier, plugins)
         await autotuner.run(
             spec=make_spec(),
             space=SearchSpace(
@@ -862,7 +864,7 @@ class TestResultCorrectness:
             backend="fake", warmup_cycles=0, profiling_cycles=1,
         )
         verifier = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
-        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+        autotuner = Autotuner(profiler, verifier, PluginManager())
 
         result = await autotuner.run(
             spec=spec,
@@ -923,7 +925,7 @@ class TestLinkBindings:
         profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
                             backend="fake", warmup_cycles=0, profiling_cycles=1)
         verifier = Verifier(runner=runner, device=FakeDeviceHandle())
-        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+        autotuner = Autotuner(profiler, verifier, PluginManager())
 
         spec = make_spec(name="k")
         configs = [KernelConfig(params={"BS": 64})]
@@ -976,7 +978,7 @@ class TestLinkBindings:
         profiler = Profiler(runner=FakeRunner(), device=FakeDeviceHandle(),
                             backend="fake", warmup_cycles=0, profiling_cycles=1)
         verifier = Verifier(runner=FakeRunner(), device=FakeDeviceHandle())
-        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+        autotuner = Autotuner(profiler, verifier, PluginManager())
 
         await autotuner.run(
             spec=spec,
@@ -1026,7 +1028,7 @@ class TestLinkBindings:
         profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
                             backend="fake", warmup_cycles=0, profiling_cycles=1)
         verifier = Verifier(runner=runner, device=FakeDeviceHandle())
-        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+        autotuner = Autotuner(profiler, verifier, PluginManager())
 
         spec = make_spec(name="k")
         configs = [KernelConfig(params={"BS": 64})]
@@ -1062,7 +1064,7 @@ class TestLinkBindings:
         profiler = Profiler(runner=runner, device=FakeDeviceHandle(),
                             backend="fake", warmup_cycles=0, profiling_cycles=1)
         verifier = Verifier(runner=runner, device=FakeDeviceHandle())
-        autotuner = Autotuner(profiler, verifier, FakeResultStore(), PluginManager())
+        autotuner = Autotuner(profiler, verifier, PluginManager())
 
         spec = make_spec(name="k_no_binding")
         configs = [KernelConfig(params={"BS": 64})]

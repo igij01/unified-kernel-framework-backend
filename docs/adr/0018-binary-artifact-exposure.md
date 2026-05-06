@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Superseded by [ADR-0020](0020-artifact-export-separated-from-autotuning.md)
 
 ## Date
 

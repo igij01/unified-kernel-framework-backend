@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed
+Superseded by [ADR-0019](0019-problem-versioning-belongs-to-frontend.md).
+Versioning is a frontend (packaging) concern, not a backend concern.
+The backend retains only a narrower `ReferenceHash` for verification
+provenance; see ADR-0019 for the rationale.
 
 ## Date
 

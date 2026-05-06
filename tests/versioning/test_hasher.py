@@ -1,4 +1,4 @@
-"""Tests for kernel_pipeline_backend.versioning.hasher.KernelHasher."""
+"""Tests for kernel_pipeline_backend.versioning.hasher (KernelHasher and ReferenceHasher)."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from kernel_pipeline_backend.core.types import (
     KernelConfig,
     KernelHash,
     KernelSpec,
+    ReferenceHash,
     SearchPoint,
 )
 from kernel_pipeline_backend.storage.database import DatabaseStore
-from kernel_pipeline_backend.versioning.hasher import KernelHasher
+from kernel_pipeline_backend.versioning.hasher import KernelHasher, ReferenceHasher
 
 
 # ---------------------------------------------------------------------------
@@ -406,3 +407,190 @@ class TestHasChanged:
 
         new_spec = _make_spec(compile_flags={"opt": 3}, target_archs=[CUDAArch.SM_90])
         assert hasher.has_changed(new_spec, store) is True
+
+
+# ---------------------------------------------------------------------------
+# ReferenceHasher tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ref_hasher() -> ReferenceHasher:
+    return ReferenceHasher()
+
+
+class _FakeProblem:
+    """Minimal Problem implementation for hashing tests."""
+
+    def __init__(
+        self,
+        sizes: dict | None = None,
+        dtypes: list | None = None,
+        atol: float = 1e-5,
+        rtol: float = 1e-5,
+    ) -> None:
+        self.sizes = sizes if sizes is not None else {"M": [128, 256]}
+        self.dtypes = dtypes or []
+        self.atol = atol
+        self.rtol = rtol
+
+    def initialize(self, sizes: dict[str, int], dtype=None):
+        return [42]
+
+    def reference(self, inputs: list, sizes: dict[str, int]):
+        return [42]
+
+
+class _FakeProblemNoReference:
+    """Problem without a reference implementation."""
+
+    sizes = {"N": [1024]}
+    dtypes = []
+    atol = 0.0
+    rtol = 0.0
+
+    def initialize(self, sizes, dtype=None):
+        return [42]
+
+
+class TestReferenceHashDeterminism:
+    """Same problem must always produce the same hash."""
+
+    def test_same_problem_same_hash(self, ref_hasher: ReferenceHasher) -> None:
+        p = _FakeProblem()
+        assert ref_hasher.hash(p) == ref_hasher.hash(p)
+
+    def test_two_identical_problems_same_hash(self, ref_hasher: ReferenceHasher) -> None:
+        p1 = _FakeProblem(sizes={"M": [128]}, atol=1e-3)
+        p2 = _FakeProblem(sizes={"M": [128]}, atol=1e-3)
+        assert ref_hasher.hash(p1) == ref_hasher.hash(p2)
+
+    def test_hash_is_reference_hash_type(self, ref_hasher: ReferenceHasher) -> None:
+        result = ref_hasher.hash(_FakeProblem())
+        assert isinstance(result, ReferenceHash)
+
+    def test_hash_is_64_hex_chars(self, ref_hasher: ReferenceHasher) -> None:
+        digest = str(ref_hasher.hash(_FakeProblem()))
+        assert len(digest) == 64
+        assert all(c in "0123456789abcdef" for c in digest)
+
+
+class TestReferenceHashSensitivity:
+    """Hash must change when any hashed input changes."""
+
+    def test_different_atol_different_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(atol=1e-3))
+        h2 = ref_hasher.hash(_FakeProblem(atol=1e-5))
+        assert h1 != h2
+
+    def test_different_rtol_different_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(rtol=1e-3))
+        h2 = ref_hasher.hash(_FakeProblem(rtol=1e-5))
+        assert h1 != h2
+
+    def test_different_sizes_different_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [256]}))
+        assert h1 != h2
+
+    def test_different_size_keys_different_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [128], "N": [256]}))
+        assert h1 != h2
+
+    def test_different_reference_source_different_hash(
+        self, ref_hasher: ReferenceHasher
+    ) -> None:
+        class P1(_FakeProblem):
+            def reference(self, inputs, sizes):
+                return [1]
+
+        class P2(_FakeProblem):
+            def reference(self, inputs, sizes):
+                return [2]
+
+        assert ref_hasher.hash(P1()) != ref_hasher.hash(P2())
+
+    def test_different_initialize_source_different_hash(
+        self, ref_hasher: ReferenceHasher
+    ) -> None:
+        class P1(_FakeProblem):
+            def initialize(self, sizes, dtype=None):
+                return [1]
+
+        class P2(_FakeProblem):
+            def initialize(self, sizes, dtype=None):
+                return [2]
+
+        assert ref_hasher.hash(P1()) != ref_hasher.hash(P2())
+
+
+class TestReferenceHashInsensitivity:
+    """Hash must NOT change for fields excluded from hashing."""
+
+    def test_no_reference_problem_hashes(self, ref_hasher: ReferenceHasher) -> None:
+        p = _FakeProblemNoReference()
+        h = ref_hasher.hash(p)
+        assert isinstance(h, ReferenceHash)
+
+    def test_no_reference_produces_deterministic_hash(
+        self, ref_hasher: ReferenceHasher
+    ) -> None:
+        p1 = _FakeProblemNoReference()
+        p2 = _FakeProblemNoReference()
+        assert ref_hasher.hash(p1) == ref_hasher.hash(p2)
+
+
+class TestReferenceHashRobustness:
+    """Hash must not raise for non-introspectable references."""
+
+    def test_partial_reference_does_not_raise(self, ref_hasher: ReferenceHasher) -> None:
+        import functools
+
+        def base_ref(inputs, sizes, scale):
+            return [scale]
+
+        class P(_FakeProblem):
+            pass
+
+        p = P()
+        p.reference = functools.partial(base_ref, scale=2)
+        h = ref_hasher.hash(p)
+        assert isinstance(h, ReferenceHash)
+
+    def test_builtin_reference_does_not_raise(self, ref_hasher: ReferenceHasher) -> None:
+        class P(_FakeProblem):
+            pass
+
+        p = P()
+        # `len` is a C builtin — inspect.getsource raises TypeError on it.
+        p.reference = len
+        h = ref_hasher.hash(p)
+        assert isinstance(h, ReferenceHash)
+
+    def test_wrapped_reference_matches_inner(self, ref_hasher: ReferenceHasher) -> None:
+        import functools
+
+        def inner(inputs, sizes):
+            return [42]
+
+        @functools.wraps(inner)
+        def wrapper(*args, **kwargs):
+            return inner(*args, **kwargs)
+
+        class P1(_FakeProblem):
+            reference = staticmethod(inner)
+
+        class P2(_FakeProblem):
+            reference = staticmethod(wrapper)
+
+        assert ref_hasher.hash(P1()) == ref_hasher.hash(P2())
+
+
+class TestReferenceHashSizesOrdering:
+    """Sizes with different insertion order must hash equal."""
+
+    def test_sizes_key_order_irrelevant(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128], "N": [256]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"N": [256], "M": [128]}))
+        assert h1 == h2
