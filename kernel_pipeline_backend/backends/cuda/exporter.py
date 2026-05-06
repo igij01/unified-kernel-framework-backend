@@ -59,12 +59,19 @@ class CUDAExporter:
             RuntimeError: If NVRTC compilation or cubin extraction fails.
         """
         del force_binary, warmup_args  # protocol-uniformity placeholders
-        import cupy
         import os
+        from cupy.cuda import compiler as _cupy_compiler
         try:
             from torch.utils.cpp_extension import CUDA_HOME
         except Exception:
             CUDA_HOME = None
+
+        if not spec.target_archs:
+            raise RuntimeError(
+                f"CUDAExporter: spec.target_archs is empty for {spec.name}; "
+                f"cannot determine NVRTC compilation arch."
+            )
+        target_arch = spec.target_archs[0]
 
         entry_point: str = spec.compile_flags.get("entry_point", spec.name)
         template_params: list[str] | None = spec.compile_flags.get("template_params")
@@ -82,7 +89,8 @@ class CUDAExporter:
         options.extend(spec.compile_flags.get("nvrtc_options", []))
 
         if compile_options and compile_options.optimization_level:
-            options.append(f"-O{compile_options.optimization_level}")
+            # NVRTC does not accept top-level -O flags; forward to ptxas.
+            options.append(f"--ptxas-options=-O{compile_options.optimization_level}")
 
         if CUDA_HOME:
             targets_include = os.path.join(CUDA_HOME, "targets", "x86_64-linux", "include")
@@ -92,30 +100,29 @@ class CUDAExporter:
             elif os.path.isdir(root_include):
                 options = [f"-I{root_include}"] + options
 
+        arch = target_arch.major * 10 + target_arch.minor
+
+        name_expressions = None
+        name_expr = None
+        if template_params:
+            name_expr = self._build_name_expression(entry_point, effective_params, template_params)
+            name_expressions = [name_expr]
+
         try:
-            if template_params:
-                name_expr = self._build_name_expression(entry_point, effective_params, template_params)
-                module = cupy.RawModule(
-                    code=str(spec.source),
-                    options=tuple(options),
-                    name_expressions=[name_expr],
-                )
-            else:
-                module = cupy.RawModule(
-                    code=str(spec.source),
-                    options=tuple(options),
-                )
+            cubin_bytes, _mapping = _cupy_compiler.compile_using_nvrtc(
+                str(spec.source),
+                options=tuple(options),
+                arch=arch,
+                name_expressions=name_expressions,
+                cache_in_memory=True,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"CUDAExporter: NVRTC compilation failed for {spec.name}: {exc}"
             ) from exc
 
-        try:
-            cubin_bytes: bytes = module.get_cubin()
-        except Exception as exc:
-            raise RuntimeError(
-                f"CUDAExporter: cubin extraction failed for {spec.name}: {exc}"
-            ) from exc
+        if not isinstance(cubin_bytes, bytes):
+            cubin_bytes = bytes(cubin_bytes)
 
         metadata: dict[str, Any] = {
             "backend": "cuda",

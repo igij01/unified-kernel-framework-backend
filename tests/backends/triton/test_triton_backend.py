@@ -1067,3 +1067,43 @@ class TestTritonShapeAsArgsGPU:
             assert torch.allclose(result.outputs[0], x + y)
         finally:
             Registry.clear()
+
+
+# -------------------------------------------------------------------
+# Virtual-arch (compute_XX) forward compatibility
+# -------------------------------------------------------------------
+
+
+@requires_gpu
+class TestVirtualArchForwardCompat:
+    """Triton accepts a virtual-arch spec and JIT-runs on the device.
+
+    Triton always lowers to the active GPU's actual compute capability,
+    so a kernel whose ``KernelSpec.target_archs`` lists
+    ``CUDAArch.COMPUTE_80`` should still execute correctly on newer
+    hardware (e.g. sm_120 / RTX 5090) inside cuda130-torch.
+    """
+
+    def test_compile_compute_80_runs_on_device(self) -> None:
+        compiler = TritonCompiler()
+        runner = TritonRunner()
+        device = _FakeDevice()
+
+        from kernel_pipeline_backend.core.types import CUDAArch
+        spec = _make_spec(
+            source=_add_kernel,
+            target_archs=[CUDAArch.COMPUTE_80],
+        )
+        compiled = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 256})
+        )
+
+        N = 1024
+        x = torch.randn(N, device="cuda")
+        y = torch.randn(N, device="cuda")
+        out = torch.zeros(N, device="cuda")
+        launch = runner.make_launch_request(
+            compiled, [x, y, out], {"N": N}, compiled.config, (N,),
+        )
+        result = runner.run(launch, device)
+        assert torch.allclose(result.outputs[0], x + y)

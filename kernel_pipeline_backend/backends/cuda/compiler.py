@@ -224,6 +224,15 @@ class CUDACompiler:
         ]
         options.extend(spec.compile_flags.get("nvrtc_options", []))
 
+        # Forward target architecture to NVRTC. The first entry of
+        # ``spec.target_archs`` selects the compile target — virtual
+        # ``compute_XX`` archs emit forward-compatible PTX, real
+        # ``sm_XX`` archs emit a SASS cubin for that exact device.
+        if spec.target_archs and not any(
+            o.startswith(("-arch", "--gpu-architecture")) for o in options
+        ):
+            options.append(f"--gpu-architecture={spec.target_archs[0].sm_name}")
+
         # Prepend the CUDA include directory that PyTorch was built against so
         # that the complete header tree (including crt/mma.h) takes priority
         # over the pip-installed nvidia/cu* stubs, which ship mma.h but omit

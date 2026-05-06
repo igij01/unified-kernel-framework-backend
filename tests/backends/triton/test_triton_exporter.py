@@ -165,7 +165,8 @@ class TestTritonExporterGPU:
 
         N = 1024
         BLOCK = 256
-        config = KernelConfig(params={"BLOCK_SIZE": BLOCK, "num_warps": 4})
+        NUM_WARPS = 4
+        config = KernelConfig(params={"BLOCK_SIZE": BLOCK, "num_warps": NUM_WARPS})
 
         x = torch.ones(N, device="cuda", dtype=torch.float32)
         y = torch.ones(N, device="cuda", dtype=torch.float32) * 2.0
@@ -180,18 +181,36 @@ class TestTritonExporterGPU:
         assert isinstance(artifact.data, bytes) and len(artifact.data) > 0
 
         # Load the cubin via CuPy's module loader and launch the entry point.
-        module = cupy.RawModule(code=artifact.data)
-        # Triton mangles kernel names; locate the function by scanning the
-        # module's known entry points via metadata or fall back to the
-        # spec-declared name. Triton typically preserves the Python fn name.
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+            f.write(artifact.data)
+            cubin_path = f.name
         try:
-            kernel = module.get_function(artifact.entry_point)
-        except Exception:
-            kernel = module.get_function("add_kernel")
+            module = cupy.RawModule(path=cubin_path)
+            # Triton mangles kernel names; locate the function by scanning the
+            # module's known entry points via metadata or fall back to the
+            # spec-declared name. Triton typically preserves the Python fn name.
+            try:
+                kernel = module.get_function(artifact.entry_point)
+            except Exception:
+                kernel = module.get_function("add_kernel")
 
-        grid = ((N + BLOCK - 1) // BLOCK,)
-        kernel(grid, (BLOCK,), (x.data_ptr(), y.data_ptr(), out.data_ptr(), N))
-        torch.cuda.synchronize()
+            grid = ((N + BLOCK - 1) // BLOCK,)
+            # Triton-compiled kernels expect num_warps*32 threads per block,
+            # plus implicit trailing scratch pointers (global + profile) appended
+            # to the user signature. Allocate zero-filled buffers as scratch.
+            block_threads = NUM_WARPS * 32
+            scratch_g = torch.zeros(1, dtype=torch.uint8, device="cuda")
+            scratch_p = torch.zeros(1, dtype=torch.uint8, device="cuda")
+            kernel(
+                grid,
+                (block_threads,),
+                (x.data_ptr(), y.data_ptr(), out.data_ptr(), N,
+                 scratch_g.data_ptr(), scratch_p.data_ptr()),
+            )
+            torch.cuda.synchronize()
+        finally:
+            os.unlink(cubin_path)
         torch.testing.assert_close(out, x + y)
 
     def test_jit_artifact_is_callable_and_correct(self, exporter, add_kernel_spec) -> None:

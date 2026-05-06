@@ -183,9 +183,18 @@ class TestCUDAExporterGPU:
         """Round-trip: cubin bytes → cuModuleLoadData → launch → verify."""
         import cupy
         import numpy as np
+        import tempfile, os
 
         N = 1024
+        # Compile for the actual device arch so the cubin is loadable here.
+        props = cupy.cuda.runtime.getDeviceProperties(cupy.cuda.runtime.getDevice())
+        device_arch = CUDAArch.from_capability(props["major"], props["minor"], "sm")
         spec = _make_spec()
+        spec = KernelSpec(
+            name=spec.name, source=spec.source, backend=spec.backend,
+            target_archs=[device_arch], grid_generator=spec.grid_generator,
+            compile_flags=spec.compile_flags,
+        )
         config = KernelConfig(params={"BLOCK_SIZE": 256})
         artifact = exporter.export(spec, config)
 
@@ -195,8 +204,14 @@ class TestCUDAExporterGPU:
         b_cp = cupy.asarray(b_np)
         c_cp = cupy.zeros(N, dtype=cupy.float32)
 
-        module = cupy.RawModule(ptx=None, code=artifact.data)
-        kernel = module.get_function("vector_add")
+        with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+            f.write(artifact.data)
+            cubin_path = f.name
+        try:
+            module = cupy.RawModule(path=cubin_path)
+            kernel = module.get_function("vector_add")
+        finally:
+            os.unlink(cubin_path)
         block = 256
         grid = (N + block - 1) // block
         kernel((grid,), (block,), (a_cp, b_cp, c_cp, N))

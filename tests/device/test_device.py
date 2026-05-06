@@ -82,8 +82,22 @@ class TestRange:
 
     def test_wide_range(self) -> None:
         result = CUDAArch.range(CUDAArch.SM_70, CUDAArch.SM_120)
-        # Should include everything
+        # Default kind="sm" includes all real archs (incl. sm_XXa) but
+        # excludes the virtual compute_XX members.
+        all_real = [m for m in CUDAArch if not m.virtual]
+        assert len(result) == len(all_real)
+
+    def test_wide_range_both(self) -> None:
+        result = CUDAArch.range(
+            CUDAArch.SM_70, CUDAArch.SM_120, kind="both"
+        )
+        # kind="both" includes real archs (incl. sm_XXa) plus all
+        # virtual compute_XX members in the capability range.
         assert len(result) == len(list(CUDAArch))
+        # Spot-check a member from each variant kind.
+        assert CUDAArch.SM_80 in result
+        assert CUDAArch.SM_90A in result
+        assert CUDAArch.COMPUTE_80 in result
 
     def test_ordered_by_capability(self) -> None:
         result = CUDAArch.range(CUDAArch.SM_70, CUDAArch.SM_90)
@@ -93,6 +107,55 @@ class TestRange:
     def test_empty_when_start_after_end(self) -> None:
         result = CUDAArch.range(CUDAArch.SM_90, CUDAArch.SM_70)
         assert result == []
+
+    def test_compute_kind(self) -> None:
+        result = CUDAArch.range(
+            CUDAArch.SM_80, CUDAArch.SM_90, kind="compute"
+        )
+        assert all(m.virtual for m in result)
+        assert CUDAArch.COMPUTE_80 in result
+        assert CUDAArch.COMPUTE_90 in result
+        assert CUDAArch.SM_80 not in result
+
+
+# ---------------------------------------------------------------------------
+# CUDAArch virtual architectures
+# ---------------------------------------------------------------------------
+
+
+class TestVirtualArch:
+    """Virtual (compute_XX) architectures for forward-compatible PTX."""
+
+    def test_sm_member_is_not_virtual(self) -> None:
+        assert CUDAArch.SM_80.virtual is False
+
+    def test_compute_member_is_virtual(self) -> None:
+        assert CUDAArch.COMPUTE_80.virtual is True
+
+    def test_sm_name_for_sm_member(self) -> None:
+        assert CUDAArch.SM_80.sm_name == "sm_80"
+        assert CUDAArch.SM_90A.sm_name == "sm_90a"
+
+    def test_sm_name_for_compute_member(self) -> None:
+        assert CUDAArch.COMPUTE_80.sm_name == "compute_80"
+        assert CUDAArch.COMPUTE_120.sm_name == "compute_120"
+
+    def test_from_capability_default_returns_sm(self) -> None:
+        assert CUDAArch.from_capability(8, 0) is CUDAArch.SM_80
+
+    def test_from_capability_compute(self) -> None:
+        assert (
+            CUDAArch.from_capability(8, 0, kind="compute")
+            is CUDAArch.COMPUTE_80
+        )
+
+    def test_from_capability_both(self) -> None:
+        result = CUDAArch.from_capability(8, 0, kind="both")
+        assert result == (CUDAArch.SM_80, CUDAArch.COMPUTE_80)
+
+    def test_from_capability_invalid_kind(self) -> None:
+        with pytest.raises(ValueError, match="kind"):
+            CUDAArch.from_capability(8, 0, kind="bogus")
 
 
 # ---------------------------------------------------------------------------

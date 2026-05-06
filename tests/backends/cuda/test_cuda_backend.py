@@ -882,3 +882,42 @@ class TestMmaHeaderIncludePathFixGPU:
         spec = _make_spec()
         result = compiler.compile(spec, KernelConfig(params={"BLOCK_SIZE": 128}))
         assert result.artifact is not None
+
+
+# -------------------------------------------------------------------
+# Virtual-arch (compute_XX) forward compatibility
+# -------------------------------------------------------------------
+
+
+@requires_gpu
+class TestVirtualArchForwardCompat:
+    """Compile to ``compute_80`` PTX and run on the actual device.
+
+    NVRTC emits forward-compatible PTX when given a virtual arch; the
+    driver JIT-compiles it to whatever SM the active GPU exposes.
+    Verifies that a compute_80-targeted kernel runs correctly on
+    newer hardware (e.g. sm_120 / RTX 5090) inside the cuda130-torch
+    container.
+    """
+
+    def test_compile_compute_80_runs_on_device(self) -> None:
+        compiler = CUDACompiler()
+        runner = CUDARunner()
+        device = _FakeDevice()
+
+        spec = _make_spec(target_archs=[CUDAArch.COMPUTE_80])
+        compiled = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        assert compiled.artifact is not None
+
+        N = 1024
+        a = torch.randn(N, device="cuda", dtype=torch.float32)
+        b = torch.randn(N, device="cuda", dtype=torch.float32)
+        c = torch.zeros(N, device="cuda", dtype=torch.float32)
+        launch = runner.make_launch_request(
+            compiled, [a, b, c], {"N": N}, compiled.config,
+            (np.int32(N),),
+        )
+        result = runner.run(launch, device)
+        assert torch.allclose(result.outputs[0], a + b)

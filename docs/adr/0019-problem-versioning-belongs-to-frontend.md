@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — supersedes [ADR-0017](0017-problem-versioning.md).
+Accepted — supersedes [ADR-0017](0017-problem-versioning.md).
 
 ## Date
 

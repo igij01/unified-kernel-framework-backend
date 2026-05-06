@@ -57,38 +57,58 @@ class BinaryArtifact:
 class CUDAArch(Enum):
     """NVIDIA GPU compute capability targets.
 
-    Each member is ``(major, minor, arch_specific)`` where
-    ``arch_specific`` is True for ``sm_XXa`` variants that use
-    architecture-specific features (not forward-compatible).
+    Each member is ``(major, minor, arch_specific, virtual)`` where:
+
+    * ``arch_specific`` is True for ``sm_XXa`` variants that use
+      architecture-specific features (not forward-compatible).
+    * ``virtual`` is True for PTX virtual architectures (``compute_XX``)
+      that emit forward-compatible PTX, JIT-compiled to the device's
+      actual SM at load time.
+
+    ``SM_*`` members emit a real GPU binary for that exact SM.
+    ``COMPUTE_*`` members emit virtual PTX that runs on any SM with
+    a compute capability >= the listed one.
 
     To support a new architecture, add a member here — no other module
     needs changes.
     """
 
     # Volta
-    SM_70 = (7, 0, False)
-    SM_72 = (7, 2, False)
+    SM_70 = (7, 0, False, False)
+    SM_72 = (7, 2, False, False)
 
     # Turing
-    SM_75 = (7, 5, False)
+    SM_75 = (7, 5, False, False)
 
     # Ampere
-    SM_80 = (8, 0, False)
-    SM_86 = (8, 6, False)
-    SM_87 = (8, 7, False)
+    SM_80 = (8, 0, False, False)
+    SM_86 = (8, 6, False, False)
+    SM_87 = (8, 7, False, False)
 
     # Ada Lovelace
-    SM_89 = (8, 9, False)
+    SM_89 = (8, 9, False, False)
 
     # Hopper
-    SM_90 = (9, 0, False)
-    SM_90A = (9, 0, True)
+    SM_90 = (9, 0, False, False)
+    SM_90A = (9, 0, True, False)
 
     # Blackwell
-    SM_100 = (10, 0, False)
-    SM_100A = (10, 0, True)
-    SM_120 = (12, 0, False)
-    SM_120A = (12, 0, True)
+    SM_100 = (10, 0, False, False)
+    SM_100A = (10, 0, True, False)
+    SM_120 = (12, 0, False, False)
+    SM_120A = (12, 0, True, False)
+
+    # Virtual (PTX) architectures — forward-compatible
+    COMPUTE_70 = (7, 0, False, True)
+    COMPUTE_72 = (7, 2, False, True)
+    COMPUTE_75 = (7, 5, False, True)
+    COMPUTE_80 = (8, 0, False, True)
+    COMPUTE_86 = (8, 6, False, True)
+    COMPUTE_87 = (8, 7, False, True)
+    COMPUTE_89 = (8, 9, False, True)
+    COMPUTE_90 = (9, 0, False, True)
+    COMPUTE_100 = (10, 0, False, True)
+    COMPUTE_120 = (12, 0, False, True)
 
     @property
     def major(self) -> int:
@@ -106,17 +126,25 @@ class CUDAArch(Enum):
         return self.value[2]
 
     @property
-    def sm_name(self) -> str:
-        """Architecture string as used by nvcc (e.g. ``"sm_90"``, ``"sm_90a"``)."""
-        return f"sm_{self.name.removeprefix('SM_').lower()}"
-    
+    def virtual(self) -> bool:
+        """True for ``compute_XX`` PTX virtual architectures."""
+        return self.value[3]
+
     @property
-    def arch_name(self) -> str:
-        """Virtual-architecture string as used by nvcc (e.g. ``"compute_90"``, ``"compute_90a"``)."""
-        return f"compute_{self.name.removeprefix('SM_').lower()}"
+    def sm_name(self) -> str:
+        """Architecture string as used by nvcc.
+
+        Returns ``"compute_XX"`` for virtual architectures and
+        ``"sm_XX"`` (or ``"sm_XXa"``) for real ones.
+        """
+        suffix = self.name.split("_", 1)[1].lower()
+        prefix = "compute" if self.virtual else "sm"
+        return f"{prefix}_{suffix}"
 
     @classmethod
-    def from_capability(cls, major: int, minor: int) -> CUDAArch:
+    def from_capability(
+        cls, major: int, minor: int, kind: str = "sm"
+    ) -> CUDAArch | tuple[CUDAArch, CUDAArch]:
         """Look up an arch by compute capability numbers.
 
         Returns the generic (non-arch-specific) variant when both a
@@ -125,22 +153,52 @@ class CUDAArch(Enum):
         Args:
             major: Compute capability major version.
             minor: Compute capability minor version.
+            kind: Which variant to return — ``"sm"`` (real, default),
+                ``"compute"`` (virtual PTX), or ``"both"`` (returns a
+                ``(sm, compute)`` tuple).
 
         Returns:
-            Matching CUDAArch member.
+            Matching ``CUDAArch`` member, or a ``(sm, compute)`` tuple
+            when ``kind == "both"``.
 
         Raises:
-            ValueError: If no matching architecture exists.
+            ValueError: If ``kind`` is invalid or no matching arch exists.
         """
+        if kind not in ("sm", "compute", "both"):
+            raise ValueError(
+                f"kind must be 'sm', 'compute', or 'both', got {kind!r}"
+            )
+
+        sm = cls._lookup(major, minor, virtual=False)
+        if kind == "sm":
+            return sm
+        compute = cls._lookup(major, minor, virtual=True)
+        if kind == "compute":
+            return compute
+        return sm, compute
+
+    @classmethod
+    def _lookup(cls, major: int, minor: int, *, virtual: bool) -> CUDAArch:
         for member in cls:
-            if member.major == major and member.minor == minor and not member.arch_specific:
+            if (
+                member.major == major
+                and member.minor == minor
+                and not member.arch_specific
+                and member.virtual == virtual
+            ):
                 return member
+        kind_str = "compute_" if virtual else "sm_"
         raise ValueError(
-            f"No CUDAArch for compute capability {major}.{minor}"
+            f"No CUDAArch ({kind_str}) for compute capability {major}.{minor}"
         )
 
     @classmethod
-    def range(cls, start: CUDAArch, end: CUDAArch) -> list[CUDAArch]:
+    def range(
+        cls,
+        start: CUDAArch,
+        end: CUDAArch,
+        kind: str = "sm",
+    ) -> list[CUDAArch]:
         """Return all architectures between ``start`` and ``end`` inclusive.
 
         Ordered by compute capability. Useful for specifying
@@ -149,16 +207,34 @@ class CUDAArch(Enum):
         Args:
             start: Lowest architecture (inclusive).
             end: Highest architecture (inclusive).
+            kind: Which variants to include — ``"sm"`` (real, default),
+                ``"compute"`` (virtual PTX), or ``"both"`` (real and
+                virtual interleaved by compute capability).
 
         Returns:
-            Sorted list of CUDAArch members in the range.
+            Sorted list of ``CUDAArch`` members in the range. ``sm_XXa``
+            arch-specific variants are included only when ``kind`` selects
+            real archs.
         """
+        if kind not in ("sm", "compute", "both"):
+            raise ValueError(
+                f"kind must be 'sm', 'compute', or 'both', got {kind!r}"
+            )
+
         start_key = (start.major, start.minor)
         end_key = (end.major, end.minor)
-        return [
-            m for m in cls
-            if start_key <= (m.major, m.minor) <= end_key
-        ]
+
+        def included(m: CUDAArch) -> bool:
+            if kind == "sm" and m.virtual:
+                return False
+            if kind == "compute" and (not m.virtual or m.arch_specific):
+                return False
+            return start_key <= (m.major, m.minor) <= end_key
+
+        return sorted(
+            (m for m in cls if included(m)),
+            key=lambda m: (m.major, m.minor, m.virtual, m.arch_specific),
+        )
 
 
 # ---------------------------------------------------------------------------

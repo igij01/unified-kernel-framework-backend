@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — supersedes ADR-0018.
+Accepted — supersedes ADR-0018.
 
 ## Date
 

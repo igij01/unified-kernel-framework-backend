@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 > **Partially superseded by ADR-0015 Stage 3.**  The separate `Instrument`
 > and `Observer` protocols defined here are unified into `InstrumentationPass`
