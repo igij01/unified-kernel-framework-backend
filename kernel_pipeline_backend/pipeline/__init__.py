@@ -1,5 +1,5 @@
-"""Top-level pipeline orchestration module."""
+"""Native pipeline implementation (ADR-0021/0022)."""
 
-from kernel_pipeline_backend.pipeline.pipeline import Pipeline, PipelineResult, PipelineError
+from kernel_pipeline_backend.pipeline.native import NativePipeline
 
-__all__ = ["Pipeline", "PipelineResult", "PipelineError"]
+__all__ = ["NativePipeline"]

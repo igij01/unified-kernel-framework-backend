@@ -11,7 +11,7 @@ Quick start::
     from kernel_pipeline_backend.autotuner import Autotuner, BayesianOptimization
     from kernel_pipeline_backend.device import DeviceHandle
     from kernel_pipeline_backend.storage import DatabaseStore
-    from kernel_pipeline_backend.pipeline import Pipeline
+    from kernel_pipeline_backend.pipeline import NativePipeline
 
     # Import a backend to register it
     import kernel_pipeline_backend.backends.triton

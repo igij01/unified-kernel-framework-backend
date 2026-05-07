@@ -29,10 +29,10 @@ class SimpleProblem(Problem):
     atol = 1e-5
     rtol = 1e-5
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["N"])]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -46,10 +46,10 @@ class FilteredProblem(Problem):
     atol = 1e-5
     rtol = 1e-5
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["N"])]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -63,10 +63,10 @@ class NoFilterProblem(Problem):
     atol = 1e-5
     rtol = 1e-5
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [torch.zeros(sizes["X"])]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return inputs
 
 
@@ -77,10 +77,10 @@ class RangeProblem(Problem):
     atol = 1e-3
     rtol = 1e-3
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [torch.zeros(sizes["M"], sizes["K"])]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return inputs
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -94,14 +94,14 @@ class MatMulProblem(Problem):
     atol = 1e-5
     rtol = 1e-5
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         M, N, K = sizes["M"], sizes["N"], sizes["K"]
         return [
             ones_tensor(M, K, device="cpu"),
             ones_tensor(K, N, device="cpu"),
         ]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         A, B = inputs
         return [torch.matmul(A, B)]
 
@@ -116,14 +116,14 @@ class VectorAddProblem(Problem):
     atol = 0.0
     rtol = 0.0
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         N = sizes["N"]
         return [
             torch.arange(N, dtype=torch.float32, device="cpu"),
             ones_tensor(N, device="cpu"),
         ]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         a, b = inputs
         return [a + b]
 
@@ -145,10 +145,10 @@ class SoftmaxProblem(Problem):
     atol = 1e-6
     rtol = 1e-5
 
-    def initialize(self, sizes: dict[str, int]) -> list[torch.Tensor]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [rand_tensor(sizes["B"], sizes["D"], device="cpu")]
 
-    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int]) -> list[torch.Tensor]:
+    def reference(self, inputs: list[torch.Tensor], sizes: dict[str, int], dtypes: dict[str, torch.dtype] = {}) -> list[torch.Tensor]:
         return [torch.softmax(inputs[0], dim=-1)]
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:
@@ -313,10 +313,10 @@ class TestFilterSizePoints:
             sizes = {"X": [1, 2, 3]}
             atol = rtol = 1e-5
 
-            def initialize(self, sizes):
+            def initialize(self, sizes, dtypes={}):
                 return []
 
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes={}):
                 return []
 
             def filter_sizes(self, sizes):

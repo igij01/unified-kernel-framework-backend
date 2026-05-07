@@ -13,11 +13,12 @@ from kernel_pipeline_backend.core.types import (
     SearchPoint,
     SearchSpace,
 )
-from kernel_pipeline_backend.pipeline.pipeline import (
-    Pipeline,
+from kernel_pipeline_backend.orchestrator import (
+    Orchestrator,
     PipelineError,
     PipelineResult,
 )
+from kernel_pipeline_backend.pipeline.native import NativePipeline
 from kernel_pipeline_backend.plugin.manager import PluginManager
 from kernel_pipeline_backend.plugin.plugin import (
     EVENT_AUTOTUNE_COMPLETE,
@@ -72,14 +73,20 @@ async def _run_pipeline(
     _plugins = plugins if plugins is not None else PluginManager()
     _device = device if device is not None else FakeDeviceHandle()
 
-    pipeline = Pipeline(
+    pipeline = NativePipeline(
         compiler=_compiler,
         runner=_runner,
         store=_store,
         plugin_manager=_plugins,
         device=_device,
     )
-    return await pipeline.run(
+    orchestrator = Orchestrator(
+        pipeline=pipeline,
+        store=_store,
+        plugin_manager=_plugins,
+        device=_device,
+    )
+    return await orchestrator.run(
         kernels=kernels if kernels is not None else [make_spec()],
         problem=problem if problem is not None else FakeProblem(),
         strategy=strategy if strategy is not None else FakeStrategy(),
@@ -647,7 +654,7 @@ class TestSearchSpaceDtypeAxisPipeline:
         """Pipeline produces one result per (size, config, dtype) combination."""
 
         class TwoDtypeProblem(FakeProblem):
-            dtypes = ["float16", "float32"]
+            dtypes = [{"T": "float16"}, {"T": "float32"}]
 
         problem = TwoDtypeProblem(sizes={"M": [128]})
         compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
@@ -660,10 +667,10 @@ class TestSearchSpaceDtypeAxisPipeline:
         assert len(result.autotuned) == 2
 
     async def test_result_point_dtype_matches_problem_dtype(self) -> None:
-        """Each AutotuneResult.point.dtype reflects the problem's dtype."""
+        """Each AutotuneResult.point.dtypes reflects the problem's dtype combo."""
 
         class SingleDtypeProblem(FakeProblem):
-            dtypes = ["bfloat16"]
+            dtypes = [{"T": "bfloat16"}]
 
         problem = SingleDtypeProblem(sizes={"M": [128]})
         compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
@@ -673,11 +680,11 @@ class TestSearchSpaceDtypeAxisPipeline:
             skip_verify=True,
         )
         assert len(result.autotuned) == 1
-        assert result.autotuned[0].point.dtype == "bfloat16"
+        assert result.autotuned[0].point.dtypes == {"T": "bfloat16"}
 
-    async def test_problem_without_dtypes_defaults_to_none(self) -> None:
-        """Problems with no dtypes attribute produce dtype=None search points."""
-        # FakeProblem has no dtypes — should silently default to [None]
+    async def test_problem_without_dtypes_defaults_to_empty(self) -> None:
+        """Problems with no dtypes attribute produce dtypes={} search points."""
+        # FakeProblem has no dtypes — should silently default to [{}]
         problem = FakeProblem(sizes={"M": [128]})
         compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
         result = await _run_pipeline(
@@ -686,4 +693,85 @@ class TestSearchSpaceDtypeAxisPipeline:
             skip_verify=True,
         )
         assert len(result.autotuned) == 1
-        assert result.autotuned[0].point.dtype is None
+        assert result.autotuned[0].point.dtypes == {}
+
+
+# ---------------------------------------------------------------------------
+# ADR-0025 — initialize/reference receive correct dtypes dict per combo
+# ---------------------------------------------------------------------------
+
+
+class TestDtypeCombosPlumbing:
+    """End-to-end: each SearchPoint's combo dict reaches initialize/reference."""
+
+    async def test_combos_passed_verbatim_to_initialize(self) -> None:
+        """All declared combo dicts are observed by initialize unchanged."""
+        observed: list[dict] = []
+
+        class CapturingProblem(FakeProblem):
+            dtypes = [
+                {"A": "fp16", "C": "fp32"},
+                {"A": "bf16", "C": "fp32"},
+            ]
+
+            def initialize(self, sizes, dtypes):
+                observed.append(dict(dtypes))
+                return [[1.0]]
+
+            def reference(self, inputs, sizes, dtypes):
+                return list(inputs)
+
+        problem = CapturingProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        assert {"A": "fp16", "C": "fp32"} in observed
+        assert {"A": "bf16", "C": "fp32"} in observed
+
+    async def test_empty_dtypes_list_passes_empty_dict(self) -> None:
+        """Problem.dtypes = [] materialises [{}] and initialize sees {}."""
+        seen: list[dict] = []
+
+        class EmptyDtypeProblem(FakeProblem):
+            dtypes: list = []
+
+            def initialize(self, sizes, dtypes):
+                seen.append(dict(dtypes))
+                return [[1.0]]
+
+            def reference(self, inputs, sizes, dtypes):
+                return list(inputs)
+
+        problem = EmptyDtypeProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        assert seen == [{}]
+
+    async def test_missing_dtypes_attribute_passes_empty_dict(self) -> None:
+        """Problem with no dtypes attr materialises [{}] and initialize sees {}."""
+        seen: list[dict] = []
+
+        class NoDtypesProblem(FakeProblem):
+            # FakeProblem has no dtypes attr; override initialize/reference to record
+            def initialize(self, sizes, dtypes):
+                seen.append(dict(dtypes))
+                return [[1.0]]
+
+            def reference(self, inputs, sizes, dtypes):
+                return list(inputs)
+
+        problem = NoDtypesProblem(sizes={"M": [128]})
+        compiler = FakeCompiler(configs=[KernelConfig(params={"BS": 64})])
+        await _run_pipeline(
+            problem=problem,
+            compiler=compiler,
+            skip_verify=True,
+        )
+        assert seen == [{}]

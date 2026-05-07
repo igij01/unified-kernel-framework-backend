@@ -250,7 +250,7 @@ class Profiler:
         extra_args: tuple[Any, ...] = (),
         *,
         original_config: KernelConfig | None = None,
-        dtype: Any = None,
+        dtypes: dict[str, Any] | None = None,
     ) -> AutotuneResult:
         """Benchmark a compiled kernel at a specific size point.
 
@@ -284,8 +284,8 @@ class Profiler:
             observer ``metrics``.
         """
         point_config = original_config if original_config is not None else compiled.config
-        point = SearchPoint(sizes=sizes, config=point_config, dtype=dtype)
-        inputs = problem.initialize(sizes, dtype=dtype)
+        point = SearchPoint(sizes=sizes, config=point_config, dtypes=dtypes or {})
+        inputs = problem.initialize(sizes, dtypes or {})
 
         # Build the backend-owned launch plan once; reuse for all runs.
         launch = self._runner.make_launch_request(

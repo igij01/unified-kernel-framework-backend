@@ -8,6 +8,7 @@ Usage::
     result = await service.tune("matmul_splitk")
 """
 
-from kernel_pipeline_backend.service.service import TuneResult, TuneService
+from kernel_pipeline_backend.service.debug_session import DebugSession
+from kernel_pipeline_backend.service.service import ServiceTuneResult, TuneService
 
-__all__ = ["TuneResult", "TuneService"]
+__all__ = ["DebugSession", "ServiceTuneResult", "TuneService"]

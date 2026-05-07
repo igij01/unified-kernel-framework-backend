@@ -31,7 +31,7 @@ from kernel_pipeline_backend.core.types import (
     SearchPoint,
     CUDAArch,
 )
-from kernel_pipeline_backend.pipeline.pipeline import Pipeline
+from kernel_pipeline_backend.pipeline.native import NativePipeline
 from kernel_pipeline_backend.plugin.manager import PluginManager
 
 from .conftest import (
@@ -53,8 +53,8 @@ from .conftest import (
 def _make_pipeline(
     compiler: FakeCompiler | None = None,
     runner: FakeRunner | None = None,
-) -> Pipeline:
-    return Pipeline(
+) -> NativePipeline:
+    return NativePipeline(
         compiler=compiler or FakeCompiler(),
         runner=runner or FakeRunner(),
         store=FakeResultStore(),

@@ -29,9 +29,9 @@ from kernel_pipeline_backend.core.types import (
     KernelSpec,
 )
 from kernel_pipeline_backend.device.device import DeviceInfo
-from kernel_pipeline_backend.pipeline.pipeline import PipelineResult
+from kernel_pipeline_backend.orchestrator import PipelineResult
 from kernel_pipeline_backend.registry import Registry
-from kernel_pipeline_backend.service import TuneResult, TuneService
+from kernel_pipeline_backend.service import ServiceTuneResult, TuneService
 
 pytestmark = pytest.mark.anyio
 
@@ -50,10 +50,10 @@ class _FakeProblem:
     atol: float = 1e-3
     rtol: float = 1e-3
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
 
@@ -245,29 +245,29 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_PipelineCall]:
         )
         return PipelineResult()
 
-    from kernel_pipeline_backend.pipeline.pipeline import Pipeline
+    from kernel_pipeline_backend.orchestrator import Orchestrator
 
-    monkeypatch.setattr(Pipeline, "run", _mock_run)
+    monkeypatch.setattr(Orchestrator, "run", _mock_run)
     return calls
 
 
 # ---------------------------------------------------------------------------
-# TestTuneResult
+# TestServiceTuneResult
 # ---------------------------------------------------------------------------
 
 
-class TestTuneResult:
-    """TuneResult dataclass has the expected fields and defaults."""
+class TestServiceTuneResult:
+    """ServiceTuneResult dataclass has the expected fields and defaults."""
 
     def test_defaults(self) -> None:
-        result = TuneResult()
+        result = ServiceTuneResult()
         assert result.kernel_names == []
         assert result.problem_name is None
         assert isinstance(result.pipeline_result, PipelineResult)
 
     def test_custom_values(self) -> None:
         pr = PipelineResult()
-        result = TuneResult(
+        result = ServiceTuneResult(
             kernel_names=["k1", "k2"],
             problem_name="matmul",
             pipeline_result=pr,
@@ -602,10 +602,10 @@ class TestPluginLifecycle:
         async def _failing_run(self, **kwargs):
             raise RuntimeError("boom")
 
-        from kernel_pipeline_backend.pipeline.pipeline import Pipeline
+        from kernel_pipeline_backend.orchestrator import Orchestrator
 
         monkeypatch.setattr(
-            Pipeline, "run",
+            Orchestrator, "run",
             lambda self, *a, **kw: _failing_run(self, **kw),
         )
 

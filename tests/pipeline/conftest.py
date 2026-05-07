@@ -198,10 +198,10 @@ class FakeProblem:
         self._filter_fn = filter_fn
         self._fail_sizes = fail_sizes or set()
 
-    def initialize(self, sizes: dict[str, int], dtype: Any = None) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, Any]) -> list[Any]:
         return self._init_fn(sizes)
 
-    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int], dtypes: dict[str, Any]) -> list[Any]:
         return self._ref_fn(inputs, sizes)
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:

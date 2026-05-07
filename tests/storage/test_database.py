@@ -30,6 +30,9 @@ def store() -> DatabaseStore:
     s.close()
 
 
+_UNSET = object()
+
+
 def _make_result(
     kernel_hash: str = "abc123",
     arch: CUDAArch = CUDAArch.SM_90,
@@ -38,17 +41,21 @@ def _make_result(
     time_ms: float = 1.0,
     metrics: dict[str, float] | None = None,
     timestamp: datetime | None = None,
+    dtype=_UNSET,
 ) -> AutotuneResult:
     """Helper to build an AutotuneResult with sensible defaults."""
+    point_kwargs = dict(
+        sizes={"M": 1024, "N": 1024} if sizes is None else sizes,
+        config=KernelConfig(
+            params={"BLOCK_M": 128} if config_params is None else config_params
+        ),
+    )
+    if dtype is not _UNSET:
+        point_kwargs["dtypes"] = dtype
     return AutotuneResult(
         kernel_hash=KernelHash(kernel_hash),
         arch=arch,
-        point=SearchPoint(
-            sizes={"M": 1024, "N": 1024} if sizes is None else sizes,
-            config=KernelConfig(
-                params={"BLOCK_M": 128} if config_params is None else config_params
-            ),
-        ),
+        point=SearchPoint(**point_kwargs),
         time_ms=time_ms,
         metrics=metrics or {},
         timestamp=timestamp or datetime(2026, 1, 15, 12, 0, 0),
@@ -397,6 +404,59 @@ class TestEdgeCases:
         s2 = DatabaseStore(f"sqlite://{db_file}")
         assert len(s2.query()) == 1
         s2.close()
+
+    def test_dtype_distinguishes_rows(self, store: DatabaseStore) -> None:
+        """ADR-0023: same kernel/arch/sizes/config but different dtype = distinct rows."""
+        store.store([
+            _make_result(dtype="fp16", time_ms=1.0),
+            _make_result(dtype="bf16", time_ms=2.0),
+        ])
+        count = store._conn.execute(
+            "SELECT COUNT(*) FROM autotune_results"
+        ).fetchone()[0]
+        assert count == 2
+
+    def test_dtype_filter_in_query(self, store: DatabaseStore) -> None:
+        store.store([
+            _make_result(dtype="fp16", time_ms=1.0),
+            _make_result(dtype="bf16", time_ms=2.0),
+        ])
+        results = store.query(dtype="fp16")
+        assert len(results) == 1
+        assert results[0].point.dtypes == "fp16"
+
+    def test_dtype_none_round_trips(self, store: DatabaseStore) -> None:
+        store.store([_make_result(dtype=None)])
+        results = store.query()
+        assert results[0].point.dtypes is None
+
+    def test_dtype_filter_matches_none(self, store: DatabaseStore) -> None:
+        """Passing dtype=None filters for null-dtype rows specifically."""
+        store.store([
+            _make_result(dtype=None, config_params={"x": 1}),
+            _make_result(dtype="fp16", config_params={"x": 2}),
+        ])
+        results = store.query(dtype=None)
+        assert len(results) == 1
+        assert results[0].point.dtypes is None
+
+    def test_best_config_scoped_to_dtype(self, store: DatabaseStore) -> None:
+        store.store([
+            _make_result(dtype="fp16", config_params={"x": 1}, time_ms=5.0),
+            _make_result(dtype="bf16", config_params={"x": 2}, time_ms=1.0),
+        ])
+        best = store.best_config(
+            KernelHash("abc123"), CUDAArch.SM_90, {"M": 1024, "N": 1024},
+            dtype="fp16",
+        )
+        assert best is not None
+        assert best.params == {"x": 1}
+
+    def test_dtype_dict_canonical_round_trip(self, store: DatabaseStore) -> None:
+        """Dict dtype coordinates round-trip with sorted keys."""
+        store.store([_make_result(dtype={"input": "fp16", "accum": "fp32"})])
+        results = store.query(dtype={"accum": "fp32", "input": "fp16"})
+        assert len(results) == 1
 
     def test_close_and_reopen_memory(self) -> None:
         """In-memory DB loses data after close (expected behavior)."""

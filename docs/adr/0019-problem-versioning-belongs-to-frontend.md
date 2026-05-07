@@ -3,6 +3,10 @@
 ## Status
 
 Accepted — supersedes [ADR-0017](0017-problem-versioning.md).
+Refined by [ADR-0023](0023-coverage-axes-vs-correctness-hash.md): the
+hash inputs in clauses 2–3 below narrow to correctness inputs only;
+``sizes`` and ``dtypes`` move to row-level coverage coordinates on the
+autotune result table.
 
 ## Date
 
@@ -244,16 +248,14 @@ backend.  The backend gains a table it neither reads nor acts on, and
 every future frontend is forced to model "version" the way the backend
 modeled it.
 
-### B. Hash the full `Problem` (including name) on the verification
-record
+### B. Hash the full `Problem` (including name) on the verification record
 
 Rejected: name is a registry handle, not a correctness input.  Two
 problems with the same reference and tolerances but different
 registered names would produce different hashes for no semantic
 reason.
 
-### C. Skip reference-hash entirely; trust users to re-run verification
-manually
+### C. Skip reference-hash entirely; trust users to re-run verification manually
 
 Rejected: silent staleness is the failure mode the current
 `KernelHasher` was built to avoid.  Extending the same discipline to

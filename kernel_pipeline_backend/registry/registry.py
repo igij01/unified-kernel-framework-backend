@@ -57,14 +57,14 @@ class _LinkBinding:
             Resolved into compile-time kwargs merged into KernelConfig.
         runtime_args: Ordered problem size keys whose values are passed
             as extra positional args to Runner.run(extra_args=...).
-        type_args: List of kernel template parameter names that should
-            be bound to the current dtype from the problem's ``dtypes``
-            sweep.  All listed params receive the same dtype value.
+        type_args: Maps kernel template parameter name → problem dtype
+            slot name. Resolved against the current dtype combination
+            dict to produce per-template-param torch.dtype values.
     """
 
     constexpr_args: dict[str, str]
     runtime_args: tuple[str, ...]
-    type_args: tuple[str, ...] = ()
+    type_args: dict[str, str] = field(default_factory=dict)
 
 
 _EMPTY_BINDING = _LinkBinding(constexpr_args={}, runtime_args=())
@@ -73,7 +73,7 @@ _EMPTY_BINDING = _LinkBinding(constexpr_args={}, runtime_args=())
 def _resolve_link_binding(
     binding: _LinkBinding,
     sizes: dict[str, int],
-    dtype: Any = None,
+    dtypes: dict[str, Any] | None = None,
 ) -> tuple[tuple[Any, ...], dict[str, Any], dict[str, Any]]:
     """Resolve a link binding against a concrete size point.
 
@@ -83,10 +83,12 @@ def _resolve_link_binding(
             contain all keys referenced in the binding — callers are
             expected to run ``Registry.validate()`` upfront to ensure
             this invariant.
-        dtype: The current ``torch.dtype`` from the problem's ``dtypes``
-            sweep.  When provided and ``binding.type_args`` is non-empty,
-            the returned ``type_map`` maps each type-arg name to this
-            dtype value.
+        dtypes: The current dtype combination dict (slot name →
+            ``torch.dtype``).  When non-empty and ``binding.type_args``
+            is non-empty, each kernel template-param in
+            ``binding.type_args`` is resolved by looking up its slot in
+            ``dtypes``; the resulting ``type_map`` entry pairs the
+            kernel-param name with the resolved dtype value.
 
     Returns:
         ``(extra_args_tuple, constexpr_kwargs, type_map)`` where:
@@ -94,12 +96,17 @@ def _resolve_link_binding(
         - ``extra_args_tuple`` is passed as ``Runner.run(extra_args=...)``
         - ``constexpr_kwargs`` is merged into ``KernelConfig.params``
           before compilation.
-        - ``type_map`` maps kernel template parameter names to the
-          current ``torch.dtype`` (e.g. ``{"T": torch.float16}``).
+        - ``type_map`` maps each kernel template parameter name to the
+          ``torch.dtype`` resolved by per-slot lookup in ``dtypes``
+          (e.g. ``{"T": torch.float16}``).
     """
     extra = tuple(sizes[k] for k in binding.runtime_args)
     constexpr = {param: sizes[key] for param, key in binding.constexpr_args.items()}
-    type_map: dict[str, Any] = {p: dtype for p in binding.type_args} if dtype and binding.type_args else {}
+    type_map: dict[str, Any] = (
+        {param: dtypes[slot] for param, slot in binding.type_args.items()}
+        if dtypes and binding.type_args
+        else {}
+    )
     return extra, constexpr, type_map
 
 
@@ -230,7 +237,7 @@ class Registry:
         problem: str | None = None,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
-        type_args: list[str] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> None:
         """Register a kernel imperatively.
 
@@ -252,9 +259,10 @@ class Registry:
                 compile-time specialisation.  Requires ``problem`` to be set.
             runtime_args: Ordered problem size keys forwarded as scalar
                 ``extra_args`` to ``Runner.run()``.  Requires ``problem``.
-            type_args: List of kernel template parameter names that should
-                be bound to the current dtype from the problem's ``dtypes``
-                sweep.  Requires ``problem`` to be set.
+            type_args: Maps kernel template parameter name → problem dtype
+                slot name. Resolved against the current dtype combination
+                dict from the problem's ``dtypes`` sweep at autotune time.
+                Requires ``problem`` to be set.
 
         Raises:
             ValueError: If ``name`` is already registered as a kernel.
@@ -310,7 +318,7 @@ class Registry:
         problem: str | None = None,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
-        type_args: list[str] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator that registers the decorated callable as a kernel source.
 
@@ -325,8 +333,10 @@ class Registry:
             grid_generator: Grid dimension callable.
             compile_flags: Backend-specific flags.
             problem: If given, links this kernel to the named problem.
-            type_args: List of kernel template parameter names bound to
-                the current dtype from the problem's ``dtypes`` sweep.
+            type_args: Maps kernel template parameter name → problem dtype
+                slot name. Resolved against the current dtype combination
+                dict from the problem's ``dtypes`` sweep at autotune time.
+                Requires ``problem`` to be set.
 
         Returns:
             A decorator that registers and returns the decorated callable.
@@ -369,7 +379,7 @@ class Registry:
         *,
         constexpr_args: dict[str, str] | None = None,
         runtime_args: list[str] | None = None,
-        type_args: list[str] | None = None,
+        type_args: dict[str, str] | None = None,
     ) -> None:
         """Create a many-to-many link between a kernel and a problem.
 
@@ -390,8 +400,9 @@ class Registry:
                 compile-time specialisation.
             runtime_args: Ordered problem size keys passed as scalar
                 ``extra_args`` to ``Runner.run()``.
-            type_args: List of kernel template parameter names bound to
-                the current dtype from the problem's ``dtypes`` sweep.
+            type_args: Maps kernel template parameter name → problem dtype
+                slot name. Resolved against the current dtype combination
+                dict from the problem's ``dtypes`` sweep at autotune time.
 
         Example::
 
@@ -405,7 +416,7 @@ class Registry:
             Registry._link_bindings[(kernel_name, problem_name)] = _LinkBinding(
                 constexpr_args=dict(constexpr_args or {}),
                 runtime_args=tuple(runtime_args or []),
-                type_args=tuple(type_args or []),
+                type_args=dict(type_args) if type_args is not None else {},
             )
 
     @staticmethod
@@ -714,6 +725,26 @@ class Registry:
                     f"error: kernel '{kernel_name}' has no linked problems"
                 )
 
+        # Problem-level invariant: all dtype combos must share the same key set
+        for prob_name, problem in sorted(Registry._problems.items()):
+            prob_dtypes = getattr(problem, "dtypes", None)
+            if not prob_dtypes:
+                continue
+            key_sets = [frozenset(combo.keys()) for combo in prob_dtypes]
+            unique = []
+            for ks in key_sets:
+                if ks not in unique:
+                    unique.append(ks)
+            if len(unique) > 1:
+                rendered = " vs ".join(
+                    "{" + ",".join(f"'{k}'" for k in sorted(ks)) + "}"
+                    for ks in unique
+                )
+                messages.append(
+                    f"error: problem '{prob_name}' dtype combinations have "
+                    f"inconsistent key sets: {rendered}"
+                )
+
         # Check that binding keys exist in the linked problem's sizes
         for (kernel_name, prob_name), binding in sorted(Registry._link_bindings.items()):
             problem = Registry._problems.get(prob_name)
@@ -750,22 +781,25 @@ class Registry:
                         f"error: kernel '{kernel_name}' type_args "
                         f"{sorted(overlap)} overlap with constexpr_args"
                     )
-                # type_args must be in template_params if defined
+                # type_args keys must be in template_params if defined;
+                # type_args values (slot names) must exist in every dtype combo.
                 kernel_entry = Registry._kernels.get(kernel_name)
+                combo_slots = set(prob_dtypes[0].keys()) if prob_dtypes else set()
                 if kernel_entry is not None:
                     template_params = kernel_entry.compile_flags.get("template_params", [])
-                    type_params = kernel_entry.compile_flags.get("type_params", [])
                     for ta in binding.type_args:
                         if template_params and ta not in template_params:
                             messages.append(
                                 f"error: kernel '{kernel_name}' type_arg "
                                 f"'{ta}' not in template_params"
                             )
-                        if type_params and ta not in type_params:
-                            messages.append(
-                                f"error: kernel '{kernel_name}' type_arg "
-                                f"'{ta}' not in type_params"
-                            )
+                for slot in sorted(set(binding.type_args.values())):
+                    if prob_dtypes and slot not in combo_slots:
+                        messages.append(
+                            f"error: kernel '{kernel_name}' type_args "
+                            f"references slot '{slot}' not present in "
+                            f"problem '{prob_name}' dtype combination(s)"
+                        )
 
         return messages
 

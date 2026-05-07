@@ -10,8 +10,10 @@ Supports two modes for injecting kernel configuration:
   params (if any) still become ``-D`` defines.
 
 Type-parameterized kernels (``template<typename T, ...>``) are
-supported via ``compile_flags["type_params"]`` and the ``type_args``
-parameter on ``compile()`` / ``compile_identity()``.
+supported via the ``type_args`` parameter on ``compile()`` /
+``compile_identity()``.  Type-vs-integer template-param classification
+is determined by membership in ``type_args`` itself; no separate
+``type_params`` declaration is required (see ADR-0026).
 """
 
 from __future__ import annotations

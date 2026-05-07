@@ -2,11 +2,19 @@
 
 ## Status
 
-Accepted
+Accepted (partially superseded by ADR-0025 and ADR-0026)
 
 ## Date
 
 2026-04-13
+
+## Note
+
+The `Problem.dtypes` shape, `Problem.initialize`/`reference` signatures,
+and the `_LinkBinding.type_args` shape decided here have been replaced
+by ADR-0025 (named slot combinations) and ADR-0026 (slot-name bindings).
+The dtype-to-string mapping, `_CUDA_DTYPE_MAP`, `Compiler.dtype_to_str`,
+and `CompileIdentity` handling from this ADR remain in force.
 
 ## Context
 

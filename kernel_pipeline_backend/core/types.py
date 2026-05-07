@@ -280,11 +280,13 @@ class KernelHash:
 
 
 class ReferenceHash:
-    """Opaque content-based hash of a Problem's verification inputs.
+    """Opaque content-based hash of a Problem's correctness inputs.
 
-    Covers the reference source, tolerance, dtype sweep, and sizes
-    domain — everything that determines whether a prior verification is
-    still valid for the current problem definition.
+    Covers the reference source, initialize source, and tolerances —
+    the inputs whose change invalidates a prior verification verdict.
+    Per ADR-0023 it does **not** cover ``problem.sizes`` or
+    ``problem.dtypes``; those are coverage coordinates persisted per
+    result row, not problem identity.
 
     Constructed only by ``ReferenceHasher`` in the versioning module.
     """
@@ -451,18 +453,20 @@ class CompileIdentity:
 
 @dataclass(frozen=True)
 class SearchPoint:
-    """A single point in the (problem_size x config x dtype) search space.
+    """A single point in the (problem_size x config x dtype-combination) search space.
 
     Attributes:
         sizes: Concrete problem-size values for this point.
         config: Kernel configuration (tile sizes, warps, etc.).
-        dtype: The current dtype from the problem's ``dtypes`` sweep.
-            ``None`` for problems that do not sweep over dtypes.
+        dtypes: The current dtype combination dict (slot name → torch.dtype)
+            from the problem's ``dtypes`` sweep. For problems with no dtype
+            axis the dict is ``{}``.
     """
 
     sizes: dict[str, int] = field(default_factory=dict)
     config: KernelConfig = field(default_factory=KernelConfig)
-    dtype: Any = None  # torch.dtype | None — Any to avoid torch import
+    # Any to avoid torch import — torch.dtype values
+    dtypes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -472,14 +476,17 @@ class SearchSpace:
     Attributes:
         size_specs: Problem-size axes and their domains (from Problem.sizes).
         configs: Candidate kernel configurations (from Compiler.generate_configs).
-        dtypes: Dtype sweep domain. Defaults to ``[None]`` for problems that do
-            not declare a ``dtypes`` attribute (single-dtype or dtype-agnostic
-            problems). The pipeline sets this from ``Problem.dtypes``.
+        dtypes: List of dtype combination dicts (slot name → torch.dtype).
+            Defaults to ``[{}]`` (one empty combination, meaning "no dtype
+            axis"). The pipeline sets this from ``Problem.dtypes``; if
+            ``Problem.dtypes`` is empty or missing, the pipeline materialises
+            ``[{}]``.
     """
 
     size_specs: dict[str, SizeSpec] = field(default_factory=dict)
     configs: list[KernelConfig] = field(default_factory=list)
-    dtypes: list[Any] = field(default_factory=lambda: [None])
+    # Any to avoid torch import — torch.dtype values
+    dtypes: list[dict[str, Any]] = field(default_factory=lambda: [{}])
 
 
 @dataclass(frozen=True)

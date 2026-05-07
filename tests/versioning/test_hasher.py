@@ -434,10 +434,10 @@ class _FakeProblem:
         self.atol = atol
         self.rtol = rtol
 
-    def initialize(self, sizes: dict[str, int], dtype=None):
+    def initialize(self, sizes: dict[str, int], dtypes=None):
         return [42]
 
-    def reference(self, inputs: list, sizes: dict[str, int]):
+    def reference(self, inputs: list, sizes: dict[str, int], dtypes=None):
         return [42]
 
 
@@ -449,7 +449,7 @@ class _FakeProblemNoReference:
     atol = 0.0
     rtol = 0.0
 
-    def initialize(self, sizes, dtype=None):
+    def initialize(self, sizes, dtypes=None):
         return [42]
 
 
@@ -488,25 +488,15 @@ class TestReferenceHashSensitivity:
         h2 = ref_hasher.hash(_FakeProblem(rtol=1e-5))
         assert h1 != h2
 
-    def test_different_sizes_different_hash(self, ref_hasher: ReferenceHasher) -> None:
-        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
-        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [256]}))
-        assert h1 != h2
-
-    def test_different_size_keys_different_hash(self, ref_hasher: ReferenceHasher) -> None:
-        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
-        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [128], "N": [256]}))
-        assert h1 != h2
-
     def test_different_reference_source_different_hash(
         self, ref_hasher: ReferenceHasher
     ) -> None:
         class P1(_FakeProblem):
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes=None):
                 return [1]
 
         class P2(_FakeProblem):
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes=None):
                 return [2]
 
         assert ref_hasher.hash(P1()) != ref_hasher.hash(P2())
@@ -515,11 +505,11 @@ class TestReferenceHashSensitivity:
         self, ref_hasher: ReferenceHasher
     ) -> None:
         class P1(_FakeProblem):
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 return [1]
 
         class P2(_FakeProblem):
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 return [2]
 
         assert ref_hasher.hash(P1()) != ref_hasher.hash(P2())
@@ -587,10 +577,29 @@ class TestReferenceHashRobustness:
         assert ref_hasher.hash(P1()) == ref_hasher.hash(P2())
 
 
-class TestReferenceHashSizesOrdering:
-    """Sizes with different insertion order must hash equal."""
+class TestReferenceHashCoverageInsensitivity:
+    """ADR-0023: sizes and dtypes are coverage axes, not hash inputs.
 
-    def test_sizes_key_order_irrelevant(self, ref_hasher: ReferenceHasher) -> None:
-        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128], "N": [256]}))
-        h2 = ref_hasher.hash(_FakeProblem(sizes={"N": [256], "M": [128]}))
+    Extending coverage must not invalidate prior verification rows.
+    """
+
+    def test_different_sizes_same_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [256]}))
+        assert h1 == h2
+
+    def test_different_size_keys_same_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [128], "N": [256]}))
+        assert h1 == h2
+
+    def test_added_size_does_not_change_hash(self, ref_hasher: ReferenceHasher) -> None:
+        """Widening the size sweep is the canonical 'incremental autotune' case."""
+        h1 = ref_hasher.hash(_FakeProblem(sizes={"M": [128, 256]}))
+        h2 = ref_hasher.hash(_FakeProblem(sizes={"M": [128, 256, 4096]}))
+        assert h1 == h2
+
+    def test_different_dtypes_same_hash(self, ref_hasher: ReferenceHasher) -> None:
+        h1 = ref_hasher.hash(_FakeProblem(dtypes=[{"T": "fp16"}]))
+        h2 = ref_hasher.hash(_FakeProblem(dtypes=[{"T": "fp16"}, {"T": "bf16"}]))
         assert h1 == h2

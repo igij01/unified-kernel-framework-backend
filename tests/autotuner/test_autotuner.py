@@ -294,10 +294,10 @@ class TestVerification:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 return [[0.0]]
 
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes):
                 return [[999.0]]
 
             def filter_sizes(self, sizes):
@@ -356,10 +356,10 @@ class TestVerification:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 return [[1.0, 2.0, 3.0]]
 
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes):
                 nonlocal call_count
                 call_count += 1
                 if call_count % 2 == 0:
@@ -481,10 +481,10 @@ class TestPluginEvents:
             atol = 1e-3
             rtol = 1e-3
 
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 return [[0.0]]
 
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes):
                 return [[999.0]]
 
             def filter_sizes(self, sizes):

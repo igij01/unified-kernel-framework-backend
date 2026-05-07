@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from kernel_pipeline_backend.core.types import AutotuneResult, CUDAArch, KernelConfig, KernelHash
 
@@ -30,16 +30,20 @@ class ResultStore(Protocol):
         kernel_hash: KernelHash | None = None,
         arch: CUDAArch | None = None,
         sizes: dict[str, int] | None = None,
+        dtype: Any = ...,
     ) -> list[AutotuneResult]:
         """Query stored results with optional filters.
 
         All parameters are optional — omitting a parameter means
-        "match any value" for that field.
+        "match any value" for that field.  ``dtype`` accepts ``None`` as
+        a real filter value (rows whose dtype coordinate is null); to
+        skip the dtype filter entirely, omit the argument.
 
         Args:
             kernel_hash: Filter by opaque kernel hash.
             arch: Filter by GPU architecture string.
             sizes: Filter by exact problem size match.
+            dtype: Filter by exact dtype coordinate (ADR-0023).
 
         Returns:
             Matching results, ordered by time_ms ascending.
@@ -51,13 +55,16 @@ class ResultStore(Protocol):
         kernel_hash: KernelHash,
         arch: CUDAArch,
         sizes: dict[str, int],
+        dtype: Any = ...,
     ) -> KernelConfig | None:
-        """Return the optimal config for a specific (kernel, arch, size) point.
+        """Return the optimal config for a specific point.
 
         Args:
             kernel_hash: Opaque kernel hash.
             arch: GPU architecture string.
             sizes: Exact problem size.
+            dtype: Exact dtype coordinate (ADR-0023).  Omit for kernels
+                with no dtype sweep.
 
         Returns:
             The KernelConfig with the lowest time_ms, or None if no

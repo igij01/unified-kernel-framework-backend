@@ -15,18 +15,21 @@ Example::
             "N": range(128, 4097, 128),
             "K": [128, 256, 512],
         }
-        dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        dtypes = [
+            {"A": torch.float16, "B": torch.float16, "C": torch.float32},
+            {"A": torch.bfloat16, "B": torch.bfloat16, "C": torch.float32},
+        ]
         atol = 1e-3
         rtol = 1e-3
 
-        def initialize(self, sizes, dtype):
+        def initialize(self, sizes, dtypes):
             M, N, K = sizes["M"], sizes["N"], sizes["K"]
-            return [rand_tensor(M, K, dtype=dtype),
-                    rand_tensor(K, N, dtype=dtype)]
+            return [rand_tensor(M, K, dtype=dtypes["A"]),
+                    rand_tensor(K, N, dtype=dtypes["B"])]
 
-        def reference(self, inputs, sizes):
+        def reference(self, inputs, sizes, dtypes):
             A, B = inputs
-            return [torch.matmul(A, B)]
+            return [torch.matmul(A, B).to(dtypes["C"])]
 """
 
 from __future__ import annotations
@@ -57,13 +60,21 @@ class Problem(Protocol):
     sizes: dict[str, SizeSpec]
     """Size parameter axes and their domains for autotuning sweeps."""
 
-    dtypes: list[torch.dtype]
-    """Dtype sweep domain — the set of dtypes to benchmark the kernel at.
+    dtypes: list[dict[str, torch.dtype]]
+    """Dtype sweep domain — a list of named dtype combinations.
 
-    The pipeline iterates over each dtype in this list as an outer axis
-    alongside ``sizes``, passing the current dtype to ``initialize``.
-    A single-dtype problem simply uses a one-element list (e.g.
-    ``[torch.float32]``).
+    Each element is a dict mapping slot names (chosen by the problem
+    author) to ``torch.dtype`` values. The pipeline iterates over each
+    combination as an outer axis alongside ``sizes``, passing the
+    current combination dict to ``initialize``.
+
+    All combination dicts must share the same set of slot keys; this
+    invariant is checked by ``Registry.validate()``.
+
+    An empty list (``dtypes = []``) or a missing attribute means "no
+    dtype axis." In that case the pipeline still calls ``initialize``
+    with ``dtypes={}``. A single-combination problem uses a one-element
+    list, e.g. ``[{"T": torch.float32}]``.
     """
 
     atol: float
@@ -75,7 +86,7 @@ class Problem(Protocol):
     def initialize(
         self,
         sizes: dict[str, int],
-        dtype: torch.dtype | None = None,
+        dtypes: dict[str, torch.dtype],
     ) -> list[torch.Tensor]:
         """Create input tensors for a specific size point.
 
@@ -83,9 +94,10 @@ class Problem(Protocol):
             sizes: A dict mapping each size parameter name to a concrete
                 integer value (one point from the cartesian product of
                 ``self.sizes``).
-            dtype: The current dtype from the ``dtypes`` sweep.  When the
-                pipeline drives the call, this is always set.  Defaults
-                to ``None`` for backward compatibility.
+            dtypes: The current dtype combination — a dict mapping slot
+                names (as declared in ``self.dtypes``) to ``torch.dtype``
+                values. For problems with no dtype axis (empty or
+                missing ``dtypes`` attribute), this is ``{}``.
 
         Returns:
             List of input tensors on the appropriate device and dtype.
@@ -96,6 +108,7 @@ class Problem(Protocol):
         self,
         inputs: list[torch.Tensor],
         sizes: dict[str, int],
+        dtypes: dict[str, torch.dtype],
     ) -> list[torch.Tensor]:
         """Ground truth implementation using PyTorch.
 
@@ -107,6 +120,12 @@ class Problem(Protocol):
             inputs: Tensors returned by ``initialize``.
             sizes: A dict mapping each size parameter name to a concrete
                 integer value — the same point passed to ``initialize``.
+            dtypes: The same dtype combination passed to ``initialize``.
+                Useful when the reference needs the dtype of a slot that
+                is not directly visible on an input tensor — for example
+                an accumulator or output dtype that the kernel produces
+                but ``inputs`` does not carry. For problems with no dtype
+                axis this is ``{}``.
 
         Returns:
             Expected output tensors that the kernel should match.

@@ -14,7 +14,7 @@ from kernel_pipeline_backend.core.types import (
     PointResult,
     SearchPoint,
 )
-from kernel_pipeline_backend.pipeline.pipeline import Pipeline
+from kernel_pipeline_backend.pipeline.native import NativePipeline
 from kernel_pipeline_backend.plugin.manager import PluginManager
 from kernel_pipeline_backend.plugin.plugin import (
     EVENT_COMPILE_COMPLETE,
@@ -74,8 +74,8 @@ def _make_pipeline(
     store: FakeResultStore | None = None,
     plugins: PluginManager | None = None,
     device: FakeDeviceHandle | None = None,
-) -> Pipeline:
-    return Pipeline(
+) -> NativePipeline:
+    return NativePipeline(
         compiler=compiler or FakeCompiler(),
         runner=runner or FakeRunner(),
         store=store or FakeResultStore(),
@@ -457,8 +457,8 @@ class TestRunPointBindingResolution:
             class _P:
                 sizes = {"M": [128], "N": [64]}
                 atol = rtol = 1e-3
-                def initialize(self, s, dtype=None): return [[1.0]]
-                def reference(self, i, s): return list(i)
+                def initialize(self, s, dtypes): return [[1.0]]
+                def reference(self, i, s, dtypes): return list(i)
 
             Registry.register_problem("p", _P())
             Registry.register_kernel(
@@ -514,8 +514,8 @@ class TestRunPointBindingResolution:
             class _P:
                 sizes = {"M": [128], "HEAD_DIM": [64]}
                 atol = rtol = 1e-3
-                def initialize(self, s, dtype=None): return [[1.0]]
-                def reference(self, i, s): return list(i)
+                def initialize(self, s, dtypes): return [[1.0]]
+                def reference(self, i, s, dtypes): return list(i)
 
             Registry.register_problem("p", _P())
             Registry.register_kernel(
@@ -559,7 +559,7 @@ class TestRunPointBindingResolution:
         class NoRefProblem:
             sizes = {"M": [128]}
             atol = rtol = 1e-3
-            def initialize(self, s, dtype=None): return [[1.0]]
+            def initialize(self, s, dtypes): return [[1.0]]
             # No reference method
 
         pipeline = _make_pipeline()

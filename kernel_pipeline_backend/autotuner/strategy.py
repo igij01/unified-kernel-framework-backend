@@ -38,11 +38,11 @@ def _enumerate_all_points(space: SearchSpace) -> list[SearchPoint]:
     domains = [list(space.size_specs[n]) for n in names]
 
     points: list[SearchPoint] = []
-    for dtype in space.dtypes:
+    for combo in space.dtypes:
         for size_combo in itertools.product(*domains):
             sizes = dict(zip(names, size_combo))
             for config in space.configs:
-                points.append(SearchPoint(sizes=sizes, config=config, dtype=dtype))
+                points.append(SearchPoint(sizes=sizes, config=config, dtypes=combo))
     return points
 
 
@@ -50,10 +50,10 @@ def _point_key(point: SearchPoint) -> str:
     """Create a hashable string key for a SearchPoint.
 
     Uses deterministic JSON serialization so that two SearchPoints with
-    identical sizes, config params, and dtype produce the same key.
+    identical sizes, config params, and dtypes produce the same key.
     """
     return json.dumps(
-        {"s": point.sizes, "c": point.config.params, "d": point.dtype},
+        {"s": point.sizes, "c": point.config.params, "d": point.dtypes},
         sort_keys=True,
         default=str,
     )

@@ -11,13 +11,15 @@ Excluded from kernel hash (intentionally):
     ``name`` (cosmetic), ``target_archs`` (handled per-arch in the store),
     ``grid_generator`` (runtime launch config, not compiled content).
 
-**ReferenceHash** inputs (per ADR-0019):
+**ReferenceHash** inputs (per ADR-0019, refined by ADR-0023):
     ``problem.reference`` source + ``problem.initialize`` source +
-    ``problem.atol`` + ``problem.rtol`` + ``problem.dtypes`` +
-    ``problem.sizes`` keys/domains.
+    ``problem.atol`` + ``problem.rtol``.
 
 Excluded from reference hash (intentionally):
-    ``problem`` name (cosmetic), kernel set membership.
+    ``problem`` name (cosmetic), kernel set membership,
+    ``problem.sizes`` and ``problem.dtypes`` (these are coverage
+    coordinates persisted per result row — see ADR-0023 — not
+    correctness inputs that invalidate prior verifications).
 """
 
 from __future__ import annotations
@@ -146,29 +148,36 @@ class KernelHasher:
 
 
 class ReferenceHasher:
-    """Compute a deterministic hash of a Problem's verification inputs.
+    """Compute a deterministic hash of a Problem's correctness inputs.
 
     The resulting ``ReferenceHash`` answers exactly one question: "is a
     previously-recorded verification still valid for the current problem
     definition?"  Used to detect reference drift — when the reference
-    implementation, tolerances, dtype sweep, or sizes domain change,
-    prior verification verdicts are stale and the kernel must be
-    re-verified.
+    implementation, input distribution, or tolerances change, prior
+    verification verdicts are stale and the kernel must be re-verified.
 
-    Per ADR-0019 this is the only hashing the backend owns for problems.
-    Release manifests and labelled versions are a frontend concern.
+    Per ADR-0019 this is the only hashing the backend owns for problems;
+    release manifests and labelled versions are a frontend concern.
+
+    Per ADR-0023 the hash covers only correctness inputs.  ``sizes`` and
+    ``dtypes`` are *coverage axes* — coordinates of the autotune result
+    table — not identity inputs.  Extending coverage adds new rows; it
+    does not invalidate existing rows whose correctness inputs are
+    unchanged.
     """
 
     def hash(self, problem: Problem) -> ReferenceHash:
-        """Compute a content hash of a problem's verification inputs.
+        """Compute a content hash of a problem's correctness inputs.
 
         Hashes the canonical serialization of:
 
         - ``problem.reference`` source (or ``"<no-reference>"`` if absent).
         - ``problem.initialize`` source.
         - ``problem.atol``, ``problem.rtol``.
-        - ``problem.dtypes`` — sorted by ``torch.dtype.__repr__``.
-        - ``problem.sizes`` keys + size domains, canonically sorted.
+
+        ``problem.sizes`` and ``problem.dtypes`` are intentionally
+        excluded; they are persisted per result row as coverage
+        coordinates (ADR-0023), not folded into problem identity.
 
         Args:
             problem: Any object satisfying the ``Problem`` protocol.
@@ -204,22 +213,5 @@ class ReferenceHasher:
         h.update(str(atol).encode("utf-8"))
         h.update(b"\x00rtol:")
         h.update(str(rtol).encode("utf-8"))
-        h.update(b"\x00")
-
-        # --- dtypes (sorted by repr) ---
-        dtypes = getattr(problem, "dtypes", None) or []
-        dtype_reprs = sorted(repr(dt) for dt in dtypes)
-        h.update(b"dtypes:")
-        h.update(json.dumps(dtype_reprs).encode("utf-8"))
-        h.update(b"\x00")
-
-        # --- sizes keys + domains (canonically sorted) ---
-        sizes = getattr(problem, "sizes", {}) or {}
-        sizes_canonical: dict[str, list[int]] = {
-            key: list(domain)
-            for key, domain in sorted(sizes.items())
-        }
-        h.update(b"sizes:")
-        h.update(json.dumps(sizes_canonical, sort_keys=True).encode("utf-8"))
 
         return ReferenceHash(h.hexdigest())

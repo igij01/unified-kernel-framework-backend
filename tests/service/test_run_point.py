@@ -44,10 +44,10 @@ class _FakeProblem:
     atol: float = 1e-3
     rtol: float = 1e-3
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
 
@@ -193,8 +193,8 @@ def captured_calls(monkeypatch: pytest.MonkeyPatch) -> list[_RunPointCall]:
         ))
         return PointResult(kernel_name=spec.name, point=point)
 
-    from kernel_pipeline_backend.pipeline.pipeline import Pipeline
-    monkeypatch.setattr(Pipeline, "run_point", _mock_run_point)
+    from kernel_pipeline_backend.pipeline.native import NativePipeline
+    monkeypatch.setattr(NativePipeline, "run_point", _mock_run_point)
     return calls
 
 

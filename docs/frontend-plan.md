@@ -111,8 +111,11 @@ containing:
 - The shared C++ launcher `.so` (built once, not per-kernel).
 - A `manifest.json` describing
   `(problem_name, label, kernel_hashes, archs, sizes_covered,
-  reference_hash)`.  This manifest *is* the version record (per
-  ADR-0019); there is no corresponding backend table.
+  dtypes_covered, reference_hash)`.  This manifest *is* the version
+  record (per ADR-0019); there is no corresponding backend table.
+  ``sizes_covered`` and ``dtypes_covered`` are recorded explicitly
+  because they are row-level coverage coordinates in the backend
+  store, not folded into ``reference_hash`` (ADR-0023).
 - Meta info for traceability: backend repo SHA, autotune timestamp
   range, `reference_hash` from the backend's verification record.
 
@@ -161,12 +164,17 @@ Both are Proposed as of 2026-04-26.
 
 Withdraws ADR-0017.  The backend does **not** gain a `problem_versions`
 table or `snapshot_version` API.  Instead it adds a narrow
-`ReferenceHash` (covering `reference` + `initialize` + tolerances +
-dtypes + sizes domain) recorded on each verification record so
-reference drift triggers re-verification.  All release/version
-semantics — labels, manifests, "list versions" — live in the frontend.
+`ReferenceHash` recorded on each verification record so reference
+drift triggers re-verification.  All release/version semantics —
+labels, manifests, "list versions" — live in the frontend.
 
-See [adr/0019-problem-versioning-belongs-to-frontend.md](adr/0019-problem-versioning-belongs-to-frontend.md).
+Per ADR-0023 the hash covers only correctness inputs (`reference` +
+`initialize` + tolerances).  ``sizes`` and ``dtypes`` are persisted
+per result row as coverage coordinates, so widening the size or dtype
+sweep produces incremental work without invalidating prior rows.
+
+See [adr/0019-problem-versioning-belongs-to-frontend.md](adr/0019-problem-versioning-belongs-to-frontend.md)
+and [adr/0023-coverage-axes-vs-correctness-hash.md](adr/0023-coverage-axes-vs-correctness-hash.md).
 
 ### ADR-0018 — Binary Artifact Exposure on `CompiledKernel`
 
@@ -232,7 +240,8 @@ external frontend repo:
 | --- | --- | --- |
 | Target framework for v1 | PyTorch only | Lean on `torch.export` / AOTInductor where possible; defer TF until the manifest format is proven. |
 | Problem-version ownership | Frontend-owned `manifest.json` per wheel + local label index; backend has no version table (ADR-0019, supersedes 0017) | Versioning is a release/packaging concern, not a verify/autotune concern; keeps backend layered per ADR-0001. |
-| Reference-drift detection | `ReferenceHash` on verification records (ADR-0019) | The actual backend correctness invariant; narrower than a full problem hash. |
+| Reference-drift detection | `ReferenceHash` (correctness inputs only) on verification records (ADR-0019, refined by ADR-0023) | The actual backend correctness invariant; narrower than a full problem hash.  Sizes and dtypes are row-level coverage coordinates so coverage extension does not invalidate prior rows. |
+| Coverage axes (sizes, dtypes) | Persisted as row-level coordinates on every autotune result; not folded into `ReferenceHash` (ADR-0023) | Lets users widen the sweep incrementally — new sizes/dtypes produce new rows without re-tuning existing ones. |
 | Triton AOT path | Use `torch.export` / AOTInductor when target=torch; roll own only when adding TF | Avoid duplicating launch glue torch already provides. |
 | Codegen language | Python (with shared C++ `cuLaunchKernel` shim) | Dispatch overhead is negligible vs. kernel runtime; avoids C++ build in install path; `torch.library.custom_op` is the supported surface. |
 | Packaging substrate | Native per-target codegen | TVM evaluated and rejected: built for compilation orchestration, not pre-compiled binary dispatch; `torch_tvm` unmaintained; no TVM→TF export. |

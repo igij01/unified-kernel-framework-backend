@@ -28,9 +28,11 @@ from typing import TYPE_CHECKING
 
 from kernel_pipeline_backend.core.registry import registry as backend_registry
 from kernel_pipeline_backend.core.types import CompileOptions, PointResult
-from kernel_pipeline_backend.pipeline.pipeline import Pipeline, PipelineResult
+from kernel_pipeline_backend.orchestrator import Orchestrator, PipelineResult
+from kernel_pipeline_backend.pipeline.native import NativePipeline
 from kernel_pipeline_backend.plugin.manager import PluginManager
 from kernel_pipeline_backend.registry import Registry
+from kernel_pipeline_backend.service.debug_session import DebugSession
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
@@ -75,7 +77,7 @@ def _enforce_registry_valid() -> None:
 
 
 @dataclass
-class TuneResult:
+class ServiceTuneResult:
     """Result of tuning one or more kernels.
 
     Attributes:
@@ -218,8 +220,8 @@ class TuneService:
         self,
         backend: str,
         plugin_manager: PluginManager,
-    ) -> Pipeline:
-        """Construct a Pipeline for the given backend.
+    ) -> NativePipeline:
+        """Construct a NativePipeline for the given backend.
 
         Resolves ``Compiler`` and ``Runner`` from the ``BackendRegistry``.
 
@@ -235,7 +237,7 @@ class TuneService:
         """
         compiler = backend_registry.get_compiler(backend)
         runner = backend_registry.get_runner(backend)
-        return Pipeline(
+        return NativePipeline(
             compiler=compiler,
             runner=runner,
             store=self._store,
@@ -258,7 +260,7 @@ class TuneService:
         force: bool = False,
         skip_verify: bool = False,
         skip_autotune: bool = False,
-    ) -> TuneResult:
+    ) -> ServiceTuneResult:
         """Tune a single kernel by name.
 
         Resolution:
@@ -287,7 +289,7 @@ class TuneService:
             skip_autotune: If ``True``, skip autotuning.
 
         Returns:
-            A ``TuneResult`` with the pipeline output.
+            A ``ServiceTuneResult`` with the pipeline output.
 
         Raises:
             KeyError: If ``kernel_name`` or ``problem`` is not registered.
@@ -317,7 +319,8 @@ class TuneService:
         pm = await self._build_plugin_manager(resolved_plugins)
         try:
             pipeline = self._build_pipeline(spec.backend, pm)
-            pipeline_result = await pipeline.run(
+            orchestrator = Orchestrator(pipeline, self._store, pm, self._device)
+            pipeline_result = await orchestrator.run(
                 kernels=[spec],
                 problem=problem_obj,
                 strategy=resolved_strategy,
@@ -330,7 +333,7 @@ class TuneService:
         finally:
             await pm.shutdown_all()
 
-        return TuneResult(
+        return ServiceTuneResult(
             kernel_names=[kernel_name],
             problem_name=problem_name,
             pipeline_result=pipeline_result,
@@ -346,7 +349,7 @@ class TuneService:
         force: bool = False,
         skip_verify: bool = False,
         skip_autotune: bool = False,
-    ) -> TuneResult:
+    ) -> ServiceTuneResult:
         """Tune all kernels linked to a problem.
 
         Resolves ``Registry.kernels_for_problem(problem_name)`` and passes
@@ -365,7 +368,7 @@ class TuneService:
             skip_autotune: If ``True``, skip autotuning.
 
         Returns:
-            A ``TuneResult`` with the pipeline output.
+            A ``ServiceTuneResult`` with the pipeline output.
 
         Raises:
             KeyError: If ``problem_name`` is not registered.
@@ -400,7 +403,8 @@ class TuneService:
         pm = await self._build_plugin_manager(resolved_plugins)
         try:
             pipeline = self._build_pipeline(specs[0].backend, pm)
-            pipeline_result = await pipeline.run(
+            orchestrator = Orchestrator(pipeline, self._store, pm, self._device)
+            pipeline_result = await orchestrator.run(
                 kernels=specs,
                 problem=problem_obj,
                 strategy=resolved_strategy,
@@ -413,7 +417,7 @@ class TuneService:
         finally:
             await pm.shutdown_all()
 
-        return TuneResult(
+        return ServiceTuneResult(
             kernel_names=kernel_names,
             problem_name=problem_name,
             pipeline_result=pipeline_result,
@@ -428,7 +432,7 @@ class TuneService:
         force: bool = False,
         skip_verify: bool = False,
         skip_autotune: bool = False,
-    ) -> list[TuneResult]:
+    ) -> list[ServiceTuneResult]:
         """Tune every kernel in the registry.
 
         Groups kernels by problem, issues one ``tune_problem()`` per
@@ -445,7 +449,7 @@ class TuneService:
             skip_autotune: If ``True``, skip autotuning.
 
         Returns:
-            A list of ``TuneResult`` — one per problem group.
+            A list of ``ServiceTuneResult`` — one per problem group.
 
         Raises:
             ValueError: If the registry is empty or has validation errors
@@ -458,7 +462,7 @@ class TuneService:
         # Validate once upfront; catches unlinked kernels and dangling links.
         _enforce_registry_valid()
 
-        results: list[TuneResult] = []
+        results: list[ServiceTuneResult] = []
 
         # Tune each problem group (tune_problem calls _enforce_registry_valid)
         for problem_name in Registry.list_problems():
@@ -568,13 +572,20 @@ class TuneService:
 
         pm = await self._build_plugin_manager(resolved_plugins)
         try:
-            pipeline = self._build_pipeline(spec.backend, pm)
-            return await pipeline.run_point(
+            compiler = backend_registry.get_compiler(spec.backend)
+            runner = backend_registry.get_runner(spec.backend)
+            session = DebugSession(
+                compiler=compiler,
+                runner=runner,
+                device=self._device,
+                plugin_manager=pm,
+                passes=passes,
+            )
+            return await session.run_point(
                 spec,
                 point,
                 problem_obj,
                 problem_name=problem_name,
-                passes=passes,
                 compile_options=compile_options,
                 verify=verify,
                 profile=profile,

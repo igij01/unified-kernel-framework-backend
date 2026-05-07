@@ -355,7 +355,7 @@ class Autotuner:
 
                 # Resolve size bindings for this point.
                 extra_args, constexpr_sizes, type_map = _resolve_link_binding(
-                    binding, point.sizes, dtype=point.dtype,  # type: ignore[arg-type]
+                    binding, point.sizes, dtypes=point.dtypes,
                 )
 
                 # Resolve type_map (torch.dtype values) → backend type strings
@@ -422,7 +422,7 @@ class Autotuner:
                         )
                         vr = self._verifier.verify(
                             compiled, problem, point.sizes, extra_args,  # type: ignore[arg-type]
-                            dtype=point.dtype,
+                            dtypes=point.dtypes,
                         )
                         result.verified.append(vr)
                         verified_cache[cache_key_v] = vr.passed
@@ -450,7 +450,7 @@ class Autotuner:
                             point.sizes,
                             extra_args,
                             original_config=point.config,
-                            dtype=point.dtype,
+                            dtypes=point.dtypes,
                         )
                         result.tuned.append(ar)
 

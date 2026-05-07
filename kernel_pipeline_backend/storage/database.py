@@ -1,8 +1,10 @@
 """Database-backed implementation of ResultStore.
 
 Uses SQLite via the stdlib ``sqlite3`` module — no external dependencies.
-Results are keyed by ``(kernel_hash, arch, sizes, config)`` with timing
-and observer metrics stored as JSON columns.
+Results are keyed by ``(kernel_hash, arch, sizes, dtypes, config)`` per
+ADR-0023 — ``dtypes`` is a row-level coverage coordinate, not part of
+problem identity.  Timing and observer metrics are stored as JSON
+columns.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
+from typing import Any
 
 from kernel_pipeline_backend.core.types import (
     AutotuneResult,
@@ -25,8 +28,11 @@ class DatabaseStore:
     """SQLite implementation of :class:`ResultStore`.
 
     Stores autotune results in a single ``autotune_results`` table with a
-    UNIQUE constraint on ``(kernel_hash, arch, sizes_json, config_json)``
-    so that re-running an identical point overwrites the previous row.
+    UNIQUE constraint on
+    ``(kernel_hash, arch, sizes_json, dtypes_json, config_json)`` so that
+    re-running an identical point overwrites the previous row.  Per
+    ADR-0023, ``dtypes_json`` is a row-level coverage coordinate
+    alongside ``sizes_json``.
 
     Connection string format:
         - ``"sqlite:///path/to/db.sqlite"`` — file-based database
@@ -68,12 +74,13 @@ class DatabaseStore:
                 kernel_hash TEXT NOT NULL,
                 arch        TEXT NOT NULL,
                 sizes_json  TEXT NOT NULL,
+                dtypes_json TEXT NOT NULL,
                 config_json TEXT NOT NULL,
                 time_ms     REAL NOT NULL,
                 metrics_json TEXT NOT NULL DEFAULT '{}',
                 reference_hash TEXT DEFAULT NULL,
                 timestamp   TEXT NOT NULL,
-                UNIQUE(kernel_hash, arch, sizes_json, config_json)
+                UNIQUE(kernel_hash, arch, sizes_json, dtypes_json, config_json)
             )
             """
         )
@@ -95,22 +102,70 @@ class DatabaseStore:
         return json.dumps(sizes, sort_keys=True)
 
     @staticmethod
+    def _serialize_dtypes(dtype: Any) -> str:
+        """Deterministic JSON encoding of a dtype coverage coordinate.
+
+        Per ADR-0023 the column accepts an arbitrary problem-specific
+        dtype shape (single dtype, ``(input, accumulator)`` pair,
+        per-tensor map).  ``None`` (no dtype sweep) → JSON ``null``.
+        ``torch.dtype`` and other non-JSON-native objects are coerced
+        via ``repr``.  Dicts are sorted; lists/tuples preserve order
+        (positional dtype tuples are meaningful).
+        """
+        return json.dumps(DatabaseStore._canonical_dtype(dtype), sort_keys=True)
+
+    @staticmethod
+    def _canonical_dtype(dtype: Any) -> Any:
+        """Recursively coerce a dtype coordinate to JSON-friendly form."""
+        if dtype is None or isinstance(dtype, (bool, int, float, str)):
+            return dtype
+        if isinstance(dtype, dict):
+            return {
+                str(k): DatabaseStore._canonical_dtype(v)
+                for k, v in sorted(dtype.items(), key=lambda kv: str(kv[0]))
+            }
+        if isinstance(dtype, (list, tuple)):
+            return [DatabaseStore._canonical_dtype(v) for v in dtype]
+        return repr(dtype)
+
+    @staticmethod
     def _serialize_config(config: KernelConfig) -> str:
         """Deterministic JSON for config params (sorted keys)."""
         return json.dumps(config.params, sort_keys=True)
+
+    @staticmethod
+    def _decode_dtype(dtypes_json: str) -> Any:
+        """Reverse of :meth:`_serialize_dtypes` for round-tripping rows.
+
+        TODO: lossy round-trip. ``_canonical_dtype`` coerces ``torch.dtype``
+        values to their ``repr()`` (e.g. ``"torch.float16"``) before
+        serialisation, and this method does a plain ``json.loads``. So a
+        combination dict written as ``{"A": torch.float16}`` is read back
+        as ``{"A": "torch.float16"}`` — a ``dict[str, str]``, not a
+        ``dict[str, torch.dtype]``. Filtering (``query(dtype=...)``) is
+        unaffected because both write and where-clause paths go through
+        the same canonicalization. Consumers that need real ``torch.dtype``
+        values back (e.g. to re-run a stored point) currently get
+        repr-strings and will misbehave silently. Per ADR-0023 these are
+        coverage coordinates intended for keying rows, not for replay,
+        which is why this has not been fixed; revisit if a replay use
+        case appears.
+        """
+        return json.loads(dtypes_json)
 
     def _row_to_result(self, row: sqlite3.Row | tuple) -> AutotuneResult:
         """Convert a database row to an ``AutotuneResult``.
 
         Column order matches the table definition:
-        ``(id, kernel_hash, arch, sizes_json, config_json, time_ms,
-        metrics_json, reference_hash, timestamp)``.
+        ``(id, kernel_hash, arch, sizes_json, dtypes_json, config_json,
+        time_ms, metrics_json, reference_hash, timestamp)``.
         """
         (
             _id,
             kernel_hash_str,
             arch_str,
             sizes_json,
+            dtypes_json,
             config_json,
             time_ms,
             metrics_json,
@@ -124,6 +179,7 @@ class DatabaseStore:
             point=SearchPoint(
                 sizes=json.loads(sizes_json),
                 config=KernelConfig(params=json.loads(config_json)),
+                dtypes=self._decode_dtype(dtypes_json),
             ),
             time_ms=time_ms,
             metrics=json.loads(metrics_json),
@@ -153,6 +209,7 @@ class DatabaseStore:
                 str(r.kernel_hash) if r.kernel_hash is not None else "",
                 r.arch.name if r.arch is not None else "",
                 self._serialize_sizes(r.point.sizes),
+                self._serialize_dtypes(r.point.dtypes),
                 self._serialize_config(r.point.config),
                 r.time_ms,
                 json.dumps(r.metrics),
@@ -165,29 +222,36 @@ class DatabaseStore:
         self._conn.executemany(
             """
             INSERT OR REPLACE INTO autotune_results
-                (kernel_hash, arch, sizes_json, config_json,
+                (kernel_hash, arch, sizes_json, dtypes_json, config_json,
                  time_ms, metrics_json, reference_hash, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         self._conn.commit()
+
+    _DTYPE_UNSET = object()
 
     def query(
         self,
         kernel_hash: KernelHash | None = None,
         arch: CUDAArch | None = None,
         sizes: dict[str, int] | None = None,
+        dtype: Any = _DTYPE_UNSET,
     ) -> list[AutotuneResult]:
         """Query stored results with optional filters.
 
         All parameters are optional — omitting a parameter means "match
-        any value" for that field.
+        any value" for that field.  Note that ``dtype`` accepts ``None``
+        as a real filter value (rows whose dtype coordinate is JSON
+        ``null``); to skip the dtype filter entirely, omit the argument.
 
         Args:
             kernel_hash: Filter by opaque kernel hash.
             arch: Filter by GPU architecture.
             sizes: Filter by exact problem-size match.
+            dtype: Filter by exact dtype coordinate (canonicalized via
+                :meth:`_serialize_dtypes`).  Omit to match any dtype.
 
         Returns:
             Matching results ordered by ``time_ms`` ascending.
@@ -204,6 +268,9 @@ class DatabaseStore:
         if sizes is not None:
             clauses.append("sizes_json = ?")
             params.append(self._serialize_sizes(sizes))
+        if dtype is not self._DTYPE_UNSET:
+            clauses.append("dtypes_json = ?")
+            params.append(self._serialize_dtypes(dtype))
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -218,6 +285,7 @@ class DatabaseStore:
         kernel_hash: KernelHash,
         arch: CUDAArch,
         sizes: dict[str, int],
+        dtype: Any = _DTYPE_UNSET,
     ) -> KernelConfig | None:
         """Return the config with the lowest ``time_ms`` for a given point.
 
@@ -225,19 +293,33 @@ class DatabaseStore:
             kernel_hash: Opaque kernel hash.
             arch: GPU architecture.
             sizes: Exact problem sizes.
+            dtype: Exact dtype coordinate (ADR-0023).  Omit to match any
+                dtype — appropriate for kernels with no dtype sweep; for
+                multi-dtype problems callers should pass an explicit
+                value to scope the lookup.
 
         Returns:
             The fastest :class:`KernelConfig`, or ``None`` if no results
-            exist for this ``(kernel_hash, arch, sizes)`` combination.
+            exist for this point.
         """
+        clauses = ["kernel_hash = ?", "arch = ?", "sizes_json = ?"]
+        params: list[str] = [
+            str(kernel_hash),
+            arch.name,
+            self._serialize_sizes(sizes),
+        ]
+        if dtype is not self._DTYPE_UNSET:
+            clauses.append("dtypes_json = ?")
+            params.append(self._serialize_dtypes(dtype))
+
         cursor = self._conn.execute(
-            """
+            f"""
             SELECT config_json FROM autotune_results
-            WHERE kernel_hash = ? AND arch = ? AND sizes_json = ?
+            WHERE {' AND '.join(clauses)}
             ORDER BY time_ms ASC
             LIMIT 1
             """,
-            (str(kernel_hash), arch.name, self._serialize_sizes(sizes)),
+            params,
         )
         row = cursor.fetchone()
         if row is None:

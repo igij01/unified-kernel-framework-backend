@@ -42,10 +42,10 @@ class _FakeProblem:
     atol: float = 1e-3
     rtol: float = 1e-3
 
-    def initialize(self, sizes: dict[str, int]) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
-    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]:
         return []
 
 
@@ -125,8 +125,8 @@ class TestProblemRegistration:
             sizes: dict[str, Any] = {"N": [1]}
             atol: float = 1e-3
             rtol: float = 1e-3
-            def initialize(self, s: dict[str, int]) -> list[Any]: return []
-            def reference(self, i: list[Any], sizes: dict[str, int]) -> list[Any]: return []
+            def initialize(self, s: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]: return []
+            def reference(self, i: list[Any], sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]: return []
 
         # Class is still usable directly
         assert Conv2DProblem is not None
@@ -141,8 +141,8 @@ class TestProblemRegistration:
             class AnotherMatMul:
                 sizes: dict[str, Any] = {}
                 atol = rtol = 0.0
-                def initialize(self, s: dict[str, int]) -> list[Any]: return []
-                def reference(self, i: list[Any], sizes: dict[str, int]) -> list[Any]: return []
+                def initialize(self, s: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]: return []
+                def reference(self, i: list[Any], sizes: dict[str, int], dtypes: dict[str, Any] = {}) -> list[Any]: return []
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +615,8 @@ class TestLinkBindings:
         class ProblemXY:
             sizes = {"X": [1], "Y": [2]}
             atol = rtol = 1e-3
-            def initialize(self, s): return []
-            def reference(self, i, s): return []
+            def initialize(self, s, dtypes={}): return []
+            def reference(self, i, s, dtypes={}): return []
 
         Registry.register_problem("p", ProblemXY())
         _register_kernel("k")
@@ -629,8 +629,8 @@ class TestLinkBindings:
         class ProblemM:
             sizes = {"M": [128]}
             atol = rtol = 1e-3
-            def initialize(self, s): return []
-            def reference(self, i, s): return []
+            def initialize(self, s, dtypes={}): return []
+            def reference(self, i, s, dtypes={}): return []
 
         Registry.register_problem("p", ProblemM())
         _register_kernel("k")
@@ -643,14 +643,76 @@ class TestLinkBindings:
         class ProblemMN:
             sizes = {"M": [128], "N": [64]}
             atol = rtol = 1e-3
-            def initialize(self, s): return []
-            def reference(self, i, s): return []
+            def initialize(self, s, dtypes={}): return []
+            def reference(self, i, s, dtypes={}): return []
 
         Registry.register_problem("p", ProblemMN())
         _register_kernel("k")
         Registry.link("k", "p", constexpr_args={"HEAD": "N"}, runtime_args=["M"])
         messages = Registry.validate()
         assert not any("BAD" in m or "unknown size key" in m for m in messages)
+
+    def test_validate_rejects_inconsistent_dtype_key_sets(self) -> None:
+        """ADR-0025: every dtype combo must share the same key set."""
+        import torch
+
+        class HeteroProblem:
+            sizes = {"M": [128]}
+            dtypes = [
+                {"A": torch.float16, "B": torch.float16},
+                {"A": torch.bfloat16, "C": torch.float32},
+            ]
+            atol = rtol = 1e-3
+            def initialize(self, s, dtypes={}): return []
+            def reference(self, i, s, dtypes={}): return []
+
+        Registry.register_problem("hetero", HeteroProblem())
+        messages = Registry.validate()
+        assert any(
+            "inconsistent key sets" in m and "hetero" in m for m in messages
+        ), messages
+
+    def test_validate_rejects_type_args_slot_not_in_combo(self) -> None:
+        """ADR-0026: every type_args value must be a key in every combo."""
+        import torch
+
+        class P:
+            sizes = {"M": [128]}
+            dtypes = [{"A": torch.float16, "B": torch.float32}]
+            atol = rtol = 1e-3
+            def initialize(self, s, dtypes={}): return []
+            def reference(self, i, s, dtypes={}): return []
+
+        Registry.register_problem("p", P())
+        Registry.register_kernel(
+            "k", source=_SOURCE, backend="cuda", target_archs=_ARCHS,
+            grid_generator=_noop_grid,
+            compile_flags={"template_params": ["T"]},
+            problem="p",
+            type_args={"T": "Z"},  # slot Z is not in any combo
+        )
+        messages = Registry.validate()
+        assert any("not present in" in m and "Z" in m for m in messages), messages
+
+    def test_resolve_link_binding_multi_slot(self) -> None:
+        """_resolve_link_binding produces correct per-slot type_map for a multi-slot combo."""
+        import torch
+        from kernel_pipeline_backend.registry.registry import (
+            _LinkBinding, _resolve_link_binding,
+        )
+
+        binding = _LinkBinding(
+            constexpr_args={},
+            runtime_args=(),
+            type_args={"T_in": "A", "T_out": "C"},
+        )
+        dtypes = {
+            "A": torch.float16,
+            "B": torch.float16,
+            "C": torch.float32,
+        }
+        _, _, type_map = _resolve_link_binding(binding, sizes={}, dtypes=dtypes)
+        assert type_map == {"T_in": torch.float16, "T_out": torch.float32}
 
     def test_clear_removes_all_bindings(self) -> None:
         """clear() resets link bindings along with all other state."""

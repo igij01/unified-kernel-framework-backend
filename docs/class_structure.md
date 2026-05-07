@@ -849,6 +849,7 @@ class ResultStore(Protocol):
         kernel_hash: KernelHash | None = None,
         arch: CUDAArch | None = None,
         sizes: dict[str, int] | None = None,
+        dtype: Any = ...,  # ADR-0023: omit to skip filter; pass None to filter null-dtype rows
     ) -> list[AutotuneResult]: ...
 
     def best_config(
@@ -856,6 +857,7 @@ class ResultStore(Protocol):
         kernel_hash: KernelHash,
         arch: CUDAArch,
         sizes: dict[str, int],
+        dtype: Any = ...,  # ADR-0023: scope lookup to one dtype coordinate
     ) -> KernelConfig | None:
         """Return the config with the lowest time_ms for this point."""
         ...
@@ -866,10 +868,16 @@ class DatabaseStore(ResultStore):
     """SQLite/PostgreSQL implementation."""
     def __init__(self, connection_string: str): ...
 
-    # autotune_results table includes a nullable reference_hash column
-    # (TEXT) recording which Problem reference was used for verification.
-    # The frontend queries this column directly via SQL to verify that
-    # stored results were verified against the current reference.
+    # autotune_results rows are keyed by
+    # (kernel_hash, arch, sizes_json, dtypes_json, config_json) per
+    # ADR-0023 — sizes and dtypes are coverage coordinates, not problem
+    # identity.  Adding a new size or dtype combination produces new rows
+    # without invalidating existing ones.
+    #
+    # Includes a nullable reference_hash column (TEXT) recording which
+    # Problem reference was used for verification.  The frontend queries
+    # this column directly via SQL to verify that stored results were
+    # verified against the current reference.
 ```
 
 ---
@@ -896,15 +904,18 @@ class ReferenceHash: ...
     Constructed only by ``ReferenceHasher``."""
 
 class ReferenceHasher:
-    """Hash the verification-relevant inputs of a Problem.
+    """Hash the correctness-relevant inputs of a Problem.
 
     The resulting ``ReferenceHash`` answers exactly one question:
     "is a previously-recorded verification still valid for the current
-    problem definition?"  Used to detect reference drift (ADR-0019).
+    problem definition?"  Used to detect reference drift (ADR-0019,
+    refined by ADR-0023).
 
     Hashes: ``reference`` source, ``initialize`` source, ``atol``,
-    ``rtol``, ``dtypes`` (sorted by repr), ``sizes`` keys + domains.
-    Does NOT hash: problem name, kernel set membership, grid generators.
+    ``rtol``.
+    Does NOT hash: problem name, kernel set membership, grid generators,
+    ``sizes``, ``dtypes`` (these are row-level coverage coordinates per
+    ADR-0023, not problem identity).
     """
 
     def hash(self, problem: Problem) -> ReferenceHash: ...

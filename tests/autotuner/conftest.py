@@ -187,10 +187,10 @@ class FakeProblem:
         self.rtol = 1e-3
         self._filter_fn = filter_fn
 
-    def initialize(self, sizes: dict[str, int], dtype: Any = None) -> list[Any]:
+    def initialize(self, sizes: dict[str, int], dtypes: dict[str, Any]) -> list[Any]:
         return [f"tensor_{k}={v}" for k, v in sizes.items()]
 
-    def reference(self, inputs: list[Any], sizes: dict[str, int]) -> list[Any]:
+    def reference(self, inputs: list[Any], sizes: dict[str, int], dtypes: dict[str, Any]) -> list[Any]:
         return list(inputs)
 
     def filter_sizes(self, sizes: dict[str, int]) -> bool:

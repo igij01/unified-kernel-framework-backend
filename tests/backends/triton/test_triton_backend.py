@@ -1022,14 +1022,14 @@ class TestTritonShapeAsArgsGPU:
         class ShapeProblem:
             sizes = {"M": [M], "N": [N]}
             atol = rtol = 1e-5
-            def initialize(self, sizes, dtype=None):
+            def initialize(self, sizes, dtypes):
                 m, n = sizes["M"], sizes["N"]
                 ne = m * n
                 x = torch.randn(ne, device="cuda")
                 y = torch.randn(ne, device="cuda")
                 out = torch.zeros(ne, device="cuda")
                 return [x, y, out]
-            def reference(self, inputs, sizes):
+            def reference(self, inputs, sizes, dtypes):
                 x, y, _ = inputs
                 return [x + y]
 
@@ -1057,7 +1057,7 @@ class TestTritonShapeAsArgsGPU:
             grid = GridResult(grid=((n_elements + block_size - 1) // block_size,))
 
             problem_obj = ShapeProblem()
-            inputs = problem_obj.initialize({"M": M, "N": N})
+            inputs = problem_obj.initialize({"M": M, "N": N}, {})
             x, y, out = inputs
 
             launch = runner.make_launch_request(

@@ -1,17 +1,23 @@
-"""Pipeline — top-level orchestrator for the verify-and-autotune workflow."""
+"""NativePipeline — in-house verify-and-autotune driver (ADR-0021/0022)."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from kernel_pipeline_backend.autotuner.autotuner import Autotuner
 from kernel_pipeline_backend.autotuner.instrument import InstrumentationPass
 from kernel_pipeline_backend.autotuner.profiler import Profiler
 from kernel_pipeline_backend.core.compiler import CompilationError
+from kernel_pipeline_backend.core.pipeline import (
+    Pipeline,
+    PipelineCapabilityError,
+    SelectedConfig,
+    TuneRequest,
+    TuneResult,
+)
 from kernel_pipeline_backend.core.types import (
-    AutotuneResult,
     CompileOptions,
     KernelSpec,
     PointResult,
@@ -21,8 +27,6 @@ from kernel_pipeline_backend.plugin.plugin import (
     EVENT_COMPILE_COMPLETE,
     EVENT_COMPILE_ERROR,
     EVENT_COMPILE_START,
-    EVENT_KERNEL_DISCOVERED,
-    EVENT_PIPELINE_COMPLETE,
     PipelineEvent,
 )
 from kernel_pipeline_backend.problem.problem import has_reference
@@ -30,14 +34,13 @@ from kernel_pipeline_backend.registry.registry import (
     Registry,
     _resolve_link_binding,
 )
-from kernel_pipeline_backend.verifier.verifier import Verifier, VerificationResult
-from kernel_pipeline_backend.versioning.hasher import KernelHasher, ReferenceHasher
+from kernel_pipeline_backend.verifier.verifier import Verifier
 
 if TYPE_CHECKING:
     from kernel_pipeline_backend.autotuner.strategy import Strategy
     from kernel_pipeline_backend.core.compiler import Compiler
     from kernel_pipeline_backend.core.runner import Runner
-    from kernel_pipeline_backend.core.types import SearchPoint
+    from kernel_pipeline_backend.core.types import AutotuneResult, SearchPoint
     from kernel_pipeline_backend.device.device import DeviceHandle
     from kernel_pipeline_backend.plugin.manager import PluginManager
     from kernel_pipeline_backend.problem.problem import Problem
@@ -47,74 +50,38 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Result types
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PipelineError:
-    """An error encountered during pipeline execution.
-
-    Attributes:
-        kernel_spec: The kernel that caused the error.
-        stage: Pipeline stage where the error occurred
-            ("compile", "verify", "autotune").
-        message: Human-readable error description.
-        exception: The original exception, if any.
-    """
-
-    kernel_spec: KernelSpec
-    stage: str
-    message: str
-    exception: Exception | None = None
-
-
-@dataclass
-class PipelineResult:
-    """Aggregate result from a full pipeline run.
-
-    Attributes:
-        verified: Verification results for each kernel processed.
-        autotuned: Autotune results for each kernel that passed verification.
-        skipped: Kernels that were skipped (unchanged since last run).
-        errors: Errors encountered during the run.
-    """
-
-    verified: list[VerificationResult] = field(default_factory=list)
-    autotuned: list[AutotuneResult] = field(default_factory=list)
-    skipped: list[KernelSpec] = field(default_factory=list)
-    errors: list[PipelineError] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
-class Pipeline:
-    """Top-level orchestrator for the kernel verify-and-autotune workflow.
 
-    Coordinates versioning, compilation, and autotuning.  Each stage
-    emits events to the PluginManager for async observation.
+class NativePipeline:
+    """NativePipeline — in-house verify-and-autotune driver (ADR-0021/0022).
 
-    Orchestration flow for each kernel::
+    Implements the :class:`Pipeline` Protocol (ADR-0021) with
+    ``name="native"`` and both capability flags set to ``True``.
 
-        1. Hash kernel, check store for existing results
-        2. Skip unchanged kernels (unless force=True)
-        3. Compile all configurations from the compiler
-        4. Delegate to Autotuner.run() for the strategy loop:
-           a. Strategy suggests search points
-           b. Verify each point (unless skip_verify)
-           c. Profile each point via the Profiler (unless skip_autotune)
-           d. Store results incrementally, emit plugin events
-        5. Emit pipeline-complete event
+    Owns the per-kernel verify-and-autotune loop: strategy iteration,
+    JIT compile cache, per-point verify-then-profile, and the
+    ``AUTOTUNE_*`` / ``VERIFY_*`` / ``COMPILE_*`` plugin events.
+    Does *not* own kernel iteration, hashing, change detection, or
+    storage — those are the orchestrator's responsibility (ADR-0022).
+
+    Continues to host :meth:`run_point` for single-point debugging
+    (ADR-0012); ``run_point`` is *not* part of the ``Pipeline``
+    Protocol.
     """
+
+    name: str = "native"
+    supports_verification: bool = True
+    supports_progress_events: bool = True
 
     def __init__(
         self,
         compiler: Compiler,
         runner: Runner,
-        store: ResultStore,
         plugin_manager: PluginManager,
         device: DeviceHandle,
+        store: ResultStore | None = None,
     ) -> None:
         """Initialize the pipeline.
 
@@ -122,7 +89,11 @@ class Pipeline:
             compiler: Backend compiler for generating configs and
                 compiling kernels.
             runner: Backend runner for executing compiled kernels.
-            store: Result store for caching and persisting results.
+            store: Optional result store.  Unused by ``NativePipeline``
+                itself — kept on the constructor signature for symmetry
+                with the previous API; persistence is performed by the
+                orchestrator (ADR-0022).  Defaults to ``None`` for
+                ``run_point``-only usage (e.g. via :class:`DebugSession`).
             plugin_manager: Manager for dispatching async plugin events.
             device: GPU device handle for compilation, verification,
                 and autotuning.
@@ -132,102 +103,74 @@ class Pipeline:
         self._store = store
         self._plugins = plugin_manager
         self._device = device
-        self._hasher = KernelHasher()
-        self._ref_hasher = ReferenceHasher()
 
-    async def run(
-        self,
-        kernels: list[KernelSpec],
-        problem: Problem,
-        strategy: Strategy,
-        passes: list[InstrumentationPass] | None = None,
-        force: bool = False,
-        skip_verify: bool = False,
-        skip_autotune: bool = False,
-        problem_name: str | None = None,
-    ) -> PipelineResult:
-        """Execute the full pipeline for a list of kernels.
+    # ------------------------------------------------------------------
+    # Pipeline Protocol — per-kernel verify-and-autotune work
+    # ------------------------------------------------------------------
+
+    async def tune(self, request: TuneRequest) -> TuneResult:
+        """Tune one kernel — implements the :class:`Pipeline` Protocol.
+
+        Reads native-specific options from ``request.options``:
+
+        - ``strategy`` (required): :class:`Strategy` driving the search.
+        - ``existing_results`` (optional, default ``[]``): cached
+          :class:`AutotuneResult`\\ s from the store.
+        - ``passes`` (optional, default ``[]``): instrumentation passes.
+        - ``problem_name`` (optional, default ``None``): registered
+          problem name for link-binding lookups.
+
+        The orchestrator (ADR-0022) is responsible for hashing, change
+        detection, store queries, reference-hash stamping, and result
+        persistence.  This method only owns the work between those
+        bookends.
 
         Args:
-            kernels: Kernels to process.
-            problem: Problem specification (reference impl + sizes).
-            strategy: Autotuning search strategy.
-            passes: Optional :class:`InstrumentationPass` instances for
-                observation during the autotuning session.  Only the
-                observation hooks (``setup`` / ``before_run`` /
-                ``after_run`` / ``teardown``) are invoked in the
-                autotuner loop — transform hooks are ``run_point``-only.
-            force: If True, reprocess all kernels regardless of cache.
-            skip_verify: If True, skip verification stage.
-            skip_autotune: If True, skip autotuning stage.
-            problem_name: Registered name of ``problem``, used to look
-                up link bindings (``constexpr_args`` / ``runtime_args``)
-                from the Registry for each kernel.
+            request: Per-kernel tune request.
 
         Returns:
-            Aggregate PipelineResult with verification, autotuning,
-            skipped, and error information.
-        """
-        result = PipelineResult()
+            :class:`TuneResult` exposing the per-size best configs in
+            ``selected``, full per-point measurements in
+            ``measurements``, and verification / error data forwarded
+            from the underlying autotuner.
 
-        for spec in kernels:
-            await self._process_kernel(
-                spec, problem, strategy,
-                passes=passes or [],
-                force=force,
-                skip_verify=skip_verify,
-                skip_autotune=skip_autotune,
-                result=result,
-                problem_name=problem_name,
+        Raises:
+            PipelineCapabilityError: Reserved for the protocol contract;
+                ``NativePipeline`` always supports verification.
+            ValueError: If ``options['strategy']`` is missing.
+        """
+        if request.verification is not None and not self.supports_verification:
+            raise PipelineCapabilityError(
+                f"Pipeline {self.name!r} does not support verification."
             )
 
-        await self._emit(EVENT_PIPELINE_COMPLETE, {"result": result})
-        await self._plugins.await_plugins()
-        return result
+        options = request.options
+        if "strategy" not in options:
+            raise ValueError(
+                "NativePipeline.tune requires options['strategy']: a Strategy instance.",
+            )
+        strategy: Strategy = options["strategy"]  # type: ignore[assignment]
+        existing_results: list[AutotuneResult] = list(
+            options.get("existing_results", []) or [],
+        )
+        passes: list[InstrumentationPass] = list(
+            options.get("passes", []) or [],
+        )
+        problem_name: str | None = options.get("problem_name")  # type: ignore[assignment]
+        skip_autotune: bool = bool(options.get("skip_autotune", False))
 
-    # ------------------------------------------------------------------
-    # Per-kernel orchestration
-    # ------------------------------------------------------------------
+        spec = request.spec
+        problem = request.problem
+        skip_verify = request.verification is None
 
-    async def _process_kernel(
-        self,
-        spec: KernelSpec,
-        problem: Problem,
-        strategy: Strategy,
-        *,
-        passes: list[InstrumentationPass],
-        force: bool,
-        skip_verify: bool,
-        skip_autotune: bool,
-        result: PipelineResult,
-        problem_name: str | None = None,
-    ) -> None:
-        """Process a single kernel through the full pipeline."""
-        # -- 1. Version hash and change detection -------------------------
-        kernel_hash = self._hasher.hash(spec)
-        spec = replace(spec, version_hash=kernel_hash)
-
-        if not force and not self._hasher.has_changed(spec, self._store):
-            result.skipped.append(spec)
-            return
-
-        await self._emit(EVENT_KERNEL_DISCOVERED, {"spec": spec})
-
-        # -- 2. Generate configs (shape-independent) ----------------------
         configs = self._compiler.generate_configs(spec)
-
-        # -- 3. Compute reference hash for verification provenance -------
-        reference_hash = self._ref_hasher.hash(problem)
-
-        # -- 4. Build search space ----------------------------------------
-        problem_dtypes = getattr(problem, "dtypes", None) or [None]
+        problem_dtypes = getattr(problem, "dtypes", None) or [{}]
         space = SearchSpace(
             size_specs=dict(problem.sizes),
             configs=configs,
             dtypes=list(problem_dtypes),
         )
 
-        # -- 5. Autotuner: JIT compile, strategy loop, verify, profile ----
         profiler = Profiler(
             runner=self._runner,
             device=self._device,
@@ -241,42 +184,47 @@ class Pipeline:
             plugin_manager=self._plugins,
         )
 
-        existing = self._store.query(
-            kernel_hash=kernel_hash,
-            arch=self._device.info.arch,
-        )
-
-        # Skip verification if the problem provides no reference implementation
-        effective_skip_verify = skip_verify or not has_reference(problem)
-
-        autotune_result = await autotuner.run(
+        run_result = await autotuner.run(
             spec=spec,
             space=space,
             compiler=self._compiler,
             configs=configs,
             problem=problem,
             strategy=strategy,
-            existing_results=existing,
-            skip_verify=effective_skip_verify,
+            existing_results=existing_results,
+            skip_verify=skip_verify,
             skip_autotune=skip_autotune,
             problem_name=problem_name,
         )
 
-        # Merge autotuner results into pipeline result
-        result.verified.extend(autotune_result.verified)
-        # Stamp each tuned result with the reference hash and persist
-        for ar in autotune_result.tuned:
-            ar.reference_hash = reference_hash
-        self._store.store(autotune_result.tuned)
-        result.autotuned.extend(autotune_result.tuned)
-        for err in autotune_result.errors:
-            stage = "compile" if isinstance(err.exception, CompilationError) else "autotune"
-            result.errors.append(
-                PipelineError(spec, stage, err.message, err.exception),
-            )
+        selected: list[SelectedConfig] = []
+        if run_result.tuned:
+            best_per_size: dict[tuple, AutotuneResult] = {}
+            for ar in run_result.tuned:
+                key = tuple(sorted(ar.point.sizes.items()))
+                cur = best_per_size.get(key)
+                if cur is None or ar.time_ms < cur.time_ms:
+                    best_per_size[key] = ar
+            ranked = sorted(best_per_size.values(), key=lambda r: r.time_ms)
+            selected = [
+                SelectedConfig(
+                    config=ar.point.config,
+                    sizes_hint=dict(ar.point.sizes),
+                    score_hint=ar.time_ms,
+                )
+                for ar in ranked
+            ]
+
+        return TuneResult(
+            selected=selected,
+            measurements=list(run_result.tuned),
+            verifications=list(run_result.verified),
+            errors=list(run_result.errors),
+            backend_metadata={},
+        )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Single-point execution (ADR-0012)
     # ------------------------------------------------------------------
 
     async def run_point(
@@ -342,7 +290,7 @@ class Pipeline:
         if problem_name is not None:
             binding = Registry.get_link_binding(spec.name, problem_name)
             extra_args, constexpr_kwargs, type_map = _resolve_link_binding(
-                binding, point.sizes, dtype=point.dtype,
+                binding, point.sizes, dtypes=point.dtypes,
             )
             constexpr_sizes = constexpr_kwargs or None
             if type_map:
@@ -420,7 +368,7 @@ class Pipeline:
         run_once_metrics: dict[str, Any] = {}
         run_once_passes = [p for p in (passes or []) if p.run_once]
         if run_once_passes and problem is not None:
-            fork_inputs = problem.initialize(point.sizes, dtype=point.dtype)
+            fork_inputs = problem.initialize(point.sizes, point.dtypes)
             base_spec = replace(spec, compile_flags=flags)
             for p in run_once_passes:
                 fork_spec, fork_config, fork_constexpr = p.transform_compile_request(
@@ -451,7 +399,7 @@ class Pipeline:
         if verify and problem is not None and has_reference(problem):
             verifier = Verifier(runner=self._runner, device=self._device, passes=passes or [])
             verification = verifier.verify(
-                compiled, problem, point.sizes, extra_args, dtype=point.dtype,
+                compiled, problem, point.sizes, extra_args, dtypes=point.dtypes,
             )
 
         # 8. Profile (optional — requires a problem for input initialization).
@@ -472,7 +420,7 @@ class Pipeline:
                 profile_result = profiler.profile(
                     compiled, problem, point.sizes, extra_args,
                     original_config=point.config,
-                    dtype=point.dtype,
+                    dtypes=point.dtypes,
                 )
             finally:
                 profiler.teardown()

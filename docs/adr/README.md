@@ -21,12 +21,17 @@ This directory contains Architecture Decision Records (ADRs) for kernel-pipeline
 | [0013](0013-link-time-size-bindings.md) | Link-Time Size Bindings for Kernel Specialization and Runtime Shape Arguments | Accepted | 2026-04-08 |
 | [0014](0014-jit-compilation-with-constexpr-sizes.md) | JIT Compilation with Per-Point Constexpr-Size Resolution | Accepted | 2026-04-09 |
 | [0015](0015-backend-contract-redesign.md) | Backend Contract Redesign — Launch Ownership, Compile Identity, Unified Instrumentation | Accepted | 2026-04-10 |
-| [0016](0016-dtype-template-mapping.md) | Input Dtype to C++ Template Type Mapping | Accepted | 2026-04-13 |
+| [0016](0016-dtype-template-mapping.md) | Input Dtype to C++ Template Type Mapping | Accepted (partially superseded by 0025/0026) | 2026-04-13 |
 | [0017](0017-problem-versioning.md) | Problem Versioning | Superseded by 0019 | 2026-04-26 |
 | [0018](0018-binary-artifact-exposure.md) | Binary Artifact Exposure on `CompiledKernel` | Superseded by 0020 | 2026-04-26 |
 | [0019](0019-problem-versioning-belongs-to-frontend.md) | Problem Versioning Belongs to the Frontend | Accepted | 2026-05-05 |
 | [0020](0020-artifact-export-separated-from-autotuning.md) | Artifact Export Is Separated from Autotuning | Accepted | 2026-05-05 |
-| [0021](0021-abstract-autotuner-protocol.md) | Abstract Autotuner Protocol with Optional Verification | Proposed | 2026-05-05 |
+| [0021](0021-abstract-pipeline-protocol.md) | Abstract Pipeline Protocol with Optional Verification | Proposed | 2026-05-05 |
+| [0022](0022-pipeline-orchestrator-and-debug-session.md) | Pipeline Orchestrator and Debug Session | Proposed | 2026-05-06 |
+| [0023](0023-coverage-axes-vs-correctness-hash.md) | Coverage Axes vs. Correctness Hash — Sizes and Dtypes Are Row Dimensions | Proposed | 2026-05-06 |
+| [0024](0024-arch-refactor-skill.md) | `/arch-refactor` Skill — ADR-Driven Architectural Refactor Workflow | Proposed | 2026-05-06 |
+| [0025](0025-problem-dtype-combinations.md) | Problem Dtype Combinations as Named Multi-Type Slots | Accepted | 2026-05-07 |
+| [0026](0026-kernel-type-args-slot-binding.md) | Kernel `type_args` as Slot-Name Bindings | Accepted | 2026-05-07 |
 
 ## Creating a New ADR
 
