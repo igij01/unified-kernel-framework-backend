@@ -921,3 +921,114 @@ class TestVirtualArchForwardCompat:
         )
         result = runner.run(launch, device)
         assert torch.allclose(result.outputs[0], a + b)
+
+
+# ===================================================================
+# Regression: num_outputs propagation (issue #005)
+# ===================================================================
+
+
+@requires_gpu
+class TestNumOutputsPropagationGPU:
+    """Issue #005: num_outputs from compile_flags must reach compile_info.
+
+    CUDACompiler.compile never read spec.compile_flags for
+    num_outputs, so the CUDARunner always defaulted to 1 output.
+    """
+
+    @pytest.fixture()
+    def compiler(self) -> CUDACompiler:
+        return CUDACompiler()
+
+    def test_num_outputs_propagated_to_compile_info(
+        self, compiler: CUDACompiler
+    ) -> None:
+        spec = _make_spec(
+            compile_flags={
+                "entry_point": "vector_add",
+                "num_outputs": 3,
+                "config_space": {"BLOCK_SIZE": [128]},
+            }
+        )
+        result = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        assert result.compile_info["num_outputs"] == 3
+
+    def test_num_outputs_absent_when_not_in_flags(
+        self, compiler: CUDACompiler
+    ) -> None:
+        spec = _make_spec(
+            compile_flags={
+                "entry_point": "vector_add",
+                "config_space": {"BLOCK_SIZE": [128]},
+            }
+        )
+        result = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        assert "num_outputs" not in result.compile_info
+
+    def test_num_outputs_deterministic(
+        self, compiler: CUDACompiler
+    ) -> None:
+        spec = _make_spec(
+            compile_flags={
+                "entry_point": "vector_add",
+                "num_outputs": 2,
+                "config_space": {"BLOCK_SIZE": [128]},
+            }
+        )
+        r1 = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        r2 = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        assert r1.compile_info["num_outputs"] == r2.compile_info["num_outputs"]
+
+    def test_different_num_outputs_different_compile_info(
+        self, compiler: CUDACompiler
+    ) -> None:
+        spec1 = _make_spec(
+            compile_flags={
+                "entry_point": "vector_add",
+                "num_outputs": 2,
+                "config_space": {"BLOCK_SIZE": [128]},
+            }
+        )
+        spec2 = _make_spec(
+            compile_flags={
+                "entry_point": "vector_add",
+                "num_outputs": 3,
+                "config_space": {"BLOCK_SIZE": [128]},
+            }
+        )
+        r1 = compiler.compile(
+            spec1, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        r2 = compiler.compile(
+            spec2, KernelConfig(params={"BLOCK_SIZE": 128})
+        )
+        assert r1.compile_info != r2.compile_info
+
+    def test_triton_compile_has_corresponding_support(
+        self
+    ) -> None:
+        """Confirm the Triton backend also propagates num_outputs (issue #005)."""
+        from kernel_pipeline_backend.backends.triton.compiler import (
+            TritonCompiler,
+        )
+        from kernel_pipeline_backend.core.types import CUDAArch
+
+        triton_compiler = TritonCompiler()
+        spec = KernelSpec(
+            name="dummy",
+            source=lambda: None,
+            backend="triton",
+            target_archs=[CUDAArch.COMPUTE_80],
+            grid_generator=lambda s, c: GridResult(grid=(1,)),
+            compile_flags={"num_outputs": 3},
+        )
+        result = triton_compiler.compile(spec, KernelConfig())
+        assert result.compile_info["num_outputs"] == 3

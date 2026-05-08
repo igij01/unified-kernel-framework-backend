@@ -289,6 +289,10 @@ class CUDACompiler:
 
         # --- collect metadata ---------------------------------------
         compile_info: dict[str, Any] = {"entry_point": entry_point}
+        # Forward keys the runner consumes from compile_flags so that
+        # compile_flags is the single registration-time source of truth.
+        if "num_outputs" in spec.compile_flags:
+            compile_info["num_outputs"] = spec.compile_flags["num_outputs"]
         if template_params:
             compile_info["name_expression"] = name_expr
         for attr in ("num_regs", "max_threads_per_block", "shared_size_bytes"):

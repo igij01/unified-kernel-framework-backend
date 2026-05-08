@@ -214,10 +214,17 @@ class TritonCompiler:
                 params={**config.params, **constexpr_sizes}
             )
 
+        # Propagate known runtime keys from compile_flags into compile_info
+        # so the runner can read them (e.g. num_outputs determines how many
+        # trailing input tensors are output buffers).
+        compile_info: dict[str, Any] = {}
+        if "num_outputs" in spec.compile_flags:
+            compile_info["num_outputs"] = spec.compile_flags["num_outputs"]
+
         return CompiledKernel(
             spec=spec,
             config=effective_config,
             artifact=kernel_fn,
-            compile_info={},
+            compile_info=compile_info,
             grid_generator=spec.grid_generator,
         )

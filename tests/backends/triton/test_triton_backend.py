@@ -175,6 +175,85 @@ class TestTritonCompileUnit:
         assert isinstance(result.compile_info, dict)
 
 
+class TestNumOutputsPropagation:
+    """Issue #005: num_outputs from compile_flags must reach compile_info.
+
+    TritonCompiler.compile constructs CompiledKernel with
+    compile_info={} unconditionally, ignoring spec.compile_flags.
+    The Triton runner reads info.get("num_outputs", 1) to determine
+    how many trailing input tensors are output buffers.
+    """
+
+    @pytest.fixture()
+    def compiler(self) -> TritonCompiler:
+        return TritonCompiler()
+
+    def test_num_outputs_propagated_to_compile_info(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec = _make_spec(source=lambda: None, compile_flags={"num_outputs": 3})
+        result = compiler.compile(spec, KernelConfig())
+        assert result.compile_info["num_outputs"] == 3
+
+    def test_num_outputs_absent_when_not_in_flags(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec = _make_spec(source=lambda: None, compile_flags={})
+        result = compiler.compile(spec, KernelConfig())
+        assert "num_outputs" not in result.compile_info
+
+    def test_num_outputs_absent_when_no_compile_flags(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec = _make_spec(source=lambda: None)
+        result = compiler.compile(spec, KernelConfig())
+        assert "num_outputs" not in result.compile_info
+
+    def test_num_outputs_deterministic(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec = _make_spec(source=lambda: None, compile_flags={"num_outputs": 3})
+        r1 = compiler.compile(spec, KernelConfig())
+        r2 = compiler.compile(spec, KernelConfig())
+        assert r1.compile_info == r2.compile_info
+
+    def test_different_num_outputs_different_compile_info(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec1 = _make_spec(source=lambda: None, compile_flags={"num_outputs": 3})
+        spec2 = _make_spec(source=lambda: None, compile_flags={"num_outputs": 1})
+        r1 = compiler.compile(spec1, KernelConfig())
+        r2 = compiler.compile(spec2, KernelConfig())
+        assert r1.compile_info != r2.compile_info
+
+    def test_num_outputs_with_constexpr_sizes(
+        self, compiler: TritonCompiler
+    ) -> None:
+        spec = _make_spec(source=lambda: None, compile_flags={"num_outputs": 3})
+        result = compiler.compile(
+            spec, KernelConfig(), constexpr_sizes={"HEAD_DIM": 64}
+        )
+        assert result.compile_info["num_outputs"] == 3
+
+    def test_num_outputs_with_autotune(
+        self, compiler: TritonCompiler
+    ) -> None:
+        def inner():
+            pass
+
+        autotuned = _MockAutotuner(
+            inner, [_MockTritonConfig(kwargs={"BLOCK_SIZE": 256})]
+        )
+        spec = _make_spec(
+            source=autotuned, compile_flags={"num_outputs": 3}
+        )
+        result = compiler.compile(
+            spec, KernelConfig(params={"BLOCK_SIZE": 256})
+        )
+        assert result.compile_info["num_outputs"] == 3
+        assert result.artifact is inner
+
+
 # ===================================================================
 # Autotune extraction — unit tests (mock objects, no GPU needed)
 # ===================================================================
